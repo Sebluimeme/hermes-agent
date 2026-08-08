@@ -555,6 +555,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nModel: {agent.model}"
     if agent.provider:
         timestamp_line += f"\nProvider: {agent.provider}"
+    if agent.model or agent.provider:
+        timestamp_line += (
+            "\nRuntime identity: These Model and Provider values are authoritative "
+            "for the current turn. Never infer the active model from earlier "
+            "conversation messages; they may describe a previous runtime."
+        )
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)

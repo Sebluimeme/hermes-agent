@@ -2913,6 +2913,27 @@ class SessionStore:
                 return None
             return dict(entry.model_override) if entry.model_override else None
 
+    def clear_all_model_overrides(self) -> None:
+        """Clear all persisted /model overrides across every active session.
+
+        Called by /agent to ensure the new global LLM preset applies on the
+        very next turn in every topic, even after a gateway restart.  Without
+        this, each topic's persisted override would be rehydrated from the
+        session store on the next turn and shadow the preset.
+
+        A single lock acquisition clears all entries and saves once, so
+        this is cheaper than calling set_model_override() per session.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            dirty = False
+            for entry in self._entries.values():
+                if entry.model_override:
+                    entry.model_override = None
+                    dirty = True
+            if dirty:
+                self._save()
+
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.
 

@@ -7071,9 +7071,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        global config/env (``_resolve_gateway_model(user_config)`` and default
-        provider resolution).
+        Priority (highest first): global ``/agent`` preset → session ``/model``
+        → ``channel_overrides`` → global config/env
+        (``_resolve_gateway_model(user_config)`` and default provider
+        resolution).
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -7094,31 +7095,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _override_state.conversation.model_override if _override_state else None
         )
         if override:
-            override_model = override.get("model", model)
-            override_runtime = {
-                "provider": override.get("provider"),
-                "api_key": override.get("api_key"),
-                "base_url": override.get("base_url"),
-                "api_mode": override.get("api_mode"),
-                "max_tokens": override.get("max_tokens"),
-                "credential_pool": override.get("credential_pool"),
-            }
-            if override_runtime.get("api_key"):
-                if override_runtime.get("credential_pool") is None:
-                    override_runtime["credential_pool"] = _credential_pool_for_provider(
-                        override.get("provider")
-                    )
-                logger.debug(
-                    "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
-                    resolved_session_key or "", model, override_model,
-                    override_runtime.get("provider"),
-                )
-                return override_model, override_runtime
-            # Override exists but has no api_key — fall through to env-based
-            # resolution and apply model/provider from the override on top.
+            # Always fall through so the preset block (applied last) can win.
+            # Previously a fast-path returned early here when api_key was
+            # present, but that caused the global /agent preset to be silently
+            # shadowed by any rehydrated session override.  The override is
+            # still applied by _apply_session_model_override below (step 4),
+            # and the preset block (step 5) runs last and wins over it.
             logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
-                resolved_session_key or "", model, override_model,
+                "Session model override (deferred): session=%s config_model=%s -> "
+                "override_model=%s provider=%s has_api_key=%s",
+                resolved_session_key or "", model, override.get("model", model),
+                override.get("provider"), bool(override.get("api_key")),
             )
         else:
             logger.debug(
@@ -7175,6 +7162,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
+            )
+
+        # --- Global LLM preset (HERMES-LLM-001) — applied last, wins over session and channel overrides ---
+        # Priority (highest to lowest): llm_preset > session /model > channel_overrides > config default
+        # When no preset is active, resolve_preset_runtime() returns {} → this block is a no-op and the
+        # earlier resolution (config default → channel_overrides → session_override) stands unchanged.
+        # Session history is preserved — only model/provider changes per turn.
+        # Values come from llm_presets.yaml (or built-ins), NOT from config.yaml's
+        # active model, so the preset is self-contained and independent of the
+        # per-profile model setting.
+        try:
+            from agent.llm_presets_config import resolve_preset_runtime
+            _preset = resolve_preset_runtime()
+            _preset_model = _preset.get("model")
+            _preset_provider = _preset.get("provider")
+            _preset_base_url = _preset.get("base_url")
+            _preset_api_mode = _preset.get("api_mode")
+            if _preset_provider:
+                _preset_rk = _resolve_runtime_agent_kwargs_for_provider(_preset_provider)
+                _preset_rk_model = _preset_rk.pop("model", None)
+                # Preset YAML fields override provider-resolved values so a preset
+                # can target a local proxy (base_url) or a custom api_mode without
+                # touching config.yaml.
+                if _preset_base_url:
+                    _preset_rk["base_url"] = _preset_base_url
+                if _preset_api_mode:
+                    _preset_rk["api_mode"] = _preset_api_mode
+                # Merge only non-None credential values so env-level creds
+                # already in runtime_kwargs are not silently cleared.
+                runtime_kwargs.update(
+                    {k: v for k, v in _preset_rk.items() if v is not None}
+                )
+                if _preset_model:
+                    model = _preset_model
+                elif _preset_rk_model:
+                    model = _preset_rk_model
+                logger.debug(
+                    "LLM preset applied: preset_model=%s preset_provider=%s "
+                    "preset_base_url=%s final_model=%s",
+                    _preset_model, _preset_provider, _preset_base_url, model,
+                )
+            elif _preset_model:
+                model = _preset_model
+        except Exception:
+            logger.debug(
+                "_resolve_session_agent_runtime: LLM preset resolution failed",
+                exc_info=True,
             )
 
         # When the config has no model.default but a provider was resolved
@@ -15843,6 +15877,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "fast":
             return await self._handle_fast_command(event)
+
+        if canonical == "agent":
+            return await self._handle_agent_command(event)
 
         if canonical == "verbose":
             return await self._handle_verbose_command(event)
