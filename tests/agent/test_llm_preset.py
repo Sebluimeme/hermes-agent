@@ -45,16 +45,16 @@ class TestRED:
         assert mod is not None
 
     def test_valid_presets_defined(self):
-        """VALID_PRESETS must be a frozenset containing exactly opus and chatgpt."""
+        """VALID_PRESETS exposes both Claude accounts and ChatGPT."""
         mod = _import_module()
         assert hasattr(mod, "VALID_PRESETS"), "VALID_PRESETS missing"
-        assert mod.VALID_PRESETS == frozenset({"opus", "chatgpt"})
+        assert mod.VALID_PRESETS == frozenset({"claude1", "claude2", "chatgpt"})
 
     def test_default_preset_defined(self):
-        """DEFAULT_PRESET must be 'opus'."""
+        """Claude 2 is the default workhorse preset."""
         mod = _import_module()
         assert hasattr(mod, "DEFAULT_PRESET"), "DEFAULT_PRESET missing"
-        assert mod.DEFAULT_PRESET == "opus"
+        assert mod.DEFAULT_PRESET == "claude2"
 
     def test_get_preset_callable(self):
         """get_preset must be a callable."""
@@ -72,10 +72,10 @@ class TestRED:
         assert callable(getattr(mod, "preset_file", None)), "preset_file not callable"
 
     def test_get_preset_returns_default_when_no_file(self, tmp_path):
-        """get_preset with no existing file must return DEFAULT_PRESET ('opus')."""
+        """get_preset with no existing file returns DEFAULT_PRESET."""
         mod = _import_module()
         result = mod.get_preset(hermes_home=tmp_path)
-        assert result == "opus", f"Expected 'opus', got {result!r}"
+        assert result == mod.DEFAULT_PRESET
 
     def test_set_preset_raises_on_invalid(self, tmp_path):
         """set_preset with an unknown preset must raise ValueError."""
@@ -110,12 +110,12 @@ class TestGREEN:
 
     # -- Basic state --------------------------------------------------------
 
-    def test_default_is_opus(self, tmp_path):
-        assert self.m.get_preset(tmp_path) == "opus"
+    def test_default_is_claude2(self, tmp_path):
+        assert self.m.get_preset(tmp_path) == "claude2"
 
-    def test_set_opus(self, tmp_path):
-        self.m.set_preset("opus", tmp_path)
-        assert self.m.get_preset(tmp_path) == "opus"
+    def test_set_claude1(self, tmp_path):
+        self.m.set_preset("claude1", tmp_path)
+        assert self.m.get_preset(tmp_path) == "claude1"
 
     def test_set_chatgpt(self, tmp_path):
         self.m.set_preset("chatgpt", tmp_path)
@@ -123,8 +123,8 @@ class TestGREEN:
 
     def test_overwrite_preset(self, tmp_path):
         self.m.set_preset("chatgpt", tmp_path)
-        self.m.set_preset("opus", tmp_path)
-        assert self.m.get_preset(tmp_path) == "opus"
+        self.m.set_preset("claude1", tmp_path)
+        assert self.m.get_preset(tmp_path) == "claude1"
 
     # -- File format --------------------------------------------------------
 
@@ -136,7 +136,7 @@ class TestGREEN:
         assert data == {"preset": "chatgpt"}
 
     def test_lock_file_created(self, tmp_path):
-        self.m.set_preset("opus", tmp_path)
+        self.m.set_preset("claude1", tmp_path)
         lock = tmp_path / "llm_preset.lock"
         assert lock.exists(), "Lock file must be created alongside preset file"
 
@@ -162,13 +162,13 @@ class TestGREEN:
         path.write_text("NOT JSON {{{{", encoding="utf-8")
         # Must not raise, must return default
         result = self.m.get_preset(tmp_path)
-        assert result == "opus"
+        assert result == "claude2"
 
     def test_unknown_value_in_file_falls_back(self, tmp_path):
         path = self.m.preset_file(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"preset": "gemini"}), encoding="utf-8")
-        assert self.m.get_preset(tmp_path) == "opus"
+        assert self.m.get_preset(tmp_path) == "claude2"
 
     def test_hermes_home_created_if_missing(self, tmp_path):
         deep = tmp_path / "a" / "b" / "c"
@@ -192,7 +192,7 @@ class TestGREEN:
             except Exception as exc:
                 errors.append(exc)
 
-        t1 = threading.Thread(target=writer, args=("opus",))
+        t1 = threading.Thread(target=writer, args=("claude1",))
         t2 = threading.Thread(target=writer, args=("chatgpt",))
         t1.start()
         t2.start()
@@ -296,8 +296,8 @@ class TestCrossProfileGlobalHome:
         # Write via explicit override
         self.m.set_preset("chatgpt", hermes_home=test_home)
 
-        # Global home was NOT written → default still "opus"
-        assert self.m.get_preset() == "opus"
+        # Global home was NOT written → default remains Claude 2.
+        assert self.m.get_preset() == "claude2"
         # Explicit override path has the value
         assert self.m.get_preset(hermes_home=test_home) == "chatgpt"
 

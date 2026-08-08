@@ -108,66 +108,62 @@ class _MinimalAgent:
 # 1. Unit tests — llm_preset_fallback helpers
 # ---------------------------------------------------------------------------
 
-class TestGetOtherPreset:
+class TestGetFallbackPresets:
 
-    def test_opus_returns_chatgpt(self, fb_mod):
-        assert fb_mod.get_other_preset("opus") == "chatgpt"
+    def test_claude1_falls_back_via_claude2_then_chatgpt(self, fb_mod):
+        assert fb_mod.get_fallback_presets("claude1") == ("claude2", "chatgpt")
 
-    def test_chatgpt_returns_opus(self, fb_mod):
-        assert fb_mod.get_other_preset("chatgpt") == "opus"
+    def test_chatgpt_falls_back_to_claude1(self, fb_mod):
+        assert fb_mod.get_fallback_presets("chatgpt") == ("claude1",)
 
-    def test_unknown_preset_returns_first_alternative(self, fb_mod):
-        # Unknown preset → returns the alphabetically first alternative from VALID_PRESETS
-        result = fb_mod.get_other_preset("nonexistent")
-        assert result in {"chatgpt", "opus"}  # one of the valid ones
+    def test_unknown_preset_has_no_fallback(self, fb_mod):
+        assert fb_mod.get_fallback_presets("nonexistent") == ()
 
-    def test_returns_string(self, fb_mod):
-        assert isinstance(fb_mod.get_other_preset("opus"), str)
+    def test_returns_tuple(self, fb_mod):
+        assert isinstance(fb_mod.get_fallback_presets("claude1"), tuple)
 
 
 class TestBuildPresetFallbackChainEntry:
 
-    def test_opus_active_returns_chatgpt_entry(self, fb_mod, tmp_path, monkeypatch):
+    def test_claude1_active_returns_claude2_entry(self, fb_mod, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         entry = fb_mod.build_preset_fallback_chain_entry(
-            active_preset="opus", hermes_home=tmp_path
+            active_preset="claude1", hermes_home=tmp_path
         )
         assert entry is not None
-        assert entry["provider"] == "openai"
-        assert entry["model"] == "gpt-5.6"
-        assert entry[fb_mod.PRESET_FALLBACK_MARKER] == "opus"
-        assert entry[fb_mod.PRESET_FALLBACK_TO_KEY] == "chatgpt"
+        assert entry["provider"] == "anthropic"
+        assert entry["model"]
+        assert entry[fb_mod.PRESET_FALLBACK_MARKER] == "claude1"
+        assert entry[fb_mod.PRESET_FALLBACK_TO_KEY] == "claude2"
 
-    def test_chatgpt_active_returns_opus_entry(self, fb_mod, tmp_path, monkeypatch):
+    def test_chatgpt_active_returns_claude1_entry(self, fb_mod, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         entry = fb_mod.build_preset_fallback_chain_entry(
             active_preset="chatgpt", hermes_home=tmp_path
         )
         assert entry is not None
         assert entry["provider"] == "anthropic"
-        assert entry["model"] == "claude-opus-5"
+        assert entry["model"]
         assert entry[fb_mod.PRESET_FALLBACK_MARKER] == "chatgpt"
-        assert entry[fb_mod.PRESET_FALLBACK_TO_KEY] == "opus"
+        assert entry[fb_mod.PRESET_FALLBACK_TO_KEY] == "claude1"
 
     def test_reads_active_preset_from_global_when_none(self, fb_mod, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         preset_mod = _import("agent.llm_preset")
         preset_mod.set_preset("chatgpt", hermes_home=tmp_path)
-        # active_preset=None → should read "chatgpt" and return the opus entry
         entry = fb_mod.build_preset_fallback_chain_entry(hermes_home=tmp_path)
         assert entry is not None
         assert entry[fb_mod.PRESET_FALLBACK_MARKER] == "chatgpt"
-        assert entry[fb_mod.PRESET_FALLBACK_TO_KEY] == "opus"
+        assert entry[fb_mod.PRESET_FALLBACK_TO_KEY] == "claude1"
 
     def test_base_url_propagated_when_in_yaml(self, fb_mod, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
-        # Write a presets.yaml with a base_url for chatgpt
         (tmp_path / "llm_presets.yaml").write_text(
-            "chatgpt:\n  provider: openai\n  model: gpt-5.6\n  base_url: http://proxy.local:9000\n",
+            "claude2:\n  provider: anthropic\n  model: claude-sonnet-4-6\n  base_url: http://proxy.local:9000\n",
             encoding="utf-8",
         )
         entry = fb_mod.build_preset_fallback_chain_entry(
-            active_preset="opus", hermes_home=tmp_path
+            active_preset="claude1", hermes_home=tmp_path
         )
         assert entry is not None
         assert entry.get("base_url") == "http://proxy.local:9000"
@@ -175,21 +171,18 @@ class TestBuildPresetFallbackChainEntry:
     def test_entry_has_provider_and_model(self, fb_mod, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         entry = fb_mod.build_preset_fallback_chain_entry(
-            active_preset="opus", hermes_home=tmp_path
+            active_preset="claude1", hermes_home=tmp_path
         )
-        assert "provider" in entry
-        assert "model" in entry
+        assert entry is not None
         assert entry["provider"]
         assert entry["model"]
 
-    def test_returns_none_on_import_error(self, fb_mod, monkeypatch):
-        """Should return None gracefully if get_preset_details raises."""
+    def test_returns_empty_on_import_error(self, fb_mod, monkeypatch):
         import agent.llm_presets_config as cfg
         monkeypatch.setattr(
             cfg, "get_preset_details", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom"))
         )
-        result = fb_mod.build_preset_fallback_chain_entry(active_preset="opus")
-        assert result is None
+        assert fb_mod.build_preset_fallback_chain(active_preset="claude1") == []
 
 
 class TestFormatNotices:
@@ -247,50 +240,39 @@ class TestFormatNotices:
 # ---------------------------------------------------------------------------
 
 class TestAgentInitInjection:
-    """Verify that build_preset_fallback_chain_entry result is prepended to the
-    agent's _fallback_chain during initialisation.
-
-    We don't spin up a full AIAgent (that requires real API credentials), so
-    we test the injection logic in isolation by calling the same code path
-    via agent_init's module-level helpers.
-    """
+    """Verify that a preset fallback entry is prepended to the agent chain."""
 
     def test_preset_fb_entry_prepended_when_chain_empty(self, tmp_path, monkeypatch):
-        """When no fallback_model is configured, _fallback_chain gets the preset entry."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         fb_mod = _import("agent.llm_preset_fallback")
         entry = fb_mod.build_preset_fallback_chain_entry(
-            active_preset="opus", hermes_home=tmp_path
+            active_preset="claude1", hermes_home=tmp_path
         )
         assert entry is not None
-        # Simulate what agent_init does
-        chain = []
-        chain = [entry] + chain
-        assert len(chain) == 1
-        assert chain[0][fb_mod.PRESET_FALLBACK_MARKER] == "opus"
+        chain = [entry]
+        assert chain[0][fb_mod.PRESET_FALLBACK_MARKER] == "claude1"
 
     def test_preset_fb_entry_prepended_before_user_providers(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         fb_mod = _import("agent.llm_preset_fallback")
         user_entry = {"provider": "openrouter", "model": "llama-3"}
         entry = fb_mod.build_preset_fallback_chain_entry(
-            active_preset="opus", hermes_home=tmp_path
+            active_preset="claude1", hermes_home=tmp_path
         )
-        chain = [entry] + [user_entry]
-        # Preset entry is first
-        assert chain[0][fb_mod.PRESET_FALLBACK_MARKER] == "opus"
-        # User entry still present
+        assert entry is not None
+        chain = [entry, user_entry]
+        assert chain[0][fb_mod.PRESET_FALLBACK_MARKER] == "claude1"
         assert chain[1]["provider"] == "openrouter"
 
     def test_preset_fb_entry_has_required_keys(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         fb_mod = _import("agent.llm_preset_fallback")
         entry = fb_mod.build_preset_fallback_chain_entry(
-            active_preset="opus", hermes_home=tmp_path
+            active_preset="claude1", hermes_home=tmp_path
         )
+        assert entry is not None
         required = {"provider", "model", "_preset_fallback_from", "_preset_fallback_to"}
-        for key in required:
-            assert key in entry, f"Missing key: {key}"
+        assert required <= entry.keys()
 
 
 # ---------------------------------------------------------------------------
@@ -307,13 +289,13 @@ class TestPresetFallbackActivation:
     """
 
     def _make_agent_with_preset_chain(
-        self, from_preset: str = "opus", tmp_path=None, monkeypatch=None
+        self, from_preset: str = "claude1", tmp_path=None, monkeypatch=None
     ) -> _MinimalAgent:
         """Build a minimal agent with the preset fallback entry pre-loaded."""
         fb_mod = _import("agent.llm_preset_fallback")
         agent = _MinimalAgent()
-        agent.model = "claude-opus-5" if from_preset == "opus" else "gpt-5.6"
-        agent.provider = "anthropic" if from_preset == "opus" else "openai"
+        agent.model = "claude-opus-5" if from_preset.startswith("claude") else "gpt-5.6"
+        agent.provider = "anthropic" if from_preset.startswith("claude") else "openai"
 
         if tmp_path and monkeypatch:
             monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
@@ -333,11 +315,11 @@ class TestPresetFallbackActivation:
         """When opus fails, _pending_fallback_notice must mention chatgpt."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         fb_mod = _import("agent.llm_preset_fallback")
-        agent = self._make_agent_with_preset_chain("opus", tmp_path, monkeypatch)
+        agent = self._make_agent_with_preset_chain("claude1", tmp_path, monkeypatch)
         assert agent._fallback_chain, "Preset entry must be injected"
 
         fb_entry = agent._fallback_chain[0]
-        assert fb_entry[fb_mod.PRESET_FALLBACK_MARKER] == "opus"
+        assert fb_entry[fb_mod.PRESET_FALLBACK_MARKER] == "claude1"
 
         # Manually invoke the notice path (without real client swap)
         from_preset = fb_entry["_preset_fallback_from"]
@@ -353,36 +335,35 @@ class TestPresetFallbackActivation:
         agent._active_preset_fallback_from = from_preset
 
         assert agent._pending_fallback_notice is not None
-        assert "gpt" in agent._pending_fallback_notice.lower() or "chatgpt" in agent._pending_fallback_notice.lower()
+        assert "claude 2" in agent._pending_fallback_notice.lower()
         assert "claude" in agent._pending_fallback_notice.lower() or "opus" in agent._pending_fallback_notice.lower()
 
     def test_opus_to_chatgpt_active_attr_set(self, tmp_path, monkeypatch):
         """_active_preset_fallback_from must be set to 'opus' after activation."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         fb_mod = _import("agent.llm_preset_fallback")
-        agent = self._make_agent_with_preset_chain("opus", tmp_path, monkeypatch)
+        agent = self._make_agent_with_preset_chain("claude1", tmp_path, monkeypatch)
         fb_entry = agent._fallback_chain[0]
 
         # Simulate the attribute-set step in try_activate_fallback
         agent._active_preset_fallback_from = fb_entry["_preset_fallback_from"]
-        assert agent._active_preset_fallback_from == "opus"
+        assert agent._active_preset_fallback_from == "claude1"
 
     def test_opus_to_chatgpt_global_preset_unchanged(self, tmp_path, monkeypatch):
         """The global preset file must NOT be modified by the fallback."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         preset_mod = _import("agent.llm_preset")
-        preset_mod.set_preset("opus", hermes_home=tmp_path)
+        preset_mod.set_preset("claude1", hermes_home=tmp_path)
 
         # Simulate fallback activation (no real client swap needed)
         fb_mod = _import("agent.llm_preset_fallback")
-        agent = self._make_agent_with_preset_chain("opus", tmp_path, monkeypatch)
+        agent = self._make_agent_with_preset_chain("claude1", tmp_path, monkeypatch)
         fb_entry = agent._fallback_chain[0]
         agent._active_preset_fallback_from = fb_entry["_preset_fallback_from"]
         agent.model = fb_entry["model"]
         agent.provider = fb_entry["provider"]
 
-        # Global preset must still be "opus"
-        assert preset_mod.get_preset(hermes_home=tmp_path) == "opus"
+        assert preset_mod.get_preset(hermes_home=tmp_path) == "claude1"
 
     def test_opus_to_chatgpt_notice_mentions_next_turn(self, tmp_path, monkeypatch):
         """Fallback notice must explicitly mention that the next turn retries opus."""

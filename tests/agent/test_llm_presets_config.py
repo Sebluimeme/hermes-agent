@@ -47,19 +47,18 @@ def _write_presets_yaml(path: Path, content: str) -> None:
 
 class TestBuiltinDefaults:
 
-    def test_opus_default_model_is_current(self):
-        """Default opus model should be claude-opus-5."""
+    def test_claude1_default_has_model(self):
         cfg = _import_module()
-        assert cfg.DEFAULT_BUILTIN_PRESETS["opus"]["model"] == "claude-opus-5"
+        assert cfg.DEFAULT_BUILTIN_PRESETS["claude1"]["model"]
 
     def test_chatgpt_default_model_is_current(self):
         """Default chatgpt model should be gpt-5.6."""
         cfg = _import_module()
         assert cfg.DEFAULT_BUILTIN_PRESETS["chatgpt"]["model"] == "gpt-5.6"
 
-    def test_opus_default_provider(self):
+    def test_claude1_default_provider(self):
         cfg = _import_module()
-        assert cfg.DEFAULT_BUILTIN_PRESETS["opus"]["provider"] == "anthropic"
+        assert cfg.DEFAULT_BUILTIN_PRESETS["claude1"]["provider"] == "anthropic"
 
     def test_chatgpt_default_provider(self):
         cfg = _import_module()
@@ -68,7 +67,7 @@ class TestBuiltinDefaults:
     def test_preset_labels_include_version(self):
         """Labels should mention the model version for clarity."""
         cfg = _import_module()
-        assert "4.6" in cfg.PRESET_LABELS["opus"] or "Opus" in cfg.PRESET_LABELS["opus"]
+        assert "Claude" in cfg.PRESET_LABELS["claude1"]
         assert "5.6" in cfg.PRESET_LABELS["chatgpt"] or "GPT" in cfg.PRESET_LABELS["chatgpt"]
 
     def test_no_builtin_base_url(self):
@@ -95,36 +94,37 @@ class TestLoadProfilePresets:
     def test_returns_builtin_when_no_file(self, tmp_path):
         cfg = _import_module()
         result = cfg.load_profile_presets(tmp_path)
-        assert "opus" in result
+        assert "claude1" in result
+        assert "claude2" in result
         assert "chatgpt" in result
-        assert result["opus"]["model"] == "claude-opus-5"
+        assert result["claude1"]["model"]
 
     def test_yaml_model_override(self, tmp_path):
         """A model override in YAML wins over the built-in default."""
         cfg = _import_module()
-        _write_presets_yaml(tmp_path, "opus:\n  provider: anthropic\n  model: claude-custom-99\n")
+        _write_presets_yaml(tmp_path, "claude1:\n  provider: anthropic\n  model: claude-custom-99\n")
         result = cfg.load_profile_presets(tmp_path)
-        assert result["opus"]["model"] == "claude-custom-99"
+        assert result["claude1"]["model"] == "claude-custom-99"
 
     def test_yaml_base_url_loaded(self, tmp_path):
         """base_url in YAML is captured and returned."""
         cfg = _import_module()
         _write_presets_yaml(
             tmp_path,
-            "opus:\n  provider: anthropic\n  model: claude-opus-5\n  base_url: http://localhost:4000\n",
+            "claude1:\n  provider: anthropic\n  model: claude-opus-5\n  base_url: http://localhost:4000\n",
         )
         result = cfg.load_profile_presets(tmp_path)
-        assert result["opus"].get("base_url") == "http://localhost:4000"
+        assert result["claude1"].get("base_url") == "http://localhost:4000"
 
     def test_yaml_api_mode_loaded(self, tmp_path):
         """api_mode in YAML is captured and returned."""
         cfg = _import_module()
         _write_presets_yaml(
             tmp_path,
-            "opus:\n  provider: anthropic\n  model: claude-opus-5\n  api_mode: proxy\n",
+            "claude1:\n  provider: anthropic\n  model: claude-opus-5\n  api_mode: proxy\n",
         )
         result = cfg.load_profile_presets(tmp_path)
-        assert result["opus"].get("api_mode") == "proxy"
+        assert result["claude1"].get("api_mode") == "proxy"
 
     def test_yaml_all_four_fields(self, tmp_path):
         """All four supported fields (provider, model, base_url, api_mode) load."""
@@ -132,7 +132,7 @@ class TestLoadProfilePresets:
         _write_presets_yaml(
             tmp_path,
             (
-                "opus:\n"
+                "claude1:\n"
                 "  provider: anthropic\n"
                 "  model: claude-opus-5\n"
                 "  base_url: http://proxy.local:9000\n"
@@ -140,7 +140,7 @@ class TestLoadProfilePresets:
             ),
         )
         result = cfg.load_profile_presets(tmp_path)
-        entry = result["opus"]
+        entry = result["claude1"]
         assert entry["provider"] == "anthropic"
         assert entry["model"] == "claude-opus-5"
         assert entry["base_url"] == "http://proxy.local:9000"
@@ -149,7 +149,7 @@ class TestLoadProfilePresets:
     def test_chatgpt_unaffected_by_opus_override(self, tmp_path):
         """Overriding opus leaves chatgpt at its built-in default."""
         cfg = _import_module()
-        _write_presets_yaml(tmp_path, "opus:\n  model: my-custom-model\n")
+        _write_presets_yaml(tmp_path, "claude1:\n  model: my-custom-model\n")
         result = cfg.load_profile_presets(tmp_path)
         assert result["chatgpt"]["model"] == "gpt-5.6"
 
@@ -158,18 +158,18 @@ class TestLoadProfilePresets:
         cfg = _import_module()
         (tmp_path / "llm_presets.yaml").write_text("{{{{ not valid yaml", encoding="utf-8")
         result = cfg.load_profile_presets(tmp_path)
-        assert result["opus"]["model"] == "claude-opus-5"
+        assert result["claude1"]["model"]
 
     def test_null_value_field_skipped(self, tmp_path):
         """A null YAML value is not included in the entry."""
         cfg = _import_module()
         _write_presets_yaml(
             tmp_path,
-            "opus:\n  provider: anthropic\n  model: claude-opus-5\n  base_url: null\n",
+            "claude1:\n  provider: anthropic\n  model: claude-opus-5\n  base_url: null\n",
         )
         result = cfg.load_profile_presets(tmp_path)
         # null base_url must not appear in the entry (falls back to provider default)
-        assert "base_url" not in result["opus"]
+        assert "base_url" not in result["claude1"]
 
     def test_unknown_preset_in_yaml_accepted(self, tmp_path):
         """Unknown preset names in YAML are stored (future-proof)."""
@@ -186,11 +186,11 @@ class TestLoadProfilePresets:
 
 class TestGetPresetDetails:
 
-    def test_opus_details_returns_provider_and_model(self, tmp_path):
+    def test_claude1_details_returns_provider_and_model(self, tmp_path):
         cfg = _import_module()
-        details = cfg.get_preset_details("opus", tmp_path)
+        details = cfg.get_preset_details("claude1", tmp_path)
         assert details.get("provider") == "anthropic"
-        assert details.get("model") == "claude-opus-5"
+        assert details.get("model")
 
     def test_unknown_preset_returns_empty(self, tmp_path):
         cfg = _import_module()
@@ -200,18 +200,18 @@ class TestGetPresetDetails:
         cfg = _import_module()
         _write_presets_yaml(
             tmp_path,
-            "opus:\n  provider: anthropic\n  model: claude-opus-5\n  base_url: http://local:5000\n",
+            "claude1:\n  provider: anthropic\n  model: claude-opus-5\n  base_url: http://local:5000\n",
         )
-        details = cfg.get_preset_details("opus", tmp_path)
+        details = cfg.get_preset_details("claude1", tmp_path)
         assert details.get("base_url") == "http://local:5000"
 
     def test_api_mode_present_when_in_yaml(self, tmp_path):
         cfg = _import_module()
         _write_presets_yaml(
             tmp_path,
-            "opus:\n  provider: anthropic\n  model: claude-opus-5\n  api_mode: responses\n",
+            "claude1:\n  provider: anthropic\n  model: claude-opus-5\n  api_mode: responses\n",
         )
-        details = cfg.get_preset_details("opus", tmp_path)
+        details = cfg.get_preset_details("claude1", tmp_path)
         assert details.get("api_mode") == "responses"
 
 
@@ -228,13 +228,13 @@ class TestResolvePresetRuntime:
         result = cfg.resolve_preset_runtime(tmp_path)
         assert isinstance(result, dict)
 
-    def test_returns_default_opus_when_no_preset_set(self, tmp_path, monkeypatch):
-        """Default preset is opus → returns opus details."""
+    def test_returns_default_claude2_when_no_preset_set(self, tmp_path, monkeypatch):
+        """The default preset resolves to Claude 2 details."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         cfg = _import_module()
         result = cfg.resolve_preset_runtime(tmp_path)
         assert result.get("provider") == "anthropic"
-        assert result.get("model") == "claude-opus-5"
+        assert result == cfg.get_preset_details("claude2", tmp_path)
 
     def test_returns_chatgpt_after_set_preset(self, tmp_path, monkeypatch):
         """After set_preset('chatgpt'), resolve_preset_runtime returns chatgpt details."""
@@ -255,13 +255,13 @@ class TestResolvePresetRuntime:
         """
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         preset_mod = _import_preset()
-        preset_mod.set_preset("opus", hermes_home=tmp_path)
+        preset_mod.set_preset("claude1", hermes_home=tmp_path)
 
         # Write a presets.yaml that sets a local proxy URL for opus
         _write_presets_yaml(
             tmp_path,
             (
-                "opus:\n"
+                "claude1:\n"
                 "  provider: anthropic\n"
                 "  model: claude-opus-5\n"
                 "  base_url: http://localhost:4000\n"
@@ -277,10 +277,10 @@ class TestResolvePresetRuntime:
         """api_mode is carried from llm_presets.yaml."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         preset_mod = _import_preset()
-        preset_mod.set_preset("opus", hermes_home=tmp_path)
+        preset_mod.set_preset("claude1", hermes_home=tmp_path)
         _write_presets_yaml(
             tmp_path,
-            "opus:\n  provider: anthropic\n  model: claude-opus-5\n  api_mode: openai\n",
+            "claude1:\n  provider: anthropic\n  model: claude-opus-5\n  api_mode: openai\n",
         )
         cfg = _import_module()
         result = cfg.resolve_preset_runtime(tmp_path)
@@ -320,9 +320,9 @@ class TestResolvePresetModelProviderCompat:
         result = cfg.resolve_preset_model_provider(tmp_path)
         assert isinstance(result, tuple) and len(result) == 2
 
-    def test_default_returns_opus_values(self, tmp_path, monkeypatch):
+    def test_default_returns_claude2_values(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         cfg = _import_module()
         model, provider = cfg.resolve_preset_model_provider(tmp_path)
         assert provider == "anthropic"
-        assert model == "claude-opus-5"
+        assert model == cfg.DEFAULT_BUILTIN_PRESETS["claude2"]["model"]

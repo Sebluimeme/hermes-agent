@@ -3833,7 +3833,7 @@ class GatewaySlashCommandsMixin:
             # Clearing the whole dict ensures every active topic immediately
             # sees the new preset without requiring a separate /new in each one.
             _overrides = getattr(self, "_session_model_overrides", None)
-            if isinstance(_overrides, dict):
+            if _overrides is not None:
                 _overrides.clear()
             label = get_preset_label(value)
             details = get_preset_details(value)
@@ -3908,7 +3908,7 @@ class GatewaySlashCommandsMixin:
                 options=", ".join(sorted(VALID_PRESETS)),
             )
 
-        # Typed: /agent opus or /agent chatgpt
+        # Typed: /agent claude1, /agent claude2, or /agent chatgpt
         msg = _apply_agent_selection(raw_args)
         await _clear_persisted_model_override()
         return msg

@@ -109,7 +109,7 @@ class TestAgentCommandPicker:
         choices = adapter.calls[0]["choices"]
         assert len(choices) == 2
         values = {c["value"] for c in choices}
-        assert values == {"opus", "chatgpt"}
+        assert values == {"claude1", "chatgpt"}
 
     @pytest.mark.asyncio
     async def test_current_preset_marked_is_current_on_picker(
@@ -140,8 +140,9 @@ class TestAgentCommandPicker:
         result = await runner._handle_agent_command(_make_event("/agent"))
 
         assert isinstance(result, str)
-        # Must mention both valid presets so the user knows their options.
-        assert "opus" in result
+        # Must mention all valid presets so the user knows their options.
+        assert "claude1" in result
+        assert "claude2" in result
         assert "chatgpt" in result
 
     @pytest.mark.asyncio
@@ -166,17 +167,18 @@ class TestAgentCommandPicker:
 class TestAgentCommandSelection:
 
     @pytest.mark.asyncio
-    async def test_typed_opus_sets_preset_globally(self, tmp_path, monkeypatch):
+    async def test_typed_claude1_sets_preset_globally(self, tmp_path, monkeypatch):
         from agent.llm_preset import get_preset, set_preset
 
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         set_preset("chatgpt")  # start from chatgpt
         runner = _make_runner()
 
-        response = await runner._handle_agent_command(_make_event("/agent opus"))
+        response = await runner._handle_agent_command(_make_event("/agent claude1"))
 
-        assert "opus" in response.lower() or "Claude Opus" in response
-        assert get_preset() == "opus"
+        assert response is not None
+        assert "claude 1" in response.lower()
+        assert get_preset() == "claude1"
 
     @pytest.mark.asyncio
     async def test_typed_chatgpt_sets_preset_globally(self, tmp_path, monkeypatch):
@@ -196,7 +198,7 @@ class TestAgentCommandSelection:
         turn constructs a fresh agent with the new model/provider."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         runner = _make_runner()
-        event = _make_event("/agent opus")
+        event = _make_event("/agent claude1")
         session_key = runner._session_key_for_source(event.source)
         # Pre-populate the agent cache with a sentinel.
         runner._agent_cache[session_key] = (object(), "sig")
@@ -503,11 +505,11 @@ class TestPresetRuntimeResolution:
         # HERMES_HOME must also point to tmp_path so resolve_preset_runtime()
         # reads llm_presets.yaml from the same directory (profile-scoped YAML).
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        set_preset("opus", hermes_home=tmp_path)
+        set_preset("claude1", hermes_home=tmp_path)
 
-        # Write a presets.yaml that routes opus to a local proxy
+        # Write a presets.yaml that routes Claude 1 to a local proxy.
         (tmp_path / "llm_presets.yaml").write_text(
-            "opus:\n"
+            "claude1:\n"
             "  provider: anthropic\n"
             "  model: claude-opus-4-6\n"
             "  base_url: http://localhost:4000\n",
@@ -569,11 +571,11 @@ class TestPresetRuntimeResolution:
 
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(global_home))
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
-        set_preset("opus", hermes_home=global_home)
+        set_preset("claude1", hermes_home=global_home)
 
         # Write presets.yaml only in the profile home (not in global)
         (profile_home / "llm_presets.yaml").write_text(
-            "opus:\n  provider: anthropic\n  model: claude-opus-4-6\n  base_url: http://profile-proxy:8080\n",
+            "claude1:\n  provider: anthropic\n  model: claude-opus-4-6\n  base_url: http://profile-proxy:8080\n",
             encoding="utf-8",
         )
 
@@ -597,10 +599,10 @@ class TestAgentCommandPrecedence:
 
     @pytest.mark.asyncio
     async def test_agent_clears_in_memory_model_override(self, tmp_path, monkeypatch):
-        """/agent opus clears an existing in-memory /model session override."""
+        """/agent claude1 clears an existing in-memory /model session override."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         runner = _make_runner()
-        event = _make_event("/agent opus")
+        event = _make_event("/agent claude1")
         session_key = runner._session_key_for_source(event.source)
 
         # Simulate a previous /model switch
@@ -676,7 +678,7 @@ class TestAgentCommandPrecedence:
 
         # Simulate user tapping the picker
         on_choice = adapter.calls[0]["on_choice_selected"]
-        await on_choice(event.source.chat_id, "opus")
+        await on_choice(event.source.chat_id, "claude1")
 
         # In-memory override must be gone
         assert session_key not in runner._session_model_overrides, (
@@ -693,7 +695,7 @@ class TestAgentCommandPrecedence:
         the user explicitly ran /new in each one."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         runner = _make_runner()
-        event = _make_event("/agent opus")
+        event = _make_event("/agent claude1")
 
         # Simulate three topics with their own /model overrides
         runner._session_model_overrides["topic_A"] = {
@@ -725,7 +727,7 @@ class TestAgentCommandPrecedence:
         runner = _make_runner()
         # No async_session_store attribute — must not raise AttributeError
         assert not hasattr(runner, "async_session_store")
-        event = _make_event("/agent opus")
+        event = _make_event("/agent claude1")
         # Should complete without raising
         result = await runner._handle_agent_command(event)
         assert result is not None
