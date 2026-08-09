@@ -1566,6 +1566,32 @@ def _validate_job_mode_invariants(
         )
 
 
+def _reject_oneshot_repeat_conflict(schedule_kind: Optional[str], repeat_times: Any) -> None:
+    """Reject the schedule/repeat combination that can never do what it says.
+
+    A ``kind="once"`` job fires at most once — it never reaches
+    ``advance_next_run``, so ``repeat.times > 1`` is a contradiction: the
+    config claims N runs but the scheduler can only ever deliver one, then
+    marks the job completed. This silently degrades ("ran once, then
+    completed") instead of failing loudly, which is exactly what happened to
+    job d7e51f2f21a6 (schedule kind="once", repeat.times=144 — one run, then
+    silently done). Callers must use an interval/cron schedule for anything
+    that should repeat more than once.
+    """
+    if (
+        schedule_kind == "once"
+        and isinstance(repeat_times, int)
+        and not isinstance(repeat_times, bool)
+        and repeat_times > 1
+    ):
+        raise ValueError(
+            f"A one-shot schedule (kind='once') cannot repeat {repeat_times} times — "
+            "it fires once and never reaches the recurrence logic. Use an "
+            "interval or cron schedule for repeat>1, or omit repeat / set it "
+            "to 1 for a true one-shot."
+        )
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1652,6 +1678,11 @@ def create_job(
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
         repeat = None
+
+    # A one-shot schedule can only ever fire once — repeat>1 is a
+    # contradiction that must fail loudly instead of silently completing
+    # after a single run (#HERMES-CRON-GUARD-01).
+    _reject_oneshot_repeat_conflict(parsed_schedule["kind"], repeat)
 
     # Auto-set repeat=1 for one-shot schedules if not specified
     if parsed_schedule["kind"] == "once" and repeat is None:
@@ -1954,6 +1985,20 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                             f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
                         )
                     updated["next_run_at"] = updated_next_run
+
+            # A one-shot only has one due time, so repeat > 1 would silently
+            # complete after its first dispatch. Check the effective record so
+            # neither a repeat update nor a schedule change can introduce it.
+            if schedule_changed or "repeat" in updates:
+                repeat_state = updated.get("repeat")
+                repeat_times = (
+                    repeat_state.get("times")
+                    if isinstance(repeat_state, dict)
+                    else repeat_state
+                )
+                _reject_oneshot_repeat_conflict(
+                    updated["schedule"].get("kind"), repeat_times
+                )
 
             if inference_fields_changed:
                 provider_snapshot, model_snapshot = _compute_provider_model_snapshots(

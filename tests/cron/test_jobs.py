@@ -278,6 +278,56 @@ class TestUpdateJob:
         assert fetched["name"] == "New Name"
 
 
+# =========================================================================
+# HERMES-CRON-GUARD-01 — reject kind=once with repeat>1
+#
+# Incident: job d7e51f2f21a6 (Ecobloc) was created with schedule kind="once"
+# and repeat.times=144. A one-shot job can only ever fire once (it never
+# reaches advance_next_run), so repeat>1 is a contradiction that silently
+# degrades to "ran once, then completed" — the operator believed the job
+# would repeat 144 times and it didn't. create_job/update_job must reject
+# this combination outright instead of accepting a config that can never do
+# what it says.
+# =========================================================================
+
+class TestOneshotRepeatGuard:
+    def test_create_job_rejects_oneshot_with_repeat_greater_than_one(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="one-shot"):
+            create_job(prompt="Ecobloc digest", schedule="30m", repeat=144)
+        # Nothing should have been persisted.
+        assert load_jobs() == []
+
+    def test_create_job_allows_oneshot_with_repeat_one(self, tmp_cron_dir):
+        job = create_job(prompt="One-shot", schedule="30m", repeat=1)
+        assert job["repeat"]["times"] == 1
+
+    def test_create_job_allows_oneshot_with_repeat_omitted(self, tmp_cron_dir):
+        job = create_job(prompt="One-shot", schedule="30m")
+        assert job["repeat"]["times"] == 1
+
+    def test_create_job_allows_recurring_with_repeat_n(self, tmp_cron_dir):
+        job = create_job(prompt="Recurring", schedule="every 1h", repeat=144)
+        assert job["schedule"]["kind"] == "interval"
+        assert job["repeat"]["times"] == 144
+
+    def test_update_job_rejects_setting_repeat_on_existing_oneshot(self, tmp_cron_dir):
+        job = create_job(prompt="One-shot", schedule="30m")
+        assert job["schedule"]["kind"] == "once"
+        with pytest.raises(ValueError, match="one-shot"):
+            update_job(job["id"], {"repeat": {"times": 144, "completed": 0}})
+        # The job on disk must be unchanged (rejected before persistence).
+        fetched = get_job(job["id"])
+        assert fetched["repeat"]["times"] == 1
+
+    def test_update_job_rejects_schedule_change_to_oneshot_with_existing_repeat(self, tmp_cron_dir):
+        job = create_job(prompt="Recurring", schedule="every 1h", repeat=144)
+        assert job["schedule"]["kind"] == "interval"
+        with pytest.raises(ValueError, match="one-shot"):
+            update_job(job["id"], {"schedule": "30m"})
+        fetched = get_job(job["id"])
+        assert fetched["schedule"]["kind"] == "interval"
+
+
 class TestPauseResumeJob:
     def test_pause_sets_state(self, tmp_cron_dir):
         job = create_job(prompt="Pause me", schedule="every 1h")
