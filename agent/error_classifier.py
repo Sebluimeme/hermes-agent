@@ -13,10 +13,65 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# Matches the Claude CLI's own quota wording, e.g.
+# "resets 11:20pm (Europe/Paris)" or "resets 8pm (Europe/Paris)".
+_CLI_RESET_TIME_RE = re.compile(
+    r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)",
+    re.IGNORECASE,
+)
+
+
+def _resolve_zone(name: str):
+    """Resolve an IANA zone name, tolerating case (classify_api_error
+    lowercases the whole message before this ever sees it — "europe/paris"
+    is not a valid key even though "Europe/Paris" is)."""
+    from zoneinfo import ZoneInfo, available_timezones
+
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        pass
+    lowered = name.lower()
+    for candidate in available_timezones():
+        if candidate.lower() == lowered:
+            return ZoneInfo(candidate)
+    return None
+
+
+def _parse_cli_reset_epoch(error_msg: str) -> Optional[float]:
+    """Parse a Claude-CLI-style "resets HH:MM(am|pm) (Zone)" clock time.
+
+    Returns the next occurrence of that clock time as a Unix epoch, or
+    None if the message doesn't match / the timezone name is unknown.
+    Fails open (returns None) on any error — callers fall back to the
+    existing generic backoff rather than blocking on a bad parse.
+    """
+    match = _CLI_RESET_TIME_RE.search(error_msg)
+    if not match:
+        return None
+    try:
+        hour = int(match.group(1)) % 12
+        minute = int(match.group(2) or 0)
+        if match.group(3).lower() == "pm":
+            hour += 12
+        tz = _resolve_zone(match.group(4).strip())
+        if tz is None:
+            return None
+        now = datetime.now(tz)
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate.timestamp()
+    except Exception:
+        logger.debug("Failed to parse CLI reset time from %r", error_msg, exc_info=True)
+        return None
 
 
 # ── Error taxonomy ──────────────────────────────────────────────────────
@@ -201,6 +256,14 @@ _USAGE_LIMIT_PATTERNS = [
     "quota",
     "limit exceeded",
     "key limit exceeded",
+    # Claude CLI's own wording (session/weekly caps), e.g. "You've hit your
+    # session limit · resets 11:20pm (Europe/Paris)" — previously unmatched,
+    # so these fell through to generic server_error/unknown and never
+    # triggered the preset fallback chain or its user-visible notice.
+    "session limit",
+    "weekly limit",
+    "hit your session limit",
+    "hit your weekly limit",
 ]
 
 # Patterns confirming usage limit is transient (not billing)
@@ -213,6 +276,8 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "requests remaining",
     "periodic",
     "window",
+    # Claude CLI prints "resets 11:20pm" / "resets 8pm" — no "at"/"in".
+    "resets ",
 ]
 
 # Payload-too-large patterns detected from message text (no status_code attr).
@@ -1231,6 +1296,26 @@ def _classify_by_status(
                 retryable=True,
                 should_compress=True,
             )
+        # The Claude CLI wrapper reports quota exhaustion ("You've hit your
+        # session/weekly limit · resets ...") as a generic HTTP 500 rather
+        # than 402/429, so without this check it fell through to the
+        # server_error branch below: retryable=True but should_fallback
+        # unset, meaning the retry loop burned max_retries against a quota
+        # that can't recover mid-turn and never activated the preset
+        # fallback chain (no switch, no user-visible notice).
+        if any(p in error_msg for p in _USAGE_LIMIT_PATTERNS):
+            has_transient_signal = any(p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS)
+            ctx: Dict[str, Any] = {"quota_message": error_msg}
+            reset_epoch = _parse_cli_reset_epoch(error_msg)
+            if reset_epoch is not None:
+                ctx["reset_epoch"] = reset_epoch
+            return result_fn(
+                FailoverReason.rate_limit if has_transient_signal else FailoverReason.billing,
+                retryable=has_transient_signal,
+                should_rotate_credential=True,
+                should_fallback=True,
+                error_context=ctx,
+            )
         return result_fn(FailoverReason.server_error, retryable=True)
 
     if status_code in {503, 529}:
@@ -1602,18 +1687,28 @@ def _classify_by_message(
     has_usage_limit = any(p in error_msg for p in _USAGE_LIMIT_PATTERNS)
     if has_usage_limit:
         has_transient_signal = any(p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS)
+        # Same context the status-coded quota branch builds: the raw quota
+        # wording drives the user-facing notice ("limite de session") and the
+        # parsed reset clock arms a cooldown that lasts until the quota
+        # actually recovers, instead of a blind exponential backoff.
+        ctx: Dict[str, Any] = {"quota_message": error_msg}
+        reset_epoch = _parse_cli_reset_epoch(error_msg)
+        if reset_epoch is not None:
+            ctx["reset_epoch"] = reset_epoch
         if has_transient_signal:
             return result_fn(
                 FailoverReason.rate_limit,
                 retryable=True,
                 should_rotate_credential=True,
                 should_fallback=True,
+                error_context=ctx,
             )
         return result_fn(
             FailoverReason.billing,
             retryable=False,
             should_rotate_credential=True,
             should_fallback=True,
+            error_context=ctx,
         )
 
     # Overloaded / server-busy patterns — must come BEFORE the rate_limit and

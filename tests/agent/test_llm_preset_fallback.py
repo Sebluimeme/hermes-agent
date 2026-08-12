@@ -95,10 +95,10 @@ class _MinimalAgent:
     def _buffer_status(self, msg: str) -> None:
         self._status_buffer.append(msg)
 
-    def _try_activate_fallback(self, reason=None):
+    def _try_activate_fallback(self, reason=None, error_context=None):
         """Thin forwarder matching production code."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return try_activate_fallback(self, reason, error_context)
 
     def _has_pending_fallback(self) -> bool:
         return self._fallback_index < len(self._fallback_chain)
@@ -218,6 +218,29 @@ class TestFormatNotices:
         )
         assert "gpt-5.6" in notice
         assert "claude-opus-5" in notice
+
+    def test_fallback_notice_includes_reason_when_given(self, fb_mod):
+        """The notice must say WHY, not just THAT — see the 2026-08-12
+        incident where a quota failover was invisible because the notice
+        never fired at all AND, once it did, said nothing about the cause."""
+        notice = fb_mod.format_preset_fallback_notice(
+            from_preset="opus",
+            to_preset="chatgpt",
+            from_model="claude-opus-5",
+            to_model="gpt-5.6",
+            reason_text="limite de session, réinitialisation 23h20",
+        )
+        assert "limite de session" in notice
+        assert "23h20" in notice
+
+    def test_fallback_notice_reason_omitted_when_empty(self, fb_mod):
+        notice = fb_mod.format_preset_fallback_notice(
+            from_preset="opus",
+            to_preset="chatgpt",
+            from_model="claude-opus-5",
+            to_model="gpt-5.6",
+        )
+        assert "()" not in notice
 
     def test_restored_notice_contains_preset_label(self, fb_mod):
         notice = fb_mod.format_preset_restored_notice(

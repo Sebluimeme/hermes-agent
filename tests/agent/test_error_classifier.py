@@ -274,6 +274,73 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    def test_500_claude_cli_session_limit_is_rate_limit_with_fallback(self):
+        """The Claude CLI wrapper reports quota exhaustion as a bare HTTP 500
+        ("You've hit your session limit · resets 11:20pm (Europe/Paris)")
+        instead of 402/429. Before this fix it fell through to the generic
+        server_error branch (retryable, no fallback), so the retry loop burned
+        all attempts against a quota that can't recover mid-turn and never
+        activated the preset fallback chain — no model switch, no notice."""
+        e = MockAPIError(
+            "claude CLI failed (rc=1): You've hit your session limit "
+            "· resets 11:20pm (Europe/Paris)",
+            status_code=500,
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_fallback is True
+
+    def test_500_claude_cli_weekly_limit_is_rate_limit_with_fallback(self):
+        e = MockAPIError(
+            "claude CLI failed (rc=1): You've hit your weekly limit "
+            "· resets 8pm (Europe/Paris)",
+            status_code=500,
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+        assert result.should_fallback is True
+
+    def test_500_claude_cli_session_limit_carries_raw_message_in_context(self):
+        """error_context must carry the raw message so the caller can build
+        a user-facing "why" (e.g. "limite de session") instead of a bare
+        "unavailable this turn" notice."""
+        e = MockAPIError(
+            "claude CLI failed (rc=1): You've hit your session limit "
+            "· resets 11:20pm (Europe/Paris)",
+            status_code=500,
+        )
+        result = classify_api_error(e, provider="custom")
+        assert "session limit" in result.error_context.get("quota_message", "")
+
+    def test_500_claude_cli_reset_time_parsed_into_epoch(self):
+        """error_context must carry a parsed reset_epoch so the caller can
+        set a precise cooldown instead of blindly retrying every turn until
+        the real reset time (which the message already told us)."""
+        import time as _time
+
+        e = MockAPIError(
+            "claude CLI failed (rc=1): You've hit your session limit "
+            "· resets 11:20pm (Europe/Paris)",
+            status_code=500,
+        )
+        result = classify_api_error(e, provider="custom")
+        reset_epoch = result.error_context.get("reset_epoch")
+        assert reset_epoch is not None
+        # Must be in the future (rolled to tomorrow if today's clock time
+        # already passed) and no more than 24h out.
+        assert reset_epoch > _time.time()
+        assert reset_epoch - _time.time() <= 24 * 3600
+
+    def test_500_generic_internal_server_error_still_server_error(self):
+        """Guard against over-matching: a plain 500 with no quota wording
+        must keep the existing retryable server_error classification."""
+        e = MockAPIError("Internal Server Error", status_code=500)
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server

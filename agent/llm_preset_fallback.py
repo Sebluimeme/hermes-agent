@@ -147,20 +147,25 @@ def format_preset_fallback_notice(
     to_preset: str,
     from_model: str,
     to_model: str,
+    reason_text: str = "",
 ) -> str:
     """Return the one-shot notice emitted when a preset fallback activates.
 
     Clearly names both presets (not just provider/model slugs) so the user
-    understands which configured preset is being used and why.
+    understands which configured preset is being used and why.  When
+    ``reason_text`` is supplied (e.g. "limite de session, réinitialisation
+    23h20"), it's included so the notice explains *why*, not just *that*.
 
     Example output:
-        ⚠️ Claude Opus 5 (claude-opus-5) indisponible ce tour —
-        réponse via ChatGPT GPT-5.6 (gpt-5.6). Prochain message : réessaie Claude Opus 5.
+        ⚠️ Claude Opus 5 (claude-opus-5) indisponible ce tour (limite de
+        session, réinitialisation 23h20) — réponse via ChatGPT GPT-5.6
+        (gpt-5.6). Prochain message : réessaie Claude Opus 5.
     """
     from_label = _preset_label(from_preset)
     to_label = _preset_label(to_preset)
+    reason_clause = f" ({reason_text})" if reason_text else ""
     return (
-        f"⚠️ {from_label} ({from_model}) indisponible ce tour — "
+        f"⚠️ {from_label} ({from_model}) indisponible ce tour{reason_clause} — "
         f"réponse via {to_label} ({to_model}). "
         f"Prochain message : réessaie {from_label}."
     )

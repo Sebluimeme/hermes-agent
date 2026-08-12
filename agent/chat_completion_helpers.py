@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -1920,13 +1921,59 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def _describe_failover_reason(
+    reason: "FailoverReason | None", error_context: Optional[dict]
+) -> str:
+    """Short, human (FR) description of why the primary failed over.
+
+    Used in the preset-fallback notice so the user sees *why* — not just
+    "unavailable this turn" — and, when the provider told us exactly when
+    it recovers, when it'll be back.
+    """
+    ctx = error_context or {}
+    reset_epoch = ctx.get("reset_epoch")
+    reset_str = (
+        datetime.fromtimestamp(reset_epoch).strftime("%Hh%M")
+        if reset_epoch else ""
+    )
+    quota_message = str(ctx.get("quota_message") or "")
+    if "session limit" in quota_message:
+        base = "limite de session"
+    elif "weekly limit" in quota_message:
+        base = "limite hebdomadaire"
+    elif reason == FailoverReason.billing:
+        base = "quota/crédits épuisés"
+    elif reason == FailoverReason.rate_limit:
+        base = "limite de débit"
+    elif reason == FailoverReason.upstream_rate_limit:
+        base = "fournisseur en amont limité"
+    elif reason == FailoverReason.timeout:
+        base = "timeout"
+    elif reason == FailoverReason.overloaded:
+        base = "surchargé"
+    elif reason == FailoverReason.auth:
+        base = "authentification échouée"
+    else:
+        return ""
+    return f"{base}, réinitialisation {reset_str}" if reset_str else base
+
+
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    error_context: Optional[dict] = None,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
     OpenAI client, model slug, and provider in-place so the retry loop
     can continue with the new backend.  Advances through the chain on
     each call; returns False when exhausted.
+
+    ``error_context`` carries classifier detail (e.g. the Claude CLI's
+    parsed ``reset_epoch`` / raw ``quota_message`` for a session/weekly
+    quota) so the cooldown and the user-facing notice can be precise
+    instead of a blind guess.
 
     Uses the centralized provider router (resolve_provider_client) for
     auth resolution and client construction — no duplicated provider→key
@@ -1940,20 +1987,34 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            # Exponential backoff: keep upstream's 60s first-hit cooldown and
-            # escalate on CONSECUTIVE rate-limits: 60s → 2m → 4m → 8m → ... →
-            # 4h cap. The first 429 must NOT bench the primary for half an
-            # hour — fast primary restore is the common case; escalation only
-            # punishes providers that keep 429ing.
-            # Counter is reset by restore_primary_runtime on successful restore.
-            backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
-            agent._rate_limit_backoff_count = backoff_count + 1
-            backoff_seconds = min(60 * (2 ** backoff_count), 14400)
-            agent._rate_limited_until = time.monotonic() + backoff_seconds
-            logging.info(
-                "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
-                backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
-            )
+            # A known reset clock time (parsed from the Claude CLI's own
+            # "resets 11:20pm (Europe/Paris)" wording) beats guessing: it
+            # tells us exactly when the primary can serve again, instead of
+            # an exponential backoff that keeps retrying — and failing —
+            # every turn until it happens to overshoot the real reset.
+            reset_epoch = (error_context or {}).get("reset_epoch")
+            if reset_epoch:
+                agent._rate_limited_until = time.monotonic() + max(0.0, reset_epoch - time.time())
+                logging.info(
+                    "Rate-limit cooldown set from parsed reset time: %.0fs (until %s)",
+                    max(0.0, reset_epoch - time.time()),
+                    datetime.fromtimestamp(reset_epoch).isoformat(timespec="seconds"),
+                )
+            else:
+                # Exponential backoff: keep upstream's 60s first-hit cooldown and
+                # escalate on CONSECUTIVE rate-limits: 60s → 2m → 4m → 8m → ... →
+                # 4h cap. The first 429 must NOT bench the primary for half an
+                # hour — fast primary restore is the common case; escalation only
+                # punishes providers that keep 429ing.
+                # Counter is reset by restore_primary_runtime on successful restore.
+                backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
+                agent._rate_limit_backoff_count = backoff_count + 1
+                backoff_seconds = min(60 * (2 ** backoff_count), 14400)
+                agent._rate_limited_until = time.monotonic() + backoff_seconds
+                logging.info(
+                    "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
+                    backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
+                )
     if agent._fallback_index >= len(agent._fallback_chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
@@ -1980,11 +2041,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, error_context)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return agent._try_activate_fallback(reason, error_context)  # skip invalid, try next
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -1995,7 +2056,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, error_context)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2020,7 +2081,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return agent._try_activate_fallback(reason, error_context)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -2050,7 +2111,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return agent._try_activate_fallback(reason, error_context)  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2292,6 +2353,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                     to_preset=_preset_fb_to,
                     from_model=old_model,
                     to_model=fb_model,
+                    reason_text=_describe_failover_reason(reason, error_context),
                 )
             except Exception:
                 _notice = (
@@ -2339,7 +2401,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return agent._try_activate_fallback(reason, error_context)  # try next in chain
 
 
 

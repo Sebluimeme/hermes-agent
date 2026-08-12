@@ -22,10 +22,16 @@ from agent.chat_completion_helpers import _FALLBACK_EXHAUSTED_COOLDOWN_S
 
 
 def _make_agent(fallback_model=None):
+    # build_preset_fallback_chain() prepends the active global preset's
+    # peer as a same-turn fallback entry (HERMES-LLM-001 tranche 4), which
+    # would otherwise pad every ``fallback_model`` chain below with extra
+    # entries and break the exhaustion-count assertions this suite makes.
+    # Isolate exhaustion-cooldown behavior from that unrelated feature.
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
+        patch("agent.llm_preset_fallback.build_preset_fallback_chain", return_value=[]),
     ):
         agent = AIAgent(
             api_key="test-key",
