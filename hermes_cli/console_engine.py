@@ -980,75 +980,6 @@ class HermesConsoleEngine:
             ),
         )
 
-        _register_command_family(
-            self,
-            root="kanban",
-            paths=[
-                ("init",),
-                ("boards", "list"),
-                ("boards", "create"),
-                ("boards", "rm"),
-                ("boards", "switch"),
-                ("boards", "current"),
-                ("boards", "rename"),
-                ("boards", "set-workdir"),
-                ("create",),
-                ("list",),
-                ("show",),
-                ("assign",),
-                ("reclaim",),
-                ("reassign",),
-                ("diagnose",),
-                ("link",),
-                ("unlink",),
-                ("claim",),
-                ("comment",),
-                ("complete",),
-                ("edit",),
-                ("block",),
-                ("schedule",),
-                ("unblock",),
-                ("promote",),
-                ("archive",),
-                ("stats",),
-                ("runs",),
-                ("heartbeat",),
-                ("assignments",),
-                ("context",),
-            ],
-            summaries=_builder_summaries("hermes_cli.kanban", "build_parser"),
-            mutating=[
-                ("init",),
-                ("boards", "create"),
-                ("boards", "rm"),
-                ("boards", "switch"),
-                ("boards", "rename"),
-                ("boards", "set-workdir"),
-                ("create",),
-                ("assign",),
-                ("reclaim",),
-                ("reassign",),
-                ("link",),
-                ("unlink",),
-                ("claim",),
-                ("comment",),
-                ("complete",),
-                ("edit",),
-                ("block",),
-                ("schedule",),
-                ("unblock",),
-                ("promote",),
-                ("archive",),
-            ],
-            handler_factory=lambda fixed: _builder_handler(
-                "kanban",
-                fixed,
-                "hermes_cli.kanban",
-                "build_parser",
-                "cmd_kanban",
-            ),
-        )
-
         registered = {
             "bundles": (
                 "hermes_cli.bundles",
@@ -1214,14 +1145,6 @@ class HermesConsoleEngine:
             ("skills", "publish"): "`skills publish` is not available in Hermes Console.",
             ("portal", "login"): "`portal login` is interactive and is not available in Hermes Console.",
             ("portal", "open"): "`portal open` opens a browser and is not available in Hermes Console.",
-            ("kanban", "tail"): "`kanban tail` streams output and is not available in Hermes Console.",
-            ("kanban", "watch"): "`kanban watch` streams output and is not available in Hermes Console.",
-            ("kanban", "daemon"): "`kanban daemon` starts a service and is not available in Hermes Console.",
-            ("kanban", "dispatcher"): "`kanban dispatcher` starts a worker and is not available in Hermes Console.",
-            ("kanban", "swarm"): "`kanban swarm` starts agent work and is not available in Hermes Console.",
-            ("kanban", "decompose"): "`kanban decompose` starts agent work and is not available in Hermes Console.",
-            ("kanban", "specify"): "`kanban specify` starts agent work and is not available in Hermes Console.",
-            ("kanban", "gc"): "`kanban gc` is not available in Hermes Console.",
         }
         if len(tokens) >= 2:
             pair = (tokens[0], tokens[1])
@@ -1339,7 +1262,7 @@ def _sessions_list(_engine: HermesConsoleEngine, args: list[str]) -> str:
     db = SessionDB()
     try:
         sessions = db.list_sessions_rich(
-            exclude_sources=["kanban", "tool"],
+            exclude_sources=["tool"],
             limit=ns.limit,
             order_by_last_active=True,
         )
@@ -1355,7 +1278,7 @@ def _sessions_stats(_engine: HermesConsoleEngine, args: list[str]) -> str:
     db = SessionDB()
     try:
         total = db.session_count()
-        listable = db.session_count(exclude_children=True, exclude_sources=["kanban", "tool"])
+        listable = db.session_count(exclude_children=True, exclude_sources=["tool"])
         messages = db.message_count()
         lines = [
             f"Total sessions: {total}",

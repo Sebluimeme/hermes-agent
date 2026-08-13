@@ -2465,7 +2465,6 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
@@ -5920,7 +5919,7 @@ class TurnRunner:
 
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(GatewayAuthorizationMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -6248,7 +6247,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
         # context pin; last-delivered voice-channel context) lives on
         # SessionState.conversation — see gateway/session_state.py.
-        self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -11978,17 +11976,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to /new (does not kill the turn; see agent.session_stall_timeout).
         self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
 
-        # Start background kanban notifier — each gateway delivers events for
-        # subscriptions owned by the profiles whose adapters it hosts, even
-        # when another gateway owns the single dispatcher.
-        self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
-
-        # Start background kanban dispatcher — spawns workers for ready
-        # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
-        # When false, users run `hermes kanban daemon` externally or
-        # simply don't use kanban; this loop becomes a no-op.
-        self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
-
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -12879,12 +12866,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return get_active_profile_name() or "default"
         except Exception:
             return "default"
-
-    # ── Kanban board watchers ───────────────────────────────────────────
-    # The kanban notifier/dispatcher watcher loops + their helpers live in
-    # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
-    # self state, so inheriting the mixin keeps every self._kanban_* call site
-    # working unchanged while lifting ~1,000 LOC out of this file.
 
     def _ensure_reconnect_watcher_running(self) -> None:
         """Ensure the platform reconnect watcher background task is alive.
@@ -14828,7 +14809,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "pause": self._handle_pause_command,
                 "agents": self._handle_agents_command,
                 "background": self._handle_background_command,
-                "kanban": self._handle_kanban_command,
                 "subgoal": self._handle_subgoal_command,
                 "heartbeat": self._handle_heartbeat_command,
                 "yolo": self._handle_yolo_command,
@@ -16062,9 +16042,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
-
-        if canonical == "kanban":
-            return await self._handle_kanban_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)

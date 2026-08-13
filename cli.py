@@ -1354,9 +1354,8 @@ def _reset_terminal_input_modes_on_exit() -> None:
     SGR mouse reports as visible text in whatever runs next in the same tab
     (#36823). Called from ``_run_cleanup`` (atexit-registered + invoked on the
     normal / EOF / interrupt exit paths) this covers normal quit, Ctrl+C and
-    SIGTERM/SIGHUP. ``kill -9`` is uncatchable, and the kanban worker's
-    ``os._exit(0)`` path bypasses ``atexit``; neither runs this — but both are
-    non-TTY / non-TUI, so there is nothing to reset there.
+    SIGTERM/SIGHUP. ``kill -9`` is uncatchable and bypasses ``atexit``; that
+    path is non-TTY / non-TUI, so there is nothing to reset there.
 
     Gated on ``_tui_input_modes_active`` so one-shot non-TUI CLI runs (which
     share ``_run_cleanup`` via ``atexit``) never emit these codes. Writes to the
@@ -2210,8 +2209,7 @@ def _run_checkpoint_auto_maintenance() -> None:
 def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     """Remove stale worktrees and orphaned branches on startup.
 
-    Covers EVERY directory under ``.worktrees/`` except kanban task trees
-    (``t_<hex>`` — owned by the kanban dispatcher's own gc). Scratch trees
+    Covers EVERY directory under ``.worktrees/``. Scratch trees
     created by ``hermes -w`` (``hermes-*``) age out fast; named trees created
     manually for salvage/review lanes age out on a slower schedule:
 
@@ -2259,7 +2257,6 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
        preserved for unpushed work is not re-diff-hashed on every subsequent
        startup.
     """
-    import re
     import subprocess
     import time
 
@@ -2271,16 +2268,13 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
     now = time.time()
     stale_work_cutoff = now - (7 * 24 * 3600)
     preserved_stale: list = []
-    # Kanban task worktrees (<repo>/.worktrees/t_<hex>) have their own
-    # dispatcher-driven lifecycle (hermes kanban gc) — never touch them here.
-    kanban_re = re.compile(r"^t_[0-9a-f]+$")
 
     # ── Phase 1: age filter (no subprocesses) ───────────────────────────────
     # Cheap stat-only pass so the thread pool below is sized to the trees that
     # actually need git work, not to everything on disk.
     candidates: list = []
     for entry in sorted(worktrees_dir.iterdir()):
-        if not entry.is_dir() or kanban_re.match(entry.name):
+        if not entry.is_dir():
             continue
 
         # Scratch trees (hermes-*) age out on the default schedule; named
@@ -8213,7 +8207,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 include_all_sources=False,
                 include_unnamed=True,
                 limit=limit,
-                exclude_sources=["kanban", "tool"],
+                exclude_sources=["tool"],
             )
         except Exception:
             return []
@@ -10430,8 +10424,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_blueprint_command(cmd_original)
         elif canonical == "curator":
             self._handle_curator_command(cmd_original)
-        elif canonical == "kanban":
-            self._handle_kanban_command(cmd_original)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
@@ -18271,107 +18263,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
-    """Drive a kanban goal_mode worker through the Ralph-style goal loop.
-
-    Called from the quiet single-query path AFTER the worker's first turn,
-    only when ``HERMES_KANBAN_GOAL_MODE`` is set (dispatcher-spawned
-    goal_mode card). Wires the worker's ``run_conversation`` and the kanban
-    DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
-    caller — a broken goal loop must never wedge a worker, the dispatcher's
-    claim TTL / crash detection is the backstop.
-    """
-    import os as _os
-
-    task_id = (_os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    if not task_id:
-        return
-    worker_run_id = None
-    raw_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
-    if raw_run_id:
-        try:
-            worker_run_id = int(raw_run_id)
-        except ValueError:
-            logger.warning("invalid HERMES_KANBAN_RUN_ID=%r", raw_run_id)
-
-    from hermes_cli import kanban_db as _kb
-    from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
-
-    # Resolve goal text from the card (title + body = the acceptance
-    # criteria the judge evaluates against).
-    conn = _kb.connect()
-    try:
-        task = _kb.get_task(conn, task_id)
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-    if task is None:
-        return
-
-    goal_parts = [task.title or ""]
-    if task.body:
-        goal_parts.append(task.body)
-    goal_text = "\n\n".join(p for p in goal_parts if p).strip()
-    if not goal_text:
-        return
-
-    max_turns = task.goal_max_turns or _DEF_TURNS
-
-    def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
-            user_message=prompt,
-            conversation_history=cli.conversation_history,
-        )
-        # Keep session_id in sync if mid-run compression rotated it.
-        if (
-            getattr(cli.agent, "session_id", None)
-            and cli.agent.session_id != cli.session_id
-        ):
-            cli.session_id = cli.agent.session_id
-        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
-        if resp:
-            print(resp)
-        return resp or ""
-
-    def _task_status() -> "str | None":
-        c = _kb.connect()
-        try:
-            return _kb.goal_run_status(c, task_id, worker_run_id)
-        finally:
-            try:
-                c.close()
-            except Exception:
-                pass
-
-    def _block(reason: str) -> None:
-        c = _kb.connect()
-        try:
-            _kb.block_task(
-                c,
-                task_id,
-                reason=reason,
-                expected_run_id=worker_run_id,
-            )
-        finally:
-            try:
-                c.close()
-            except Exception:
-                pass
-
-    _run_loop(
-        task_id=task_id,
-        goal_text=goal_text,
-        run_turn=_run_turn,
-        task_status_fn=_task_status,
-        block_fn=_block,
-        max_turns=max_turns,
-        first_response=first_response or "",
-        log=lambda m: logger.info("%s", m),
-    )
-
-
 def main(
     query: str = None,
     q: str = None,
@@ -18671,39 +18562,6 @@ def main(
                     time.sleep(_grace)
         except Exception:
             pass  # never block signal handling
-        # Kanban worker exit path (#28181): SIGTERM hits a dispatcher-spawned
-        # worker that's likely in a non-daemon thread waiting on a child
-        # subprocess in _wait_for_process. Raising KeyboardInterrupt only
-        # unwinds the main thread; the worker thread keeps running, the
-        # process gets reparented to init, and the dispatcher's _pid_alive
-        # check returns True forever — task stuck in 'running' indefinitely.
-        # Skip the controlled-unwind dance and call os._exit(0) so the kernel
-        # reclaims the PID immediately and detect_crashed_workers can reclaim
-        # the stale claim on the next tick. Flush logging + stdout/stderr
-        # first so the final debug trace isn't lost; SIGALRM deadman guards
-        # the flush against any rare blocking-I/O case (the reporter measured
-        # flush in <1ms; the alarm is a failsafe, not the common path).
-        if os.environ.get("HERMES_KANBAN_TASK"):
-            try:
-                import signal as _sig_mod
-                if hasattr(_sig_mod, "SIGALRM"):
-                    # Cancel any pre-existing alarm to avoid colliding with
-                    # caller-installed timers.
-                    _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
-                    _sig_mod.alarm(2)
-            except Exception:
-                pass
-            try:
-                import logging as _lg
-                _lg.shutdown()
-            except Exception:
-                pass
-            for _stream in (sys.stdout, sys.stderr):
-                try:
-                    _stream.flush()
-                except Exception:
-                    pass
-            os._exit(0)
         raise KeyboardInterrupt()
     try:
         import signal as _signal
@@ -18724,43 +18582,7 @@ def main(
             sys.exit(1)
         try:
             query, single_query_images = _collect_query_images(query, image)
-            # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
-            # the actual task description lives in the task body. Mirror the
-            # gateway/CLI behaviour for inbound images by scanning the body for
-            # local image paths and http(s) image URLs and attaching them to the
-            # worker's first turn. Without this, users who paste a screenshot
-            # path or URL into a kanban task body never get it routed to the
-            # model's vision input.
             single_query_image_urls: list[str] = []
-            _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
-            if _kanban_task_id:
-                try:
-                    from hermes_cli import kanban_db as _kb
-                    from agent.image_routing import extract_image_refs as _extract_refs
-
-                    _conn = _kb.connect()
-                    try:
-                        _task = _kb.get_task(_conn, _kanban_task_id)
-                    finally:
-                        try:
-                            _conn.close()
-                        except Exception:
-                            pass
-                    _body = getattr(_task, "body", "") if _task is not None else ""
-                    if _body:
-                        _kb_paths, _kb_urls = _extract_refs(_body)
-                        if _kb_paths:
-                            # Dedupe against any --image the user already passed.
-                            _seen = {str(p) for p in single_query_images}
-                            for _p in _kb_paths:
-                                if _p not in _seen:
-                                    _seen.add(_p)
-                                    single_query_images.append(Path(_p))
-                        if _kb_urls:
-                            single_query_image_urls.extend(_kb_urls)
-                except Exception as _exc:
-                    # Best-effort enrichment; never block worker startup on it.
-                    logger.debug("kanban image-ref extraction failed: %s", _exc)
             if quiet:
                 # Quiet mode: suppress banner, spinner, tool previews.
                 # Only print the final response and parseable session info.
@@ -18872,47 +18694,13 @@ def main(
                         elif response:
                             print(response)
 
-                        # Kanban goal-loop mode: a worker spawned for a
-                        # goal_mode card keeps working in THIS session until an
-                        # auxiliary judge agrees the card is done, the worker
-                        # terminates the task itself, or the turn budget runs
-                        # out (→ sticky block). Gated on the env vars the
-                        # dispatcher sets in `_default_spawn`; a no-op for every
-                        # normal worker and every non-kanban `-q` run.
-                        if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
-                            try:
-                                _run_kanban_goal_loop_q(cli, response)
-                            except Exception as _goal_exc:
-                                logger.debug("kanban goal loop failed: %s", _goal_exc)
-
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
                         # Ensure proper exit code for automation wrappers.
-                        #
-                        # Kanban workers get a special case: when the run failed
-                        # purely because the provider rate-limited / exhausted
-                        # quota (not because the task itself is broken), exit with
-                        # the EX_TEMPFAIL sentinel instead of the generic 1. The
-                        # dispatcher's reap classifier maps that code to a
-                        # ``rate_limited`` exit and releases the task back to
-                        # ``ready`` WITHOUT incrementing the failure counter, so a
-                        # 5-hour quota window can't trip the circuit breaker and
-                        # permanently block the card. Non-kanban runs keep the
-                        # plain 0/1 contract automation wrappers expect.
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
                             _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
