@@ -1431,6 +1431,26 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+
+    # ── Preset-level fallback injection (HERMES-LLM-001 tranche 4) ──────────
+    # Prepend an entry for the "other preset" so a transient failure of the
+    # active preset's provider (quota, auth, timeout, transport) automatically
+    # retries with the peer preset IN THE SAME TURN, without modifying the
+    # persisted global preset.  The entry is marked with ``_preset_fallback_from``
+    # so chat_completion_helpers can emit a preset-aware notice instead of the
+    # generic "switched to fallback model" line.
+    try:
+        from agent.llm_preset_fallback import build_preset_fallback_chain
+        _preset_fallbacks = build_preset_fallback_chain()
+        if _preset_fallbacks:
+            # Prepend: the preset-level route is tried before user-configured
+            # provider entries.  This preserves Claude 1 by never routing
+            # Claude 2 back to it automatically.
+            agent._fallback_chain = _preset_fallbacks + agent._fallback_chain
+    except Exception:
+        logger.debug("agent_init: preset fallback injection failed", exc_info=True)
+    # ── End of preset fallback injection ────────────────────────────────────
+
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:

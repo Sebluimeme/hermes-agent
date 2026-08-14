@@ -915,6 +915,17 @@ class TestBuildSystemPrompt:
 
 
 
+    def test_runtime_identity_overrides_stale_history(self, agent):
+        agent.model = "gpt-current"
+        agent.provider = "provider-current"
+        prompt = agent._build_system_prompt()
+        assert "Model:" in prompt
+        assert "Provider:" in prompt
+        assert (
+            "These Model and Provider values are authoritative for the current turn" in prompt
+        )
+        assert "Never infer the active model from earlier conversation messages" in prompt
+
     def test_datetime_is_date_only_not_minute_precision(self, agent):
         """Timestamp must be date-only (no HH:MM) so the system prompt
         stays byte-stable for the full day. Minute precision invalidates

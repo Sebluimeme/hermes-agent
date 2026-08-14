@@ -2277,24 +2277,58 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        agent._buffer_status(
-            f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}"
-        )
-        # The buffered line above is dropped on successful recovery, but a
-        # provider/model switch is a durable state change operators must see
-        # even when the fallback succeeds.  Record a one-shot notice that the
-        # success path surfaces exactly once via _emit_pending_fallback_notice
-        # (see run_agent.py); it is discarded on terminal failure since the
-        # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
-        logger.info(
-            "Fallback activated: %s → %s (%s)",
-            old_model, fb_model, fb_provider,
-        )
+        # ── Preset-level fallback notice (HERMES-LLM-001 tranche 4) ─────────
+        # When the chain entry is a preset-level hop (marked with
+        # ``_preset_fallback_from``), emit a preset-aware notice that names
+        # the configured presets explicitly instead of raw provider/model slugs.
+        # This makes the fallback visible and understandable to the user.
+        _preset_fb_from = fb.get("_preset_fallback_from")
+        if _preset_fb_from:
+            _preset_fb_to = fb.get("_preset_fallback_to", "")
+            try:
+                from agent.llm_preset_fallback import format_preset_fallback_notice
+                _notice = format_preset_fallback_notice(
+                    from_preset=_preset_fb_from,
+                    to_preset=_preset_fb_to,
+                    from_model=old_model,
+                    to_model=fb_model,
+                )
+            except Exception:
+                _notice = (
+                    f"⚠️ Preset {_preset_fb_from} ({old_model}) indisponible ce tour — "
+                    f"réponse via preset {_preset_fb_to} ({fb_model})."
+                )
+            agent._buffer_status(_notice)
+            agent._pending_fallback_notice = _notice
+            # Mark on the agent so restore_primary_runtime knows a preset
+            # fallback was active and can emit a "restored" notice next turn.
+            agent._active_preset_fallback_from = _preset_fb_from
+            logger.info(
+                "Preset fallback activated: %s/%s → %s/%s (preset %s → %s)",
+                old_provider, old_model, fb_provider, fb_model,
+                _preset_fb_from, _preset_fb_to,
+            )
+        else:
+            # Generic (non-preset) fallback — existing behaviour unchanged.
+            agent._buffer_status(
+                f"🔄 Primary model failed — switching to fallback: "
+                f"{fb_model} via {fb_provider}"
+            )
+            # The buffered line above is dropped on successful recovery, but a
+            # provider/model switch is a durable state change operators must see
+            # even when the fallback succeeds.  Record a one-shot notice that the
+            # success path surfaces exactly once via _emit_pending_fallback_notice
+            # (see run_agent.py); it is discarded on terminal failure since the
+            # buffered line is flushed instead.  See fallback-observability fix.
+            agent._pending_fallback_notice = (
+                f"🔄 Switched to fallback model: {old_model} via {old_provider} "
+                f"→ {fb_model} via {fb_provider}"
+            )
+            logger.info(
+                "Fallback activated: %s → %s (%s)",
+                old_model, fb_model, fb_provider,
+            )
+        # ── End of preset-level notice logic ─────────────────────────────────
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the OLD provider's unresponsiveness.  Carrying it over would
         # short-circuit the freshly activated fallback before it gets a

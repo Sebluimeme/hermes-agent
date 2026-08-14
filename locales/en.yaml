@@ -144,6 +144,10 @@ gateway:
     choice_fast:           "fast — Priority Processing on"
     choice_normal:         "normal — standard processing"
 
+  agent_preset:
+    picker_title:          "🤖 **Agent LLM** — current: {current}\n\nPick a preset:"
+    status:                "🤖 **Agent LLM** — current: **{current}**{detail}\n\n_Options:_ {options}"
+
   footer:
     status:                "📎 Runtime footer: **{state}**\nFields: `{fields}`\nPlatform: `{platform}`"
     usage:                 "Usage: `/footer [on|off|status]`"

@@ -3676,6 +3676,135 @@ class GatewaySlashCommandsMixin:
         # or alter its system prompt/tool schema (prompt-cache prefix is sacred).
         return result.message
 
+    async def _handle_agent_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /agent — switch the conversational LLM (Claude 1 / ChatGPT).
+
+        No args: show an interactive two-button picker (Telegram) or a text
+        status card on platforms without picker support.
+
+        /agent claude1   — switch to Claude 1 globally
+        /agent chatgpt   — switch to ChatGPT globally
+
+        The selection is written to a global preset file shared by all profiles
+        via ``agent.llm_preset.set_preset()``.  Gateways pick it up on every
+        new turn before constructing or reusing an agent.  Session history is
+        preserved — only the model/provider changes.
+
+        Provider/model details come from the profile's ``llm_presets.yaml``
+        (defaults to built-in values).  No ports or secrets are hardcoded.
+        """
+        from agent.llm_preset import VALID_PRESETS, get_preset, set_preset
+        from agent.llm_presets_config import get_preset_details, get_preset_label
+
+        raw_args = event.get_command_args().strip().lower()
+        session_key = self._session_key_for_source(event.source)
+        current_preset = get_preset()
+
+        def _apply_agent_selection(value: str) -> str:
+            """Validate, persist and acknowledge a preset selection.
+
+            Also clears any in-memory /model session override so the new global
+            preset takes effect on the very next turn without being shadowed by
+            a previously-set /model choice.  The persisted override must be
+            cleared separately in the async caller (via async_session_store).
+            """
+            value = str(value).strip().lower()
+            if value not in VALID_PRESETS:
+                return (
+                    f"Preset inconnu : {value!r}. "
+                    f"Options : {', '.join(sorted(VALID_PRESETS))}"
+                )
+            set_preset(value)
+            # Evict cached agent so the next turn constructs a new one from the
+            # updated preset — the session history (conversation) is preserved.
+            self._evict_cached_agent(session_key)
+            # Clear ALL in-memory /model session overrides: /agent must win
+            # globally across every topic.  A per-topic /model override would
+            # shadow the new global preset on the very next turn because
+            # _resolve_session_agent_runtime checks overrides before presets.
+            # Clearing the whole dict ensures every active topic immediately
+            # sees the new preset without requiring a separate /new in each one.
+            _overrides = getattr(self, "_session_model_overrides", None)
+            if _overrides is not None:
+                _overrides.clear()
+            label = get_preset_label(value)
+            details = get_preset_details(value)
+            provider = details.get("provider", "")
+            model = details.get("model", "")
+            detail_str = f" ({provider} / {model})" if provider and model else ""
+            return f"✓ Agent LLM : {label}{detail_str}"
+
+        async def _clear_persisted_model_override() -> None:
+            """Clear the persisted /model override from ALL sessions in the store.
+
+            /agent sets a global preset that must win everywhere.  Clearing only
+            the current session_key is not enough: every other topic's persisted
+            override would be rehydrated by _rehydrate_session_model_override on
+            the next turn and shadow the new global preset.  Wiping all entries
+            in one call ensures a clean slate process-wide.
+            """
+            store = getattr(self, "async_session_store", None)
+            if store is not None:
+                try:
+                    await store.clear_all_model_overrides()
+                except Exception:
+                    logger.debug(
+                        "_handle_agent_command: failed to clear all persisted model overrides",
+                        exc_info=True,
+                    )
+
+        if not raw_args:
+            # Show interactive picker or text card.
+            choices = [
+                {
+                    "value": "claude1",
+                    "label": get_preset_label("claude1"),
+                    "is_current": current_preset == "claude1",
+                },
+                {
+                    "value": "chatgpt",
+                    "label": get_preset_label("chatgpt"),
+                    "is_current": current_preset == "chatgpt",
+                },
+            ]
+
+            async def _on_agent_choice(_chat_id: str, value: str) -> str:
+                result = _apply_agent_selection(value)
+                # Also wipe the persisted override so a gateway restart won't
+                # re-apply the old /model choice on top of the new preset.
+                await _clear_persisted_model_override()
+                return result
+
+            picker_sent = await self._try_send_choice_picker(
+                event,
+                session_key,
+                title=t(
+                    "gateway.agent_preset.picker_title",
+                    current=get_preset_label(current_preset),
+                ),
+                choices=choices,
+                on_choice_selected=_on_agent_choice,
+            )
+            if picker_sent:
+                return None  # Picker sent — adapter handles the response
+
+            # Text fallback
+            details = get_preset_details(current_preset)
+            provider = details.get("provider", "")
+            model = details.get("model", "")
+            detail_str = f" ({provider} / {model})" if provider and model else ""
+            return t(
+                "gateway.agent_preset.status",
+                current=get_preset_label(current_preset),
+                detail=detail_str,
+                options=", ".join(sorted(VALID_PRESETS)),
+            )
+
+        # Typed: /agent claude1, /agent claude2, or /agent chatgpt
+        msg = _apply_agent_selection(raw_args)
+        await _clear_persisted_model_override()
+        return msg
+
     async def _handle_yolo_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /yolo — toggle dangerous command approval bypass for this session only."""
         from tools.approval import (

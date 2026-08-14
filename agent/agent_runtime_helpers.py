@@ -1732,6 +1732,35 @@ def restore_primary_runtime(agent) -> bool:
         from agent.chat_completion_helpers import rewrite_prompt_model_identity
         rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
 
+        # ── Preset restoration notice (HERMES-LLM-001 tranche 4) ─────────────
+        # When the previous turn used a preset-level fallback, queue a one-shot
+        # "restored" notice that will be surfaced IF this turn's primary call
+        # succeeds (via _emit_pending_fallback_notice / _pending_fallback_notice).
+        # On failure, the buffered trace is shown instead and the notice is
+        # discarded — same lifecycle as the regular fallback notice.
+        _preset_fb_from = getattr(agent, "_active_preset_fallback_from", None)
+        if _preset_fb_from:
+            agent._active_preset_fallback_from = None
+            try:
+                from agent.llm_preset import get_preset as _get_preset
+                from agent.llm_preset_fallback import format_preset_restored_notice
+                _restored_preset = _get_preset()
+                _restored_model = rt.get("model", "")
+                _restored_notice = format_preset_restored_notice(
+                    preset=_restored_preset,
+                    model=_restored_model,
+                )
+                # Reuse _pending_fallback_notice so it is emitted on the first
+                # successful content line (see _emit_pending_fallback_notice in
+                # run_agent.py) and discarded on failure without extra wiring.
+                agent._pending_fallback_notice = _restored_notice
+            except Exception:
+                logger.debug(
+                    "restore_primary_runtime: preset restoration notice failed",
+                    exc_info=True,
+                )
+        # ── End of preset restoration notice ─────────────────────────────────
+
         logger.info(
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
