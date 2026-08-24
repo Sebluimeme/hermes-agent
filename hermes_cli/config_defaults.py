@@ -256,6 +256,19 @@ DEFAULT_CONFIG = {
         # TUI, desktop — and programmatic callers, off for conversational
         # messaging surfaces). Doc/markdown/skill-only edits never fire it.
         "verify_on_stop": False,
+        # Whether this profile's model backend actually receives Hermes' tool
+        # schemas. True for every normal backend (direct API, most
+        # OpenAI-compatible endpoints). Set False on a profile whose backend
+        # is a bridging CLI proxy that drives a *different* agent binary with
+        # its own fixed built-in toolset (e.g. a proxy wrapping `claude -p`)
+        # — that backend never sees custom tool schemas like `kanban_*`, even
+        # though they still pass every local check_fn gate and render as
+        # "available" tools in this very prompt. Only affects which kanban
+        # worker/orchestrator guidance text is injected: False swaps "use the
+        # kanban_* tools" for "use `hermes kanban <verb>` in your terminal",
+        # so the worker does not stall or exit without closing its own card
+        # (t_98e5c12e). No effect when the profile is not a kanban worker.
+        "kanban_tools_reach_model": True,
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.

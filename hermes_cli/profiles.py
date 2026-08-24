@@ -707,6 +707,25 @@ def _read_config_model(profile_dir: Path) -> tuple:
         return None, None
 
 
+def resolve_profile_default_model(profile_name: str) -> tuple:
+    """Public wrapper: a profile's own configured (model, provider).
+
+    Used by the Kanban dispatcher (``hermes_cli.kanban_db._set_worker_pid``)
+    to record ``model_resolved`` on the ``spawned`` event even when no
+    per-task ``model_override``/``provider_override`` was set -- the spawn
+    argv only ever carries an override (``-m``/``--provider``), so the
+    "no override" case previously had no answer to "what model actually
+    ran this" beyond the assignee/profile name itself
+    (agent-live-activity-contract.md). Best-effort: any resolution failure
+    (missing/unreadable profile dir, bad YAML) returns ``(None, None)``
+    rather than raising -- a display gap must never affect dispatch.
+    """
+    try:
+        return _read_config_model(get_profile_dir(profile_name))
+    except Exception:
+        return None, None
+
+
 def _check_gateway_running(profile_dir: Path) -> bool:
     """Check if a gateway is running for a given profile directory.
 
@@ -2385,6 +2404,128 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         print(f"✓ Honcho host updated: {source_host} → {new_host}")
 
 
+# ---------------------------------------------------------------------------
+# Rename ledger (t_153f78d8)
+#
+# ``kanban_db.py`` stores ``tasks.assignee`` as a bare string with no
+# integrity constraint against installed profiles. When a profile is
+# renamed, every open card that referenced the old name goes silently
+# unspawnable: ``profile_exists()`` alone cannot tell "this used to be a
+# real profile" apart from an intentional non-profile control-plane lane
+# name (e.g. ``orion-cc``) that is SUPPOSED to sit unspawned until a human
+# terminal claims it. The 2026-08-22 codex-worker -> spark rename left 13
+# such cards stuck in ``ready`` for hours with zero signal anywhere.
+#
+# This tiny append-only ledger is the source of truth the dispatcher uses
+# (via :func:`resolve_renamed_profile`) to make that distinction safely.
+# ---------------------------------------------------------------------------
+
+def _rename_log_path() -> Path:
+    return _get_profiles_root() / ".rename_log.json"
+
+
+def _load_rename_log() -> List[dict]:
+    path = _rename_log_path()
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _record_profile_rename(old_canon: str, new_canon: str) -> None:
+    """Append a rename event. Best-effort: never raises — a failure here
+    must not undo (or appear to fail) the rename itself, which has already
+    committed on disk by the time this is called."""
+    try:
+        profiles_root = _get_profiles_root()
+        profiles_root.mkdir(parents=True, exist_ok=True)
+        log = _load_rename_log()
+        log.append({"old": old_canon, "new": new_canon, "at": int(time.time())})
+        path = _rename_log_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(log, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        logger.debug("profile rename: failed to record rename log entry", exc_info=True)
+
+
+def resolve_renamed_profile(name: str) -> Optional[str]:
+    """If ``name`` is a dead profile name that was renamed away, return the
+    CURRENT name it lives under today. Returns ``None`` when ``name``
+    currently exists, was never renamed, or its rename chain (possibly
+    multi-hop) ends on a name that doesn't exist either — callers must
+    never invent a destination they can't confirm.
+
+    This is the one place allowed to assert "this non-existent assignee
+    used to be a real Hermes profile" — everything else that fails
+    ``profile_exists()`` (an intentional control-plane lane name like
+    ``orion-cc``) must keep being treated as correctly idle, not orphaned.
+    """
+    canon = normalize_profile_name(name)
+    if profile_exists(canon):
+        return None
+    chain: Dict[str, str] = {}
+    for entry in _load_rename_log():
+        old = entry.get("old")
+        new = entry.get("new")
+        if old and new:
+            chain[old] = new
+    current = canon
+    seen: set = set()
+    while current in chain and current not in seen:
+        seen.add(current)
+        current = chain[current]
+    if current != canon and profile_exists(current):
+        return current
+    return None
+
+
+def _migrate_kanban_assignee_on_rename(old_canon: str, new_canon: str) -> int:
+    """Reassign every open kanban card from ``old_canon`` to ``new_canon``.
+
+    Runs across every board (default + project-linked). Best-effort: a
+    board that fails to open, or a single row that fails to reassign, is
+    skipped rather than aborting the whole migration — the rename itself
+    already committed and must not be rolled back over a kanban hiccup.
+    A currently-``running`` card is left alone (assign_task refuses to
+    reassign a claimed/running task); it keeps its old name for this run
+    and gets picked up by the dispatch-time orphan check if it's still
+    unresolved on its next tick.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb  # local import: avoids cycle
+    except Exception:
+        return 0
+    total = 0
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [{"slug": _kb.DEFAULT_BOARD}]
+    for b in boards:
+        slug = b.get("slug") or _kb.DEFAULT_BOARD
+        try:
+            with _kb.connect_closing(board=slug) as conn:
+                rows = conn.execute(
+                    "SELECT id, status FROM tasks WHERE assignee = ? "
+                    "AND status NOT IN ('done', 'archived')",
+                    (old_canon,),
+                ).fetchall()
+                for row in rows:
+                    if row["status"] == "running":
+                        continue
+                    try:
+                        if _kb.assign_task(conn, row["id"], new_canon):
+                            total += 1
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return total
+
+
 def rename_profile(old_name: str, new_name: str) -> Path:
     """Rename a profile: directory, wrapper script, service, active_profile.
 
@@ -2447,6 +2588,22 @@ def rename_profile(old_name: str, new_name: str) -> Path:
             print(f"✓ Active profile updated: {new_canon}")
     except Exception:
         pass
+
+    # 6. Record the rename and migrate open kanban cards (t_153f78d8): a
+    # rename is a name change for the SAME executor, so every open card
+    # still pointing at old_canon should follow to new_canon instead of
+    # going silently unspawnable. The ledger entry is also what lets the
+    # dispatcher's orphan check (hermes_cli.kanban_db._block_orphaned_
+    # assignee) prove a dead assignee used to be a real profile, for any
+    # card this migration doesn't reach (running at rename time, or on a
+    # board this process can't see).
+    _record_profile_rename(old_canon, new_canon)
+    try:
+        migrated = _migrate_kanban_assignee_on_rename(old_canon, new_canon)
+        if migrated:
+            print(f"✓ Kanban: {migrated} open card(s) reassigned {old_canon} → {new_canon}")
+    except Exception:
+        logger.debug("kanban assignee migration on rename failed", exc_info=True)
 
     return new_dir
 

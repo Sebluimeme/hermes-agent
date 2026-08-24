@@ -40,6 +40,81 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     )
 
 
+def test_kanban_tools_visible_for_dispatcher_owned_worker(monkeypatch, tmp_path):
+    """A genuine dispatcher-spawned worker must see the kanban lifecycle tools
+    even when its pinned ``--toolsets`` list does not spell out "kanban".
+
+    Regression for t_98e5c12e: an incident report claimed that a dispatcher
+    worker process (HERMES_KANBAN_TASK set, no delegate_task/cron wrapper)
+    saw zero kanban_* tools in its schema despite
+    ``agent.delegation_context.is_dispatcher_owned_worker_context()``
+    defaulting to True. Investigation found the gating logic
+    (``tools/kanban_tools.py::_check_kanban_mode`` and
+    ``model_tools._compute_tool_definitions``'s auto-append of the "kanban"
+    toolset for dispatcher-owned workers) already correct and unreproducible
+    end-to-end; this test locks that invariant in so a future change to
+    either function cannot silently reintroduce the reported symptom.
+    ``_resolve_worker_cli_toolsets`` (hermes_cli/kanban_db.py) pins a
+    worker's CLI toolsets from its *own* profile config, which does not
+    always list "kanban" explicitly — the auto-append is what guarantees
+    the lifecycle tools show up regardless.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker_task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # noqa: F401 - ensure registered
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    # "kanban" is deliberately absent here — the profile's own configured
+    # CLI toolsets (what the dispatcher pins via --toolsets) may not list it.
+    schema = get_tool_definitions(enabled_toolsets=["hermes-cli"], quiet_mode=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+
+    worker_lifecycle_tools = {
+        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_comment", "kanban_create",
+    }
+    missing = worker_lifecycle_tools - names
+    assert not missing, (
+        f"dispatcher-owned worker is missing kanban lifecycle tools: {missing}"
+    )
+    # Board-routing tools stay orchestrator-only even for a real worker.
+    assert "kanban_list" not in names
+    assert "kanban_unblock" not in names
+
+
+def test_instruction_authorization_tools_appear_for_reloaded_orchestrator_config(
+    monkeypatch, tmp_path
+):
+    """A fresh orchestrator config exposes only the routing-only tool surface."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+
+    import tools.kanban_tools  # ensure registered after the config is on disk
+    from hermes_cli import config as config_mod
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert {
+        "kanban_authorize_instruction_edit",
+        "kanban_recover_instruction_edit",
+    } <= names
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
@@ -113,9 +188,10 @@ def test_list_filters_tasks(monkeypatch, worker_env):
 
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
+    evidence = {"kind": "test", "detail": "pytest -q: 2 passed"}
     out = kt._handle_complete({
         "summary": "got the thing done",
-        "metadata": {"files": 2},
+        "metadata": {"files": 2, "evidence": evidence},
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -127,7 +203,29 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2}
+        assert run.metadata == {"files": 2, "evidence": evidence}
+    finally:
+        conn.close()
+
+
+def test_transient_block_stamps_worker_session_for_safe_resume(worker_env, monkeypatch):
+    """Only a safe transient block carries a reusable worker session id."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "worker-session-42")
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(kt._handle_block({
+        "reason": "read-only guard; retry is safe after unblock",
+        "kind": "transient",
+    }))
+    assert out["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.outcome == "blocked"
+        assert run.metadata == {"worker_session_id": "worker-session-42"}
     finally:
         conn.close()
 
@@ -150,6 +248,7 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     ok = json.loads(kt._handle_complete({
         "summary": "retry without claims",
         "created_cards": [],
+        "metadata": {"evidence": {"kind": "test", "detail": "pytest -q: 1 passed"}},
     }))
     assert ok.get("ok") is True
 
@@ -517,7 +616,10 @@ def test_worker_lifecycle_through_tools(worker_env):
     # 5. complete with structured handoff
     comp = json.loads(kt._handle_complete({
         "summary": "implemented + spawned QA follow-up",
-        "metadata": {"child_task": child_out["task_id"]},
+        "metadata": {
+            "child_task": child_out["task_id"],
+            "evidence": {"kind": "test", "detail": "pytest -q: 3 passed"},
+        },
     }))
     assert comp["ok"]
 
@@ -530,7 +632,10 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
+        assert run.metadata == {
+            "child_task": child_out["task_id"],
+            "evidence": {"kind": "test", "detail": "pytest -q: 3 passed"},
+        }
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
@@ -688,6 +793,69 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
         conn.close()
 
 
+def test_instruction_authorization_tools_are_orchestrator_only(worker_env, tmp_path):
+    """Workers cannot self-grant or escape triage, even via direct handler calls."""
+    from tools import kanban_tools as kt
+
+    grant = json.loads(kt._handle_authorize_instruction_edit({
+        "task_id": worker_env,
+        "target_path": str(tmp_path / "AGENTS.md"),
+        "reason": "forged worker grant",
+    }))
+    recover = json.loads(kt._handle_recover_instruction_edit({"task_id": worker_env}))
+
+    assert "orchestrator-only" in grant["error"]
+    assert "orchestrator-only" in recover["error"]
+
+
+def test_orchestrator_authorizes_canonical_path_and_recovers_triage(monkeypatch, tmp_path):
+    """The native tools preserve exact-path scope and audit the recovery transition."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="edit instructions", triage=True)
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    relative = json.loads(kt._handle_authorize_instruction_edit({
+        "task_id": task_id,
+        "target_path": "AGENTS.md",
+        "reason": "Sébastien explicit authorization",
+    }))
+    assert "absolute target path" in relative["error"]
+
+    target = tmp_path / "AGENTS.md"
+    grant = json.loads(kt._handle_authorize_instruction_edit({
+        "task_id": task_id,
+        "target_path": str(target),
+        "reason": "Sébastien explicitly authorized this exact edit.",
+    }))
+    assert grant == {
+        "ok": True,
+        "task_id": task_id,
+        "target_path": str(target.resolve()),
+        "granted_by": "default",
+    }
+    recovery = json.loads(kt._handle_recover_instruction_edit({"task_id": task_id}))
+    assert recovery == {"ok": True, "task_id": task_id, "status": "ready"}
+
+    conn = kb.connect()
+    try:
+        assert kb.has_instruction_edit_authorization(conn, task_id, str(target))
+        assert not kb.has_instruction_edit_authorization(conn, task_id, str(tmp_path / "CLAUDE.md"))
+        assert any(
+            event.kind == "instruction_edit_authorized_recovery"
+            for event in kb.list_events(conn, task_id)
+        )
+    finally:
+        conn.close()
+
+
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     """Orchestrator profiles (no HERMES_KANBAN_TASK) can still complete
     any task via explicit task_id. The check only applies to workers."""
@@ -710,7 +878,11 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
         conn.close()
 
     from tools import kanban_tools as kt
-    out = kt._handle_complete({"task_id": tid, "summary": "orchestrator close"})
+    out = kt._handle_complete({
+        "task_id": tid,
+        "summary": "orchestrator close",
+        "metadata": {"evidence": {"kind": "test", "detail": "pytest -q: 1 passed"}},
+    })
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == tid
 

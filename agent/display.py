@@ -1571,10 +1571,170 @@ def _get_cute_tool_message(
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")
 
 
+# Maps a display tool_name to the closed activity-event action vocabulary
+# (hermes_cli.kanban_db.ACTIVITY_ACTIONS). Unmapped tools collapse to
+# "other" in _emit_tool_activity_event -- never leak an arbitrary tool_name
+# onto the live agent-activity board.
+_ACTIVITY_ACTION_BY_TOOL = {
+    "web_search": "web_search", "web_extract": "web_fetch",
+    "read_file": "read_file", "write_file": "write_file", "patch": "edit_file",
+    "search_files": "search",
+    "browser_navigate": "browser", "browser_snapshot": "browser",
+    "browser_click": "browser", "browser_type": "browser",
+    "browser_scroll": "browser", "browser_back": "browser",
+    "browser_press": "browser", "browser_get_images": "browser",
+    "browser_vision": "browser", "browser_exec": "browser",
+    "delegate_task": "delegate",
+    "skill_view": "skill", "skills_list": "skill",
+    "memory": "memory", "vision_analyze": "vision",
+    "image_generate": "image_gen", "cronjob": "cron",
+    "execute_code": "bash",
+}
+
+
+def _activity_action_for_tool(tool_name: str, args: dict) -> str:
+    """Closed-vocabulary action label for one completed tool call."""
+    if tool_name == "terminal":
+        command = str((args or {}).get("command") or "").strip()
+        head = command.split()[0] if command else ""
+        if head == "git":
+            return "git"
+        if any(m in command for m in ("pytest", "go test", "cargo test", "npm test", "npm run test")):
+            return "test_run"
+        return "bash"
+    return _ACTIVITY_ACTION_BY_TOOL.get(tool_name, "other")
+
+
+def _safe_path_basename(path: str) -> str:
+    """Basename only, never the full path or any file content."""
+    try:
+        return Path(str(path).replace("\\", "/")).name or ""
+    except Exception:
+        return ""
+
+
+def _safe_host(url: str) -> str:
+    """Controlled hostname only -- never path, query string, or fragment."""
+    try:
+        parsed = urlsplit(str(url).strip())
+    except ValueError:
+        return ""
+    return parsed.hostname or ""
+
+
+# Tools whose primary argument is free-form user/model text -- a prompt,
+# goal, question, or spoken text -- with no safe closed descriptor to
+# derive. Only the closed action label (see _ACTIVITY_ACTION_BY_TOOL) is
+# ever recorded for these; the target is always empty.
+_ACTIVITY_TEXT_ONLY_TOOLS = frozenset({
+    "browser_type", "browser_exec", "delegate_task",
+    "image_generate", "text_to_speech", "vision_analyze",
+})
+
+
+def _activity_target_for_tool(tool_name: str, args: dict) -> str:
+    """Closed/structured target for the live agents board.
+
+    Fail-closed by construction: this is a small per-tool table, never a
+    generic free-text renderer. ``build_tool_preview()`` (used for the CLI's
+    own on-screen completion line) must NOT be reused here -- it happily
+    returns raw search queries, browser text, delegated goals, generation
+    prompts, TTS text, and vision questions, any of which could carry a
+    sensitive user instruction straight into ``task_events.payload.target``
+    and from there the Telegram board (review finding t_6b360247 run #147,
+    BLOCK). Every branch below returns a bounded, closed-vocabulary
+    descriptor; any tool/shape not explicitly recognized falls through to
+    the final ``return ""`` -- no target beats an unvetted one.
+
+    Categories (agent-live-activity-contract.md §5 + task body):
+    - commande/exécution (terminal, execute_code): program name only.
+    - fichier (read_file, write_file, patch, search_files): basename only,
+      never file content or the search pattern itself.
+    - web (web_search, web_extract): controlled hostname only, never the
+      query string or full URL.
+    - navigation (browser_navigate): controlled hostname only -- never the
+      path, which (unlike a vetted route table) is unqualifiable free text
+      an attacker/user can put anything into (review finding t_da242e47
+      run #152, BLOCK: a marker embedded in the path leaked to the board).
+    - texte/prompt (browser_type, browser_exec, delegate_task,
+      image_generate, text_to_speech, vision_analyze): no target at all.
+    - anything else, including unknown tools: no target.
+    """
+    args = args or {}
+
+    if tool_name in {"terminal", "execute_code"}:
+        key = "code" if tool_name == "execute_code" else "command"
+        command = str(args.get(key) or "").strip()
+        if not command:
+            return ""
+        # _shell_head_word already skips leading `NAME=value` env
+        # assignments (e.g. `HERMES_KANBAN_TASK=t_9075 uv run ...` ->
+        # "uv") and strips any path down to a basename -- exactly the
+        # closed program-name extraction this needs, reusing the same
+        # vetted shell-word parsing the CLI's own preview line uses.
+        return _shell_head_word(command)[:32]
+
+    if tool_name in {"read_file", "write_file", "patch"}:
+        path = args.get("path") or args.get("file") or args.get("filepath")
+        return _safe_path_basename(path) if path else ""
+
+    if tool_name == "search_files":
+        # Never the pattern (a free-text regex/glob the user chose, which
+        # can itself carry sensitive text) -- only the directory searched,
+        # basenamed, or a closed fallback label.
+        path = args.get("path")
+        if path and str(path).strip() not in ("", "."):
+            basename = _safe_path_basename(path)
+            return basename if basename else "recherche fichiers"
+        return "recherche fichiers"
+
+    if tool_name == "web_search":
+        # No hostname is knowable from a search query -- never the query.
+        return "recherche web"
+
+    if tool_name == "web_extract":
+        urls = args.get("urls")
+        url = urls[0] if isinstance(urls, list) and urls else urls
+        if not url:
+            return "récupération web"
+        return _safe_host(str(url)) or "récupération web"
+
+    if tool_name == "browser_navigate":
+        url = args.get("url")
+        if not url:
+            return "navigation web"
+        return _safe_host(str(url)) or "navigation web"
+
+    if tool_name in _ACTIVITY_TEXT_ONLY_TOOLS:
+        return ""
+
+    return ""
+
+
+def _emit_tool_activity_event(tool_name: str, args: dict) -> None:
+    """Record one activity event for the live agents board -- see
+    agent-live-activity-contract.md. Strict no-op outside a Kanban-worker
+    context: the env check inside ``append_activity_event`` is the entire
+    cost for every interactive session, so this is called unconditionally
+    from :func:`get_cute_tool_message`, the single choke point every tool
+    completion line already passes through.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return
+    try:
+        from hermes_cli import kanban_db as _kdb
+        action = _activity_action_for_tool(tool_name, args or {})
+        target = _activity_target_for_tool(tool_name, args or {})
+        _kdb.append_activity_event(action=action, target=target)
+    except Exception:
+        pass
+
+
 def get_cute_tool_message(
     tool_name: str, args: dict, duration: float, result: str | None = None,
 ) -> str:
     """Render a completion label without letting cosmetic failures escape."""
+    _emit_tool_activity_event(tool_name, args)
     try:
         return _get_cute_tool_message(tool_name, args, duration, result=result)
     except Exception as exc:  # noqa: BLE001 — display must never abort a turn

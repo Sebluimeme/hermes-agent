@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,52 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+# Strips a leading internal ``gate:<type> —`` (or ``gate:<type> -``) marker
+# from a worker-authored block reason before it reaches a direct chat message.
+# The marker is meaningful on the board (routes the card into "en attente de
+# ta décision") but reads as raw internal jargon in a one-line Telegram ping —
+# see AGENTS.md "Écrire un motif de blocage exploitable" for the authoring
+# contract that keeps the remainder of the reason human-readable on its own.
+_GATE_PREFIX_RE = re.compile(r"^gate:\S+\s*[—-]\s*")
+
+INTERNAL_AUTHORIZATION_SYNC_MESSAGE = (
+    "Problème interne d’autorisation — aucune action de votre part. "
+    "Reprise automatique en cours."
+)
+
+_INTERNAL_AUTHORIZATION_REASON_MARKERS = (
+    "authorize-instruction-edit",
+    "approval prompt timed out",
+    "approval request could not be delivered",
+    "no interactive user or gateway",
+    "worker-side timeout",
+    "no response within the approval window",
+    "local write failed",
+    "request file disappeared",
+)
+
+
+def _classify_authorization_block(payload: Any, *, has_instruction_grant: bool = False) -> str:
+    """Classify a block notification as user-actionable or internal auth sync.
+
+    ``needs_user_authorization`` is reserved for a decision only Sébastien can
+    make. A durable grant already present on the task, a protected-write prompt
+    timeout, or an unreachable worker-approval relay is an internal coordination
+    failure: asking the user again is misleading because the operator/orchestrator
+    path, not the worker's local guard, must recover it.
+    """
+    if has_instruction_grant:
+        return "internal_authorization_sync_failure"
+    if not isinstance(payload, dict):
+        return "needs_user_authorization"
+    explicit = str(payload.get("authorization_classification") or "").strip()
+    if explicit in {"needs_user_authorization", "internal_authorization_sync_failure"}:
+        return explicit
+    reason = str(payload.get("reason") or "").lower()
+    if any(marker in reason for marker in _INTERNAL_AUTHORIZATION_REASON_MARKERS):
+        return "internal_authorization_sync_failure"
+    return "needs_user_authorization"
 
 
 def _resolve_auto_decompose_settings(
@@ -163,6 +210,54 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return None
 
 
+_FAILURE_EVENT_KINDS = ("gave_up", "crashed", "timed_out", "protocol_violation")
+
+
+def _failure_note(kb: Any, conn: Any, events: list) -> str:
+    """One-line cause for a failing task event: outcome, duration, error.
+
+    The wake notification otherwise carries only a status word ("crashed;
+    dispatcher will retry"), which reads as routine self-healing and hides
+    *why* the worker died. The run duration is deliberately included: a wall
+    of identical durations across unrelated tasks is the only signal that
+    exposes a provider/proxy timeout, and it is invisible one card at a time.
+
+    Best-effort by contract — a notification must never fail to deliver
+    because its explanatory suffix could not be built.
+    """
+    try:
+        ev = next(
+            (e for e in reversed(events) if e.kind in _FAILURE_EVENT_KINDS),
+            None,
+        )
+        if ev is None:
+            return ""
+        bits: list[str] = []
+        run = None
+        run_id = getattr(ev, "run_id", None)
+        if run_id is not None and hasattr(kb, "get_run"):
+            run = kb.get_run(conn, run_id)
+        if run is not None:
+            started, ended = getattr(run, "started_at", None), getattr(run, "ended_at", None)
+            if started and ended and ended >= started:
+                bits.append(f"ran {int(ended - started)}s")
+            profile = getattr(run, "profile", None)
+            if profile:
+                bits.append(f"profile={profile}")
+        payload = getattr(ev, "payload", None) or {}
+        for key in ("incident_category", "exit_kind", "exit_code"):
+            if isinstance(payload, dict) and payload.get(key) is not None:
+                bits.append(f"{key}={payload[key]}")
+        error = (getattr(run, "error", None) or "").strip()
+        if not error and isinstance(payload, dict):
+            error = str(payload.get("error") or "").strip()
+        if error:
+            bits.append(error.splitlines()[0][:240])
+        return " · ".join(bits)[:400]
+    except Exception:  # never break a notification over its own annotation
+        return ""
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -211,13 +306,16 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
+        # ``status`` events are internal/intermediate transitions (including
+        # dashboard drag-drop). Do not leak them as Telegram chatter: the
+        # task-scoped progress board renders checkpoints in place. Only a
+        # completion, a review handoff, or an actionable anomaly reaches the
+        # origin topic as a separate notification.
         # ``review_requested`` wakes the origin subscriber like a block does,
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "archived", "unblocked", "block_loop_detected", "review_requested", "relayed_to_coder")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -443,6 +541,16 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    # Carry the *cause* of a failure into the
+                                    # notification. Without this the woken
+                                    # agent only ever sees "crashed; dispatcher
+                                    # will retry" and cannot tell a genuine
+                                    # protocol violation from a worker killed
+                                    # by a provider timeout — on 2026-08-22
+                                    # that blind spot hid 14 runs all dying at
+                                    # the proxy's 600 s wall. The run duration
+                                    # is what makes such a wall visible at all.
+                                    failure_note = _failure_note(_kb, conn, events)
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -454,6 +562,12 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "failure_note": failure_note,
+                                        "has_instruction_grant": bool(
+                                            task and _kb.task_has_instruction_edit_authorization(
+                                                conn, sub["task_id"]
+                                            )
+                                        ),
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -526,6 +640,7 @@ class GatewayKanbanWatchersMixin:
                     wake_handoff = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        has_instruction_grant = bool(d.get("has_instruction_grant"))
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -538,28 +653,93 @@ class GatewayKanbanWatchersMixin:
                             # task.result for legacy rows written before
                             # runs shipped.
                             handoff = ""
+                            proof = ""
+                            if ev.payload and isinstance(ev.payload.get("evidence"), dict):
+                                _ev_proof = ev.payload["evidence"]
+                                _kind = str(_ev_proof.get("kind") or "preuve").strip()
+                                _detail = str(_ev_proof.get("detail") or "").strip()
+                                proof = f" — Preuve Kanban : {_kind}"
+                                if _detail:
+                                    proof += f" — {_detail[:160]}"
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
                                 lines = payload_summary.strip().splitlines()
                                 h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                                wake_handoff = h
+                                handoff = f"\n{h}{proof}"
+                                wake_handoff = f"{h}{proof}"
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                                wake_handoff = r
+                                handoff = f"\n{r}{proof}"
+                                wake_handoff = f"{r}{proof}"
                             msg = (
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                                f" — {title}{proof}{handoff}"
                             )
                         elif kind == "blocked":
-                            reason = ""
+                            # A block is a terminal state for automatic
+                            # execution: nothing more happens without
+                            # Sébastien's decision, so it MUST reach him as a
+                            # real terminal message — the same guarantee as
+                            # completed/crashed/timed_out. A prior fix here
+                            # made `blocked` fully silent (relying only on the
+                            # passive "Travail en cours" board card), which
+                            # reproduced the exact incident this exists to
+                            # prevent: a resolved/actionable state with no
+                            # message telling him so. The fix is not to go
+                            # back to the old raw ping either (task id,
+                            # profile tag as a bracketed prefix, literal
+                            # `gate:` marker, tool/command dump) — that was
+                            # the noise Sébastien flagged. Strip the internal
+                            # `gate:<type> —` marker and keep only the
+                            # plain-language reason a worker is required to
+                            # write (see AGENTS.md "motif de blocage
+                            # exploitable"); the board still carries the raw
+                            # reason for anyone who opens the card.
+                            reason = "une décision est nécessaire pour continuer"
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                                cleaned = _GATE_PREFIX_RE.sub(
+                                    "", str(ev.payload["reason"])[:280]
+                                ).strip()
+                                if cleaned:
+                                    reason = cleaned
+                            authorization_classification = _classify_authorization_block(
+                                ev.payload,
+                                has_instruction_grant=has_instruction_grant,
+                            )
+                            if authorization_classification == "internal_authorization_sync_failure":
+                                if has_instruction_grant:
+                                    def _recover_blocked_instruction_grant() -> bool:
+                                        from hermes_cli import kanban_db as _kb
+                                        with _kb.connect_closing(board=board_slug or "default") as conn:
+                                            return _kb.unblock_task(conn, sub["task_id"])
+                                    try:
+                                        await asyncio.to_thread(_recover_blocked_instruction_grant)
+                                    except Exception:
+                                        logger.debug(
+                                            "kanban notifier: internal auth recovery failed for %s",
+                                            sub["task_id"], exc_info=True,
+                                        )
+                                msg = (
+                                    f"⚠️ {title}\n"
+                                    f"{INTERNAL_AUTHORIZATION_SYNC_MESSAGE}\n"
+                                    f"Preuve : {reason}"
+                                )
+                            else:
+                                # No board_tag / @assignee prefix here: those
+                                # bracketed identity tags ("[default] @codex-worker")
+                                # are exactly the "profile-tag brackets" Sébastien
+                                # flagged as noise on this human-decision message —
+                                # see test_notifier_sends_clean_human_ping_for_blocked_task.
+                                # Other kinds (completed/crashed/...) keep the tag
+                                # for fleet legibility; this one must read as a
+                                # plain human ask, not a worker log line.
+                                msg = (
+                                    f"⏸ {title}\n"
+                                    f"Action requise : {reason}"
+                                )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -570,22 +750,21 @@ class GatewayKanbanWatchersMixin:
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"⚠️ {board_tag}{tag}{title}\n"
+                                "Impact : le worker s’est arrêté avant la fin.\n"
+                                "Solution : relance automatique engagée.\n"
+                                "Preuve : processus de la carte absent."
                             )
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"⚠️ {board_tag}{tag}{title}\n"
+                                "Impact : délai maximal atteint avant la fin.\n"
+                                "Solution : relance automatique engagée.\n"
+                                f"Preuve : limite de {limit}s atteinte."
                             )
-                        elif kind == "status":
-                            new_status = ""
-                            if ev.payload and ev.payload.get("status"):
-                                new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
                             # first-class review lane. Wake the origin thread.
@@ -596,25 +775,86 @@ class GatewayKanbanWatchersMixin:
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
                             )
+                        elif kind == "relayed_to_coder":
+                            # A route relay is deliberately the one direct,
+                            # human message without board/task/worker metadata.
+                            # The event payload is constructed solely from API
+                            # evidence by kanban_db; never add estimates here.
+                            msg = "Relais automatique vers Coder."
+                            if ev.payload and isinstance(ev.payload.get("message"), str):
+                                msg = ev.payload["message"]
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
                             # human decision. This is the ONE transition that
                             # exists to force human attention, yet it emits no
-                            # `blocked`/`status` event — so before adding it to
-                            # TERMINAL_KINDS it produced zero notification and
-                            # the task stalled in triage silently. Ping loudly.
-                            reason = ""
-                            recurrences = None
-                            if ev.payload:
-                                if ev.payload.get("reason"):
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
-                                recurrences = ev.payload.get("recurrences")
-                            rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
-                            msg = (
-                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
-                                f" — needs a human decision{rc}{reason}"
+                            # `blocked`/`status` event — so it must still reach
+                            # Sébastien, never silently. But the raw internal
+                            # wording — "Kanban {id} routed to TRIAGE — needs a
+                            # human decision", partly in English, with a raw
+                            # task id — is exactly the noise this exists to
+                            # avoid (see the `blocked` case above for the same
+                            # incident pattern). Render it the same clean,
+                            # French, human way: no task id, no `gate:`
+                            # marker, no raw kind/recurrence jargon — just the
+                            # plain-language reason a worker is required to
+                            # write.
+                            #
+                            # `triage` is also a normal fan-out landing spot:
+                            # the dispatcher's auto-decomposer
+                            # (`_auto_decompose_tick` below) polls every
+                            # `triage`-status task, including ones that got
+                            # there via this exact recurrence-limit path, and
+                            # may turn it back into ready/running work within
+                            # a few seconds — no human input required. That
+                            # race is real (the two loops tick independently)
+                            # and firing the ping anyway would be precisely
+                            # the "raw internal transition leaking as noise"
+                            # this task exists to stop. Re-check the task's
+                            # CURRENT status (fetched fresh this tick) before
+                            # sending: if it already left `triage`, the
+                            # decision resolved itself and nothing is sent.
+                            if task is None or task.status != "triage":
+                                continue
+                            reason = "une décision est nécessaire pour continuer"
+                            if ev.payload and ev.payload.get("reason"):
+                                cleaned = _GATE_PREFIX_RE.sub(
+                                    "", str(ev.payload["reason"])[:280]
+                                ).strip()
+                                if cleaned:
+                                    reason = cleaned
+                            authorization_classification = _classify_authorization_block(
+                                ev.payload,
+                                has_instruction_grant=has_instruction_grant,
                             )
+                            if authorization_classification == "internal_authorization_sync_failure":
+                                if has_instruction_grant:
+                                    def _recover_triage_instruction_grant() -> bool:
+                                        from hermes_cli import kanban_db as _kb
+                                        with _kb.connect_closing(board=board_slug or "default") as conn:
+                                            return _kb.recover_triage_after_instruction_authorization(
+                                                conn, sub["task_id"]
+                                            )
+                                    try:
+                                        await asyncio.to_thread(_recover_triage_instruction_grant)
+                                    except Exception:
+                                        logger.debug(
+                                            "kanban notifier: internal triage auth recovery failed for %s",
+                                            sub["task_id"], exc_info=True,
+                                        )
+                                msg = (
+                                    f"⚠️ {title}\n"
+                                    f"{INTERNAL_AUTHORIZATION_SYNC_MESSAGE}\n"
+                                    f"Preuve : {reason}"
+                                )
+                            else:
+                                # Same rationale as the `blocked` branch above: no
+                                # bracketed board/profile prefix on a
+                                # human-decision message.
+                                msg = (
+                                    f"🛑 {title}\n"
+                                    f"Action requise : {reason}"
+                                )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
                             # (so the cursor advances past them and they can't
@@ -814,6 +1054,12 @@ class GatewayKanbanWatchersMixin:
                                 _synth += "\n" + t(
                                     "gateway.kanban.wake.handoff",
                                     summary=wake_handoff,
+                                )
+                            _failure_detail = d.get("failure_note") or ""
+                            if _failure_detail:
+                                _synth += "\n" + t(
+                                    "gateway.kanban.wake.failure",
+                                    detail=_failure_detail,
                                 )
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
@@ -1178,6 +1424,205 @@ class GatewayKanbanWatchersMixin:
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+
+    async def _kanban_worker_approval_bridge(self, interval: float = 3.0) -> None:
+        """Bridge Kanban worker protected-write approvals to real chat buttons.
+
+        A Kanban worker is a separate OS process from the gateway (see
+        ``tools/worker_approval.py`` for the full background). It cannot
+        register a ``tools.approval`` gateway-notify callback or read
+        ``_gateway_queues`` — both are in-memory structures private to
+        *this* process — so a protected-instruction-write approval it
+        requests was previously delivered to nobody and simply timed out.
+
+        This loop polls the durable file transport for pending requests,
+        claims one at a time (``claim_for_dispatch`` — durable, cross-tick
+        dedup so a demand is solicited at most once), resolves the task's
+        Kanban notification subscriber to a live chat via the SAME
+        ``kanban_notify_subs`` table and ``_authorization_adapter``
+        chokepoint the terminal-event notifier uses, and sends a real
+        Approve/Refuse prompt with the adapter's existing
+        ``send_exec_approval``. The dispatch is handed off to a supervised
+        task per request so multiple concurrent approvals don't serialize
+        behind each other or block this tick loop.
+
+        Gated to the gateway that owns the kanban dispatcher singleton lock
+        so a multi-gateway deployment never double-sends the same prompt.
+        """
+        try:
+            from tools import worker_approval as _wa
+        except Exception:
+            logger.warning(
+                "kanban worker-approval bridge: tools.worker_approval not "
+                "importable; worker protected-write approvals will keep "
+                "timing out silently"
+            )
+            return
+
+        # Stagger after the notifier's own 5s startup delay so adapters have
+        # finished wiring before the first tick tries to resolve one.
+        await asyncio.sleep(7)
+
+        inflight: set = getattr(self, "_kanban_worker_approval_inflight", None)
+        if inflight is None:
+            inflight = set()
+            self._kanban_worker_approval_inflight = inflight
+
+        while self._running:
+            try:
+                if not self._owns_kanban_dispatcher_lock():
+                    # Only the dispatch-owning gateway sends worker-approval
+                    # prompts — same singleton this codebase already uses to
+                    # keep exactly one process spawning workers, reused here
+                    # to keep exactly one process prompting for them.
+                    await asyncio.sleep(interval)
+                    continue
+
+                pending = await asyncio.to_thread(_wa.list_pending_requests)
+                for req in pending:
+                    request_id = req.get("request_id")
+                    if not request_id or request_id in inflight:
+                        continue
+                    claimed = await asyncio.to_thread(_wa.claim_for_dispatch, request_id)
+                    if not claimed:
+                        continue
+                    inflight.add(request_id)
+                    self._spawn_supervised(
+                        lambda r=req: self._dispatch_kanban_worker_approval(r),
+                        f"kanban_worker_approval:{request_id}",
+                        restart=False,
+                    )
+            except Exception:
+                logger.exception("kanban worker-approval bridge: tick failed")
+            await asyncio.sleep(interval)
+
+    async def _dispatch_kanban_worker_approval(self, req: dict) -> None:
+        """Deliver one claimed worker-approval request and relay the decision.
+
+        Runs as its own supervised task (spawned by
+        ``_kanban_worker_approval_bridge``) so a slow/blocked send or a long
+        human-decision wait never delays the polling tick or other pending
+        requests.
+        """
+        from tools import worker_approval as _wa
+        from tools.approval import drop_gateway_approval_entry, enqueue_gateway_approval
+        from gateway.config import Platform as _Platform
+        from hermes_cli import kanban_db as _kb
+
+        request_id = req["request_id"]
+        task_id = req["task_id"]
+        board = req.get("board") or "default"
+        inflight = getattr(self, "_kanban_worker_approval_inflight", None)
+
+        def _find_subs():
+            with _kb.connect_closing(board=board) as conn:
+                return _kb.list_notify_subs(conn, task_id=task_id, include_unowned=True)
+
+        try:
+            subs = await asyncio.to_thread(_find_subs)
+        except Exception:
+            logger.warning(
+                "kanban worker-approval bridge: could not read subscribers "
+                "for task %s", task_id, exc_info=True,
+            )
+            subs = []
+
+        adapter = None
+        sub = None
+        for candidate in subs:
+            platform_str = (candidate.get("platform") or "").lower()
+            try:
+                plat = _Platform(platform_str)
+            except ValueError:
+                continue
+            candidate_adapter = self._authorization_adapter(
+                plat, candidate.get("notifier_profile") or None,
+            )
+            if candidate_adapter is not None and getattr(
+                type(candidate_adapter), "send_exec_approval", None
+            ) is not None:
+                adapter = candidate_adapter
+                sub = candidate
+                break
+
+        if adapter is None or sub is None:
+            # No reachable channel is watching this task right now (no
+            # subscriber, or its adapter is disconnected). The transport
+            # must never decide on its own: leave the request file exactly
+            # as it is and let the worker's own timeout close it out as a
+            # refusal — never write an approval, and never guess a channel.
+            logger.info(
+                "kanban worker-approval bridge: no deliverable channel for "
+                "task %s (request %s); leaving for the worker's own "
+                "timeout to refuse it", task_id, request_id,
+            )
+            if inflight is not None:
+                inflight.discard(request_id)
+            return
+
+        session_key = f"kanban-worker-approval:{request_id}"
+        paths = req.get("paths") or []
+        approval_data = {
+            "command": f"<write to {', '.join(paths)}>",
+            "pattern_key": "protected_instruction_file",
+            "pattern_keys": ["protected_instruction_file"],
+            "description": req.get("description") or req.get("title") or "protected write",
+            "protected_instruction_paths": paths,
+            "allow_permanent": False,
+            "allow_session": False,
+            "request_id": request_id,
+        }
+        entry = enqueue_gateway_approval(session_key, approval_data)
+
+        try:
+            metadata: dict[str, Any] = {}
+            if sub.get("thread_id"):
+                metadata["thread_id"] = sub["thread_id"]
+            send_res = await adapter.send_exec_approval(
+                chat_id=sub["chat_id"],
+                command=approval_data["command"],
+                session_key=session_key,
+                description=(
+                    f"[Kanban {task_id}] {req.get('title') or ''}\n"
+                    f"{approval_data['description']}"
+                ),
+                metadata=metadata or None,
+                allow_permanent=False,
+                allow_session=False,
+            )
+            if not getattr(send_res, "success", True):
+                raise RuntimeError(getattr(send_res, "error", None) or "send_exec_approval failed")
+        except Exception as exc:
+            logger.warning(
+                "kanban worker-approval bridge: could not deliver prompt "
+                "for %s: %s", request_id, exc,
+            )
+            drop_gateway_approval_entry(session_key, entry)
+            if inflight is not None:
+                inflight.discard(request_id)
+            # A transport failure must resolve to refusal, not a retry that
+            # could double-prompt — the worker's own timeout denies it.
+            return
+
+        expires_at = float(req.get("expires_at") or (time.time() + _wa.DEFAULT_TIMEOUT_SECONDS))
+        try:
+            while not entry.event.is_set() and time.time() < expires_at:
+                await asyncio.sleep(0.5)
+
+            if entry.event.is_set():
+                choice = entry.result or "deny"
+                reason = getattr(entry, "reason", None)
+            else:
+                choice = "timeout"
+                reason = "no response within the approval window"
+        finally:
+            drop_gateway_approval_entry(session_key, entry)
+            if inflight is not None:
+                inflight.discard(request_id)
+
+        await asyncio.to_thread(
+            _wa.write_decision, request_id, choice, reason, sub.get("chat_id"),
+        )
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

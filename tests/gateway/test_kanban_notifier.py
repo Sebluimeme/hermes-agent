@@ -137,11 +137,15 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     named profile, _authorization_adapter() used to treat the active name as a
     multiplex secondary, find no _profile_adapters entry, fail closed, and
     rewind the claim forever — silent zero-delivery.
+
+    Uses a `completed` event (not `blocked`, which is now board-only and
+    intentionally silent — see test_notifier_sends_no_technical_ping_for_blocked_task)
+    to exercise the same named-profile adapter routing this regression pins.
     """
-    db_path = tmp_path / "actionable-block.db"
+    db_path = tmp_path / "actionable-completion.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
-    reason = "AGE-39 — https://linear.example/AGE-39 — publishing verified."
+    summary = "AGE-39 — https://linear.example/AGE-39 — publishing verified."
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="approval", assignee="publisher")
@@ -152,7 +156,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
             chat_id="chat-1",
             notifier_profile="main",
         )
-        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        kb.complete_task(conn, tid, summary=summary)
     finally:
         conn.close()
 
@@ -164,8 +168,40 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
 
     assert len(adapter.sent) == 1
     message = adapter.sent[0]["text"]
-    assert tid in message
-    assert "blocked" in message
+    assert summary in message
+
+
+def test_completed_notification_carries_structured_closure_evidence(tmp_path, monkeypatch):
+    db_path = tmp_path / "completion-proof-notifier.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="proof", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(
+            conn,
+            tid,
+            summary="Correction terminee",
+            metadata={
+                "evidence": {
+                    "kind": "test",
+                    "detail": "python -m pytest tests/hermes_cli/test_kanban_closure_gate.py OK",
+                }
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "Preuve Kanban : test" in message
+    assert "python -m pytest tests/hermes_cli/test_kanban_closure_gate.py OK" in message
+    assert "Correction terminee — Preuve Kanban" in message
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -323,7 +359,8 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
 
     # First crash delivered.
     assert len(adapter.sent) == 1
-    assert "crashed" in adapter.sent[0]["text"].lower()
+    assert "Impact : le worker s’est arrêté avant la fin." in adapter.sent[0]["text"]
+    assert "Solution : relance automatique engagée." in adapter.sent[0]["text"]
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -351,7 +388,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"Second crashed event should also notify; got {len(adapter.sent)} "
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
-    assert "crashed" in adapter.sent[1]["text"].lower()
+    assert "Preuve : processus de la carte absent." in adapter.sent[1]["text"]
 
 
 def test_notifier_subscription_survives_done_reopen_until_archive(
@@ -426,9 +463,9 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # The reopen status and second completion each deliver once, while only
-    # completion wakes the exact original session/thread.
-    assert len(adapter.sent) == 3
+    # Internal reopen status is silent; only the second completion delivers
+    # and wakes the exact original session/thread.
+    assert len(adapter.sent) == 2
     assert len(adapter.handled) == 2
     assert all(item["chat_id"] == "origin-chat" for item in adapter.sent)
     assert adapter.handled[-1].source.thread_id == "origin-thread"
@@ -449,7 +486,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     # Archive itself is intentionally silent, but consumes its event and
     # removes the subscription so no later historical event can replay.
-    assert len(adapter.sent) == 3
+    assert len(adapter.sent) == 2
     assert len(adapter.handled) == 2
     conn = kb.connect()
     try:
@@ -576,7 +613,9 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
 
 
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):
-    """A `block_loop_detected` event must reach the subscriber as a triage ping.
+    """A `block_loop_detected` event must reach the subscriber as ONE clean
+    human message — never the raw internal `triage` wording, and never
+    silence either.
 
     Regression for the silent-triage gap (PR #62712): kanban_db routes a task
     to `triage` after BLOCK_RECURRENCE_LIMIT re-blocks for the same cause and
@@ -585,8 +624,109 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     branch, that one transition (the whole point of which is to force human
     attention) produced zero notification and the task stalled in triage
     silently.
+
+    A later incident showed the fix for that gap had overshot: the message
+    was the *raw* worker/internal wording — "Kanban <task_id> routed to
+    TRIAGE — needs a human decision (blocked Nx for the same cause): <raw
+    reason>" — partly in English, leaking the raw task id and internal
+    `gate:` marker. Sébastien flagged this as exactly the kind of opaque
+    ping the `blocked` case was already fixed to avoid (see
+    ``test_notifier_sends_clean_human_ping_for_blocked_task``). The correct
+    behavior mirrors that fix: one clean French human message, no task id,
+    no `gate:` marker, no English, just the plain-language reason.
     """
     db_path = tmp_path / "block-loop.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="loops forever", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn, tid, "block_loop_detected",
+            {"reason": "gate:credentials — needs credentials", "kind": "needs_input",
+             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+        )
+        # Mirror kanban_db.block_task's real recurrence-limit transition: the
+        # task actually lands in `triage` and stays there (no auto-decompose
+        # resolution in this scenario) — the case that genuinely needs a
+        # human decision.
+        conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
+    text = adapter.sent[0]["text"]
+    assert "TRIAGE" not in text, "no raw internal TRIAGE wording in a human message"
+    assert tid not in text, "no raw task id in a direct chat message"
+    assert "gate:" not in text, "internal gate: marker must not leak"
+    assert "needs credentials" in text, "the plain-language reason must survive"
+    assert "loops forever" in text, "the human task title must be shown"
+    assert "Action requise" in text, "must read as a clear French action request"
+    assert "@worker" not in text, "no assignee/profile tag on a human-decision message"
+    assert "[default]" not in text, "no bracketed board-tag prefix on a human-decision message"
+    # Cursor advanced: the event is claimed and not re-delivered.
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["block_loop_detected"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_notifier_delivers_one_clean_final_coder_relay(tmp_path, monkeypatch):
+    db_path = tmp_path / "coder-relay.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="internal task", assignee="coder")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, "relayed_to_coder", {
+            "message": "Relais automatique vers Coder.\nRetour estimé Claude 2 : 09:30",
+        })
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"] == "Relais automatique vers Coder.\nRetour estimé Claude 2 : 09:30"
+    assert tid not in adapter.sent[0]["text"]
+    assert "@default" not in adapter.sent[0]["text"]
+
+
+def test_notifier_suppresses_block_loop_ping_when_already_auto_resolved(
+    tmp_path, monkeypatch,
+):
+    """A raw `block_loop_detected` event must send ZERO message once the
+    underlying task has already left `triage` by the time the notifier
+    processes it.
+
+    The dispatcher's auto-decomposer polls every `triage`-status task
+    (including ones routed there by this exact recurrence-limit path) on its
+    own independent tick and can turn it back into ready/running work with
+    no human input needed — a real race between the two loops. Pinging
+    Sébastien anyway for a transition that resolved itself is exactly the
+    raw-internal-event noise this task exists to silence: a genuine human
+    decision is only needed while the task is still actually sitting in
+    `triage`.
+    """
+    db_path = tmp_path / "block-loop-auto-resolved.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
 
@@ -599,6 +739,11 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
             {"reason": "needs credentials", "kind": "needs_input",
              "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
         )
+        # Simulate the auto-decomposer having already resolved the task back
+        # to ready/fanned-out work in the gap between the DB write and this
+        # notifier tick.
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        conn.commit()
     finally:
         conn.close()
 
@@ -607,12 +752,11 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
-    text = adapter.sent[0]["text"]
-    assert "TRIAGE" in text
-    assert tid in text
-    assert "needs credentials" in text
-    # Cursor advanced: the event is claimed and not re-delivered.
+    assert adapter.sent == [], (
+        "a self-resolved triage transition must not ping the user"
+    )
+    # Cursor still advances — the event is claimed and not re-delivered
+    # forever just because it produced no message.
     conn = kb.connect()
     try:
         _, remaining = kb.unseen_events_for_sub(
@@ -622,3 +766,291 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_sends_clean_human_ping_for_blocked_task(tmp_path, monkeypatch):
+    """A `blocked` event must reach the user as ONE clean human message.
+
+    Two failure modes bracket this contract, both observed in production:
+    (1) the original raw ping — "⛔ [default] @codex-worker … gate:credentials
+    …" — leaked task ids, profile-tag brackets, and the internal `gate:`
+    marker as noise Sébastien explicitly flagged; (2) a since-reverted "fix"
+    made `blocked` fully silent, relying only on the passive "Travail en
+    cours" board card — which reproduced the actual incident this task fixes:
+    a resolved/actionable state with no message telling him so. The correct
+    behavior is neither raw noise nor silence: send exactly one message,
+    strip the `gate:<type> —` marker, and keep the plain-language reason a
+    worker is required to write.
+    """
+    db_path = tmp_path / "blocked-clean-ping.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="needs a token", assignee="codex-worker",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            delivery_mode="notify+wake",
+        )
+        ok = kb.block_task(
+            conn, tid,
+            reason="gate:credentials — needs the Ecobloc GSC token to continue",
+            kind="capability",
+        )
+        assert ok, "block_task should succeed from the default ready state"
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Exactly one terminal message — not silence, not a duplicate.
+    assert len(adapter.sent) == 1, (
+        f"blocked must send exactly one human message, got: {adapter.sent}"
+    )
+    message = adapter.sent[0]["text"]
+    assert tid not in message, "no raw task id in a direct chat message"
+    assert "gate:" not in message, "internal gate: marker must not leak"
+    assert "needs the Ecobloc GSC token to continue" in message, (
+        "the plain-language reason must survive"
+    )
+    assert "codex-worker" not in message, (
+        "no assignee/profile tag on a human-decision message"
+    )
+    assert "[default]" not in message, (
+        "no bracketed board-tag prefix on a human-decision message"
+    )
+
+    # The wake self-post still fires — the creator agent is still informed
+    # internally and can act (e.g. route a real button-based permission ask).
+    assert len(adapter.handled) == 1
+
+    # Cursor still advances past the blocked event — it must not be
+    # redelivered forever.
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["blocked"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_notifier_classifies_prompt_timeout_as_internal_authorization_failure(
+    tmp_path, monkeypatch,
+):
+    """A worker-approval timeout is an internal relay/sync failure, not a
+    request for Sébastien to repeat an authorization manually."""
+    db_path = tmp_path / "blocked-internal-auth-timeout.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="protected write relay", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.block_task(
+            conn,
+            tid,
+            reason=(
+                "approval prompt timed out without a user response. "
+                "Silence is not consent. Run authorize-instruction-edit if needed."
+            ),
+            kind="capability",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "Problème interne d’autorisation" in message
+    assert "aucune action de votre part" in message
+    assert "Reprise automatique en cours" in message
+    assert "Action requise" not in message
+
+
+def test_notifier_recovers_blocked_task_when_durable_grant_already_exists(
+    tmp_path, monkeypatch,
+):
+    """A present durable grant proves the failure is local guard sync, so the
+    notifier must not ask the user again and must make dispatcher recovery
+    possible by unblocking the task."""
+    db_path = tmp_path / "blocked-grant-sync-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    target = tmp_path / "AGENTS.md"
+    target.write_text("rules")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="grant already exists", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.authorize_instruction_edit(
+            conn,
+            tid,
+            str(target),
+            granted_by="operator",
+            reason="Sébastien already authorized this exact file",
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="approval prompt timed out despite a durable grant",
+            kind="capability",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "Problème interne d’autorisation" in message
+    assert "Action requise" not in message
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_notifier_delivers_final_message_after_block_genuinely_resolved(
+    tmp_path, monkeypatch,
+):
+    """Block → unblock → completed must end in exactly one clear final message.
+
+    This pins the "blocage réellement résolu" case from the incident: a task
+    that was blocked, got unblocked, and then genuinely finished must not
+    leave Sébastien needing to ask again for the result. The intermediate
+    `unblocked` transition stays silent (internal), but the block itself and
+    the eventual completion both reach the user — never zero, never a
+    stuck/ambiguous state.
+    """
+    db_path = tmp_path / "block-resolved-then-complete.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="resumable task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.block_task(
+            conn, tid, reason="besoin d'une décision sur le format", kind="needs_input",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, "the block itself must reach the user"
+    assert "besoin d'une décision sur le format" in adapter.sent[0]["text"]
+
+    conn = kb.connect()
+    try:
+        assert kb.unblock_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="fait selon le format choisi")
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Exactly one more message: the completion. `unblocked` stays silent —
+    # it must not add a second, redundant ping.
+    assert len(adapter.sent) == 2, (
+        f"expected block + completion only, got: {[d['text'] for d in adapter.sent]}"
+    )
+    assert "fait selon le format choisi" in adapter.sent[1]["text"]
+
+    # A third tick with no new events must not resend anything (dedup holds).
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 2, "no event left to redeliver; count must not grow"
+
+
+def test_notifier_resumes_delivery_after_crash_then_completion(tmp_path, monkeypatch):
+    """A crash → retry → completion cycle must not strand the final result.
+
+    Mirrors the incident report: an announced task that crashes mid-run, gets
+    reclaimed by the dispatcher, and eventually finishes must still surface
+    ONE clear terminal message for the completion — not just the earlier
+    crash ping, and not a hang waiting on a manual follow-up.
+    """
+    db_path = tmp_path / "crash-then-resume-complete.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="flaky task", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="crashed")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert "Impact : le worker s’est arrêté avant la fin." in adapter.sent[0]["text"]
+
+    # Dispatcher reclaims and respawns; this run succeeds.
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, tid, summary="terminé après relance")
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2, (
+        f"the post-crash completion must still be delivered, got: "
+        f"{[d['text'] for d in adapter.sent]}"
+    )
+    assert "terminé après relance" in adapter.sent[1]["text"]
+
+
+def test_notifier_does_not_double_send_same_event(tmp_path, monkeypatch):
+    """Re-polling with no new events must never resend the last message.
+
+    The cursor is the sole dedup mechanism; this pins that a completed
+    event, once delivered and the cursor advanced, is never replayed by a
+    later tick that finds nothing new to claim.
+    """
+    db_path = tmp_path / "no-double-send.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription(summary="fini une seule fois")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+
+    # Three more ticks, no new DB writes in between.
+    for _ in range(3):
+        runner = _make_runner(adapter)
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, (
+        f"same event must not be redelivered across idle ticks, got: "
+        f"{[d['text'] for d in adapter.sent]}"
+    )

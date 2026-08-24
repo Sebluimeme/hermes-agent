@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli import closure_evidence
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 
@@ -81,6 +82,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "routing_tier": t.routing_tier,
     }
 
 
@@ -399,6 +401,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--routing-tier", choices=sorted(kb.VALID_ROUTING_TIERS),
+                          default=None, dest="routing_tier",
+                          help="Persistent routing hint for auto-routed "
+                               "(unassigned) cards. 'simple' is only for "
+                               "explicitly bounded, low-risk work (reading, "
+                               "research, inventory, small tested fixes): "
+                               "Spark -> Claude2 -> Claude1 -> Terra. 'complex' is for "
+                               "architecture/security/credentials/migrations/"
+                               "external actions/important UI/multi-file work: "
+                               "Claude2 -> Claude1 -> Terra, never Spark. "
+                               "Creation-time only — there is "
+                               "no way to change it after the card exists. "
+                               "Omit for the fail-safe default (complex).")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -655,6 +670,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_authorize_instruction = sub.add_parser(
+        "authorize-instruction-edit",
+        help="Record explicit, task-scoped consent to edit one protected instruction file",
+    )
+    p_authorize_instruction.add_argument("task_id")
+    p_authorize_instruction.add_argument("target_path", help="Absolute path of the protected file")
+    p_authorize_instruction.add_argument(
+        "--reason", required=True,
+        help="Explicit operator authorization note, stored in the task audit trail.",
+    )
+    p_authorize_instruction.add_argument(
+        "--author", default=None,
+        help="Operator identity (default: $HERMES_PROFILE or 'user').",
+    )
+
+    p_recover_instruction = sub.add_parser(
+        "recover-instruction-edit",
+        help="Recover a triage task only when it has a durable instruction-edit authorization",
+    )
+    p_recover_instruction.add_argument("task_id")
+
     p_request_review = sub.add_parser(
         "request-review",
         help="Move a task to 'review' (implementation done, awaiting review) — NOT a block",
@@ -804,6 +840,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "stats", help="Per-status + per-assignee counts + oldest-ready age",
     )
     p_stats.add_argument("--json", action="store_true")
+    p_stats.add_argument(
+        "--since", default=None,
+        help="Only count tasks created at/after this time (epoch seconds or "
+             "ISO-8601). Switches to the read-only aggregate view.",
+    )
+    p_stats.add_argument(
+        "--until", default=None,
+        help="Only count tasks created at/before this time (epoch seconds or "
+             "ISO-8601). Switches to the read-only aggregate view.",
+    )
+    p_stats.add_argument(
+        "--sessions", action="store_true",
+        help="Also include active session lease counts (read-only, from "
+             "runtime/active_sessions.json).",
+    )
+    p_stats.add_argument(
+        "--context", action="store_true",
+        help="Also include context-handoff event counts (read-only, from "
+             "state/context-handoff/events.jsonl).",
+    )
+    p_stats.add_argument(
+        "--full", action="store_true",
+        help="Shorthand for --sessions --context.",
+    )
 
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
@@ -947,6 +1007,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--json",
         action="store_true",
         help="Emit one JSON object per task on stdout",
+    )
+    p_specify.add_argument(
+        "--as-is",
+        dest="as_is",
+        action="store_true",
+        help="Promote triage -> todo WITHOUT calling the auxiliary LLM. "
+             "For cards already well-specified (e.g. a detailed block "
+             "reason) that just need unblocking, not rewriting. "
+             "Incompatible with --all. Combine with --title/--body for an "
+             "explicit manual edit, or omit both to promote unchanged.",
+    )
+    p_specify.add_argument(
+        "--title",
+        default=None,
+        help="Explicit new title, used only with --as-is",
+    )
+    p_specify.add_argument(
+        "--body",
+        default=None,
+        help="Explicit new body, used only with --as-is",
     )
 
     # --- decompose --- (triage → fan-out via auxiliary LLM + orchestrator)
@@ -1130,6 +1210,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "authorize-instruction-edit": _cmd_authorize_instruction_edit,
+            "recover-instruction-edit": _cmd_recover_instruction_edit,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -1586,6 +1668,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            routing_tier=getattr(args, "routing_tier", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1762,6 +1845,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    print(f"  routing-tier: {kb.normalize_routing_tier(task.routing_tier)}" +
+          (" (raw: none, fail-safe default)" if not task.routing_tier else ""))
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -2292,6 +2377,17 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
+            # LOT 4 — a card cannot become 'done' on bare assertion. See
+            # hermes_cli/closure_evidence.py for the accepted evidence kinds.
+            closure_rejection = closure_evidence.closure_gate(
+                prior_status=getattr(task, "status", None),
+                metadata=metadata,
+            )
+            if closure_rejection is not None:
+                print(f"kanban: {tid}: {closure_rejection}", file=sys.stderr)
+                failed.append(tid)
+                continue
+
             if not kb.complete_task(
                 conn, tid,
                 result=args.result,
@@ -2413,6 +2509,48 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_authorize_instruction_edit(args: argparse.Namespace) -> int:
+    """Persist a narrow operator grant; workers have no matching model tool."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "kanban: workers cannot grant their own instruction-edit authorization",
+            file=sys.stderr,
+        )
+        return 1
+    author = args.author or _profile_author()
+    with kb.connect_closing() as conn:
+        kb.authorize_instruction_edit(
+            conn,
+            args.task_id,
+            args.target_path,
+            granted_by=author,
+            reason=args.reason,
+        )
+    print(f"Authorized protected instruction edit for {args.task_id}: {args.target_path}")
+    return 0
+
+
+def _cmd_recover_instruction_edit(args: argparse.Namespace) -> int:
+    """Release only a triage task whose missing consent was explicitly granted."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        print(
+            "kanban: workers cannot recover triage tasks",
+            file=sys.stderr,
+        )
+        return 1
+    with kb.connect_closing() as conn:
+        if not kb.recover_triage_after_instruction_authorization(conn, args.task_id):
+            print(
+                f"cannot recover {args.task_id}: it must be in triage with a durable "
+                "instruction-edit authorization",
+                file=sys.stderr,
+            )
+            return 1
+        task = kb.get_task(conn, args.task_id)
+    print(f"Recovered {args.task_id} to {task.status if task else 'ready'}")
+    return 0
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -2918,6 +3056,48 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
+    since = getattr(args, "since", None)
+    until = getattr(args, "until", None)
+    want_sessions = getattr(args, "sessions", False) or getattr(args, "full", False)
+    want_context = getattr(args, "context", False) or getattr(args, "full", False)
+
+    if since or until or want_sessions or want_context:
+        # Aggregate diagnostic path: strictly-typed read-only counters across
+        # kanban/sessions/context, no free-form query surface. See
+        # hermes_cli/aggregate_diagnostics.py.
+        from hermes_cli.aggregate_diagnostics import (
+            DiagnosticsError,
+            run_aggregate_diagnostics,
+        )
+        try:
+            agg = run_aggregate_diagnostics(
+                since=since,
+                until=until,
+                include_sessions=want_sessions,
+                include_context=want_context,
+            )
+        except DiagnosticsError as exc:
+            print(f"kanban stats: {exc}", file=sys.stderr)
+            return 2
+        if getattr(args, "json", False):
+            print(json.dumps(agg, indent=2, ensure_ascii=False))
+            return 0
+        windowed = " (windowed)" if (since or until) else ""
+        print(f"By status{windowed}:")
+        for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+            print(f"  {k:8s}  {agg['kanban'].get(k, 0)}")
+        if want_sessions:
+            sess = agg["sessions"]
+            print(f"\nActive sessions: {sess['total']}")
+            for surface, n in sorted(sess["by_surface"].items()):
+                print(f"  {surface:12s}  {n}")
+        if want_context:
+            ctx = agg["context_handoffs"]
+            print(f"\nContext handoffs: {ctx['total']}")
+            for event, n in sorted(ctx["by_event"].items()):
+                print(f"  {event:20s}  {n}")
+        return 0
+
     with kb.connect_closing() as conn:
         stats = kb.board_stats(conn)
     if getattr(args, "json", False):
@@ -3068,10 +3248,28 @@ def _cmd_specify(args: argparse.Namespace) -> int:
     tenant = getattr(args, "tenant", None)
     author = getattr(args, "author", None) or _profile_author()
     want_json = bool(getattr(args, "json", False))
+    as_is = bool(getattr(args, "as_is", False))
+    explicit_title = getattr(args, "title", None)
+    explicit_body = getattr(args, "body", None)
 
     if args.task_id and all_flag:
         print(
             "kanban: pass either a task id OR --all, not both",
+            file=sys.stderr,
+        )
+        return 2
+
+    if as_is and all_flag:
+        print(
+            "kanban: --as-is is incompatible with --all — bulk-promoting "
+            "without a review is exactly what --as-is exists to avoid",
+            file=sys.stderr,
+        )
+        return 2
+
+    if (explicit_title is not None or explicit_body is not None) and not as_is:
+        print(
+            "kanban: --title/--body require --as-is",
             file=sys.stderr,
         )
         return 2
@@ -3101,7 +3299,12 @@ def _cmd_specify(args: argparse.Namespace) -> int:
     ok_count = 0
     fail_count = 0
     for tid in ids:
-        outcome = spec.specify_task(tid, author=author)
+        if as_is:
+            outcome = spec.specify_task_as_is(
+                tid, title=explicit_title, body=explicit_body, author=author,
+            )
+        else:
+            outcome = spec.specify_task(tid, author=author)
         if outcome.ok:
             ok_count += 1
         else:

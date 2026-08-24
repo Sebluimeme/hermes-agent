@@ -13127,6 +13127,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
+        # Start the worker-approval bridge — turns a Kanban worker process's
+        # protected-instruction-write approval request (which cannot reach
+        # this process's in-memory _gateway_queues, being a separate OS
+        # process) into a real Telegram/Discord/etc. Approve/Refuse prompt.
+        # See tools/worker_approval.py and
+        # gateway/kanban_watchers.py::_kanban_worker_approval_bridge.
+        self._spawn_supervised(
+            self._kanban_worker_approval_bridge, "kanban_worker_approval_bridge",
+        )
+
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or

@@ -9926,14 +9926,22 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     payload = getattr(ev, "payload", None) or {}
     if kind == "completed":
         handoff = ""
+        proof = ""
+        if isinstance(payload.get("evidence"), dict):
+            ev_proof = payload["evidence"]
+            proof_kind = str(ev_proof.get("kind") or "preuve").strip()
+            proof_detail = str(ev_proof.get("detail") or "").strip()
+            proof = f" — Preuve Kanban : {proof_kind}"
+            if proof_detail:
+                proof += f" — {proof_detail[:160]}"
         summary = payload.get("summary")
         if summary:
             lines = str(summary).strip().splitlines()
-            handoff = f"\n{lines[0][:200]}" if lines else ""
+            handoff = f"\n{lines[0][:200]}{proof}" if lines else ""
         elif getattr(task, "result", None):
             lines = str(task.result).strip().splitlines()
-            handoff = f"\n{lines[0][:160]}" if lines else ""
-        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+            handoff = f"\n{lines[0][:160]}{proof}" if lines else ""
+        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{proof}{handoff}"
     if kind == "blocked":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
         return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"

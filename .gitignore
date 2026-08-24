@@ -205,3 +205,8 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+# Local emergency copies made while repairing a running gateway. The reviewed
+# source and its tests belong in Git; dated pre-change snapshots do not.
+*.bak-*
+*.pre-*

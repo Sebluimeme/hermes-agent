@@ -134,6 +134,121 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_default_spawn_resumes_only_unblocked_transient_worker(monkeypatch, tmp_path):
+    """Safe tool retry keeps one worker session instead of spawning a new one."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli._parser import build_top_level_parser
+
+    kb.init_db()
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="retry a read", assignee="elias")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid, reason="read-only guard", kind="transient",
+            metadata={"worker_session_id": "worker-session-42"},
+        )
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid) is not None
+        task = kb.get_task(conn, tid)
+        assert task is not None
+
+    kb._default_spawn(task, str(workspace))
+
+    assert captured["env"]["HERMES_KANBAN_RESUME_SESSION_ID"] == "worker-session-42"
+    assert captured["cmd"][captured["cmd"].index("--resume") + 1] == "worker-session-42"
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+    parsed = parser.parse_args(captured["cmd"][3:])
+    assert parsed.resume == "worker-session-42"
+    # The resumed command references the existing worker session; it does not
+    # allocate a second session identity for this retry.
+    assert len({"worker-session-42", parsed.resume}) == 1
+    assert captured["cmd"][-1].startswith(f"continue kanban task {tid}")
+
+
+def test_default_spawn_keeps_human_block_and_crash_as_fresh_context(monkeypatch, tmp_path):
+    """needs_input and a crash must not inherit the prior worker session."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "elias").mkdir(parents=True)
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    kb.init_db()
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4246
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs decision", assignee="elias")
+        kb.claim_task(conn, tid)
+        kb.block_task(
+            conn, tid, reason="need human input", kind="needs_input",
+            metadata={"worker_session_id": "must-not-resume"},
+        )
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid) is not None
+        task = kb.get_task(conn, tid)
+        assert task is not None
+
+    kb._default_spawn(task, str(workspace))
+
+    assert "--resume" not in captured["cmd"]
+    assert "HERMES_KANBAN_RESUME_SESSION_ID" not in captured["env"]
+    assert captured["cmd"][-1] == f"work kanban task {tid}"
+
+    with kb.connect() as conn:
+        crash_tid = kb.create_task(conn, title="crashed retry", assignee="elias")
+        kb.claim_task(conn, crash_tid)
+        kb.block_task(
+            conn, crash_tid, reason="temporary", kind="transient",
+            metadata={"worker_session_id": "crashed-session"},
+        )
+        conn.execute(
+            "UPDATE task_runs SET outcome = 'crashed' WHERE task_id = ?",
+            (crash_tid,),
+        )
+        assert kb.unblock_task(conn, crash_tid)
+        assert kb.claim_task(conn, crash_tid) is not None
+        crashed_task = kb.get_task(conn, crash_tid)
+        assert crashed_task is not None
+
+    kb._default_spawn(crashed_task, str(workspace))
+    assert "--resume" not in captured["cmd"]
+    assert captured["cmd"][-1] == f"work kanban task {crash_tid}"
+
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"

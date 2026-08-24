@@ -97,6 +97,62 @@ def test_specify_task_happy_path(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# specify_task_as_is — no LLM call
+# ---------------------------------------------------------------------------
+
+def test_specify_task_as_is_promotes_without_llm_call(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="already detailed", triage=True,
+            body="**Goal**\nAlready exploitable, don't rewrite.",
+        )
+
+    mock_fn = MagicMock()
+    with patch("agent.auxiliary_client.call_llm", mock_fn):
+        outcome = spec.specify_task_as_is(tid, author="ace")
+
+    assert mock_fn.call_count == 0
+    assert outcome.ok is True
+    assert outcome.task_id == tid
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status in {"todo", "ready"}
+    # Body/title untouched since neither was passed.
+    assert task.title == "already detailed"
+    assert task.body == "**Goal**\nAlready exploitable, don't rewrite."
+
+
+def test_specify_task_as_is_with_explicit_title_body(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True, body="rough body")
+
+    mock_fn = MagicMock()
+    with patch("agent.auxiliary_client.call_llm", mock_fn):
+        outcome = spec.specify_task_as_is(
+            tid, title="Manual title", body="Manual body", author="ace",
+        )
+
+    assert mock_fn.call_count == 0
+    assert outcome.ok is True
+    assert outcome.new_title == "Manual title"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.title == "Manual title"
+    assert task.body == "Manual body"
+
+
+def test_specify_task_as_is_rejects_non_triage(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already todo", triage=False)
+
+    outcome = spec.specify_task_as_is(tid, author="ace")
+    assert outcome.ok is False
+    assert "not in triage" in outcome.reason
+
+
+# ---------------------------------------------------------------------------
 # CLI wiring — argparse + _cmd_specify
 # ---------------------------------------------------------------------------
 
@@ -136,5 +192,76 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, outside).status == "triage"
         # The inside task was promoted.
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
+
+
+def test_cli_specify_as_is_no_llm_call(kanban_home, capsys):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="detailed block reason", triage=True,
+            body="Exact repro steps kept verbatim.",
+        )
+
+    mock_fn = MagicMock()
+    with patch("agent.auxiliary_client.call_llm", mock_fn):
+        rc = _run_cli("specify", tid, "--as-is")
+
+    assert rc == 0
+    assert mock_fn.call_count == 0
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status in {"todo", "ready"}
+    assert task.body == "Exact repro steps kept verbatim."
+
+
+def test_cli_specify_as_is_with_title_and_body(kanban_home, capsys):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True, body="rough body")
+
+    mock_fn = MagicMock()
+    with patch("agent.auxiliary_client.call_llm", mock_fn):
+        rc = _run_cli(
+            "specify", tid, "--as-is",
+            "--title", "Fixed title", "--body", "Fixed body",
+        )
+
+    assert rc == 0
+    assert mock_fn.call_count == 0
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.title == "Fixed title"
+    assert task.body == "Fixed body"
+
+
+def test_cli_specify_as_is_rejects_all(kanban_home, capsys):
+    rc = _run_cli("specify", "--all", "--as-is")
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--as-is" in err and "--all" in err
+
+
+def test_cli_specify_title_without_as_is_rejected(kanban_home, capsys):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    rc = _run_cli("specify", tid, "--title", "Nope")
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--as-is" in err
+
+
+def test_cli_specify_default_behavior_unchanged(kanban_home, capsys):
+    """Without --as-is, the LLM path still runs exactly as before."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    content = jsonlib.dumps({"title": "Refined", "body": "**Goal**\nX"})
+    p, mock_fn = _patch_aux_client(content)
+    with p:
+        rc = _run_cli("specify", tid)
+
+    assert rc == 0
+    assert mock_fn.call_count == 1
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.title == "Refined"
 
 

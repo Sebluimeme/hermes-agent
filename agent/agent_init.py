@@ -1438,6 +1438,26 @@ def init_agent(
                     headers["x-anthropic-beta"] = _FINE_GRAINED
                 client_kwargs["default_headers"] = headers
 
+        # Kanban task correlation for local claude-cli-proxy daemons (claude1/
+        # claude2 lanes, t_b71ff246): those proxies are persistent daemons
+        # with no per-request knowledge of which kanban task they're serving,
+        # so the Claude Code subprocess they shell out to can never emit
+        # activity events. This worker's own env already carries the task id
+        # (set by the dispatcher) — forward it as a header so the proxy can
+        # correlate and write activity events on our behalf. Loopback-only:
+        # never leaked to a remote custom endpoint.
+        _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+        if _kanban_task and (
+            base_url_host_matches(_effective_base, "127.0.0.1")
+            or base_url_host_matches(_effective_base, "localhost")
+        ):
+            headers = client_kwargs.get("default_headers") or {}
+            headers["X-Hermes-Kanban-Task"] = _kanban_task
+            _kanban_run = os.environ.get("HERMES_KANBAN_RUN_ID")
+            if _kanban_run:
+                headers["X-Hermes-Kanban-Run-Id"] = _kanban_run
+            client_kwargs["default_headers"] = headers
+
         # User-configured request headers (model.default_headers in
         # config.yaml) override provider/SDK defaults. Lets custom
         # OpenAI-compatible endpoints behind a gateway/WAF that rejects the
@@ -1577,11 +1597,12 @@ def init_agent(
     # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    # (init + each context compression). The actual guidance text is picked
+    # further down, once `_agent_section` (the profile's `agent:` config
+    # block) is available — see the `kanban_tools_reach_model` handling
+    # near `_tool_use_enforcement` below.
+    agent._kanban_worker_guidance = ""
+    _kanban_show_registered = "kanban_show" in agent.valid_tool_names
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
@@ -1926,6 +1947,24 @@ def init_agent(
     if not isinstance(_agent_section, dict):
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+
+    # Resolve the kanban worker/orchestrator guidance text now that
+    # `_agent_section` is available (see the placeholder set earlier,
+    # right after `agent.valid_tool_names` — kept there so it's session-
+    # static and not recomputed on every prompt rebuild).
+    # ``agent.kanban_tools_reach_model`` (default True): set False in a
+    # profile's config.yaml when its backend never delivers Hermes' tool
+    # schemas to the model (e.g. a CLI-proxy backend such as
+    # scripts/claude-cli-proxy.py, which drives `claude -p` — a separate CLI
+    # with its own fixed built-in toolset that never sees the `kanban_*`
+    # schemas Hermes registers locally). `kanban_show` still passes every
+    # local check_fn gate in that case, so it appears in `valid_tool_names`
+    # even though no call to it can ever reach the model — the guidance text
+    # must not tell the worker to rely on tools it cannot actually invoke.
+    if _kanban_show_registered:
+        from agent.prompt_builder import kanban_guidance_for
+        _tools_reach_model = bool(_agent_section.get("kanban_tools_reach_model", True))
+        agent._kanban_worker_guidance = kanban_guidance_for(_tools_reach_model)
 
     # Execution-discipline guidance gate: "auto" (default — matches
     # EXECUTION_GUIDANCE_MODELS), true (always), false (never), or list of

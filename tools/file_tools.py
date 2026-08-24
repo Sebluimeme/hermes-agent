@@ -9,6 +9,7 @@ import os
 import posixpath
 import sys
 import threading
+import time
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -836,23 +837,60 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
-def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
-    """Ask the human to approve a write to protected instruction file(s).
+_PROTECTED_APPROVAL_BATCH_WINDOW_SECONDS = 0.05
+_protected_approval_batches_lock = threading.Lock()
+_protected_approval_batches: dict[tuple[str, str], dict] = {}
 
-    Returns ``None`` when approved, or a BLOCKED error string. This gate
-    intentionally does NOT route through ``_run_approval_gate``: that gate
-    honors --yolo and session/permanent allowlists, and the entire point
-    here is one-operation approval EVERY time, with no persistent scope
-    and no yolo bypass. Fail-closed when no human channel exists.
+
+def _canonical_protected_instruction_path(path: str, task_id: str) -> str:
+    """Return the exact filesystem target shown in protected-edit consent."""
+    try:
+        return os.path.realpath(str(_resolve_path_for_task(path, task_id)))
+    except (OSError, ValueError, RuntimeError):
+        return os.path.realpath(_expand_tilde(path))
+
+
+def _kanban_grant_hint(paths: list[str]) -> str:
+    """Name the durable way out when no approval channel reached this worker.
+
+    A Kanban worker is a separate process and nothing registers a gateway
+    notify callback for it (``approval.register_gateway_notify`` has no
+    production caller), so its approval request is delivered to nobody and
+    simply times out. Observed on this install: 19 requests, 19 timeouts,
+    zero answers — the operator never even knew he was being asked.
+
+    The durable grant path already works (this same gate consults
+    ``kanban_db.has_instruction_edit_authorization`` before prompting), so the
+    only thing missing was telling anyone it exists. Naming the exact command
+    turns a silent dead end into one copy-pasteable line that reaches the
+    operator through the card's block reason.
     """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id or not paths:
+        return ""
+    commands = "  |  ".join(
+        f'hermes kanban authorize-instruction-edit {task_id} {path} --reason "..."'
+        for path in list(dict.fromkeys(paths))[:3]
+    )
+    return (
+        " No approval channel reached this worker, so nobody was asked."
+        " The operator can grant this exact card and file durably with:"
+        f" {commands}"
+    )
+
+
+def _present_protected_instruction_approval(
+        reasons: list[str], paths: list[str]) -> str | None:
+    """Present one already-batched protected-edit approval to a human."""
     targets = ", ".join(dict.fromkeys(reasons))
+    exact_paths = list(dict.fromkeys(paths))
+    path_list = ", ".join(exact_paths)
     description = (
-        f"Write to protected agent-instruction file(s): {targets}. "
+        f"Write to protected agent-instruction file(s): {path_list}. "
         "These files steer future agent behavior; approval is always "
         "required (not bypassed by auto-approve)."
     )
-    display = f"<write to {targets}>"
+    display = f"<write to {path_list}>"
     blocked = (
         f"BLOCKED: write to protected agent-instruction file(s) ({targets}) "
         "{why} The user has NOT consented to this write. Do NOT retry it or "
@@ -866,9 +904,6 @@ def _request_protected_instruction_approval(
         return blocked.format(why="requires approval but the approval "
                                   "subsystem is unavailable.")
 
-    # Gateway surface: block on the button round-trip when a notify callback
-    # is registered for this session (Telegram/Discord/Slack). One-operation
-    # only — no session/permanent buttons are offered.
     session_key = _approval.get_current_session_key()
     notify_cb = None
     try:
@@ -883,6 +918,7 @@ def _request_protected_instruction_approval(
             "pattern_key": "protected_instruction_file",
             "pattern_keys": ["protected_instruction_file"],
             "description": description,
+            "protected_instruction_paths": exact_paths,
             "allow_permanent": False,
             "allow_session": False,
         }
@@ -890,48 +926,138 @@ def _request_protected_instruction_approval(
             session_key, notify_cb, approval_data, surface="gateway",
         )
         if decision.get("notify_failed"):
-            return blocked.format(
-                why="requires approval but the approval request could not "
-                    "be delivered.")
+            return blocked.format(why="requires approval but the approval request could not "
+                                       "be delivered.") + _kanban_grant_hint(exact_paths)
         choice = decision.get("choice")
         if decision.get("resolved") and choice in {"once", "session", "always"}:
-            # One-operation grant regardless of the tapped scope — nothing
-            # is persisted for this gate.
             return None
         if not decision.get("resolved"):
-            return blocked.format(
-                why="approval prompt timed out without a user response. "
-                    "Silence is not consent.")
+            return blocked.format(why="approval prompt timed out without a user response. "
+                                       "Silence is not consent.") + _kanban_grant_hint(exact_paths)
         return blocked.format(why="was denied by the user.")
 
-    # CLI surface: per-thread approval callback (prompt_toolkit panel).
     callback = None
     try:
         from tools.terminal_tool import _get_approval_callback
         callback = _get_approval_callback()
     except Exception:
         callback = None
-
     if callback is not None:
         choice = _approval.prompt_dangerous_approval(
-            display, description,
-            allow_permanent=False,
-            approval_callback=callback,
+            display, description, allow_permanent=False, approval_callback=callback,
         )
         if choice in {"once", "session", "always"}:
-            # One-operation grant; never persisted (see docstring).
             return None
         if choice == "timeout":
-            return blocked.format(
-                why="approval prompt timed out without a user response. "
-                    "Silence is not consent.")
+            return blocked.format(why="approval prompt timed out without a user response. "
+                                       "Silence is not consent.") + _kanban_grant_hint(exact_paths)
         return blocked.format(why="was denied by the user.")
 
-    # No human channel at all (script, cron, background thread): fail
-    # closed. Auto-approving here would recreate the persistence vector.
-    return blocked.format(
-        why="requires approval but no interactive user or gateway is "
-            "present to approve it.")
+    # No live interactive channel in THIS process (no gateway turn, no CLI
+    # prompt) — the situation the 19/19-timeout incident was born from. If
+    # this is a Kanban worker, bridge the request to the gateway process
+    # over the durable file transport in tools/worker_approval.py instead of
+    # giving up immediately: the gateway polls it and turns it into the same
+    # Telegram Approve/Refuse buttons a live session would get.
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if task_id:
+        try:
+            from tools import worker_approval as _worker_approval
+        except Exception:
+            _worker_approval = None
+        if _worker_approval is not None:
+            decision = _worker_approval.request_decision(
+                task_id=task_id,
+                title=f"Protected write: {path_list}",
+                description=description,
+                paths=exact_paths,
+            )
+            choice = decision.get("choice")
+            if decision.get("resolved") and choice in {"once", "session", "always"}:
+                return None
+            if not decision.get("resolved"):
+                return blocked.format(why="approval prompt timed out without a user response. "
+                                           "Silence is not consent.") + _kanban_grant_hint(exact_paths)
+            return blocked.format(why="was denied by the user.")
+
+    return blocked.format(why="requires approval but no interactive user or gateway is "
+                               "present to approve it.") + _kanban_grant_hint(exact_paths)
+
+
+def _request_protected_instruction_approval(
+        reasons: list[str], paths: list[str], task_id: str = "default") -> str | None:
+    """Ask the human to approve a write to protected instruction file(s).
+
+    A dispatcher worker may proceed without a live prompt only when every
+    protected target has a durable, task-scoped operator grant in Kanban. The
+    grant lookup is intentionally exact-path and never treats task text or
+    comments as consent.
+
+    Returns ``None`` when approved, or a BLOCKED error string. This gate
+    intentionally does NOT route through ``_run_approval_gate``: that gate
+    honors --yolo and session/permanent allowlists, and the entire point
+    here is one-operation approval EVERY time, with no persistent scope
+    and no yolo bypass. Fail-closed when no human channel exists.
+    """
+    if task_id != "default":
+        try:
+            from hermes_cli import kanban_db as kb
+            with kb.connect_closing() as conn:
+                if paths and all(
+                    kb.has_instruction_edit_authorization(conn, task_id, path)
+                    for path in paths
+                ):
+                    return None
+        except Exception:
+            # A missing/corrupt board must never become an approval bypass.
+            logger.debug("Kanban instruction-edit authorization lookup failed", exc_info=True)
+    # Concurrent protected writes in one task/session are one atomic decision.
+    # A gateway session can host several Kanban tasks with different workspaces;
+    # batching only by session could display task A's resolved target as consent
+    # for task B's same relative pathname.
+    # leader waits briefly to collect sibling paths, then every included
+    # follower adopts its result. A path arriving after the prompt is sealed
+    # waits instead of creating a competing prompt: a deny/timeout cancels it;
+    # an approval makes it request its own exact, new consent afterwards.
+    import tools.approval as _approval
+    session_key = _approval.get_current_session_key()
+    batch_key = (session_key, task_id)
+    batch = None
+    leader = False
+    with _protected_approval_batches_lock:
+        batch = _protected_approval_batches.get(batch_key)
+        if batch is None:
+            batch = {
+                "items": [],
+                "result": "BLOCKED: protected-instruction approval coordination failed. "
+                          "The user has NOT consented to this write.",
+                "done": threading.Event(),
+                "sealed": False,
+            }
+            _protected_approval_batches[batch_key] = batch
+            leader = True
+        included = not batch["sealed"]
+        if included:
+            batch["items"].extend(zip(reasons, paths))
+    if leader:
+        time.sleep(_PROTECTED_APPROVAL_BATCH_WINDOW_SECONDS)
+        with _protected_approval_batches_lock:
+            batch["sealed"] = True
+            items = list(batch["items"])
+        grouped_reasons = [reason for reason, _ in items]
+        grouped_paths = [_canonical_protected_instruction_path(path, task_id) for _, path in items]
+        try:
+            batch["result"] = _present_protected_instruction_approval(grouped_reasons, grouped_paths)
+        finally:
+            with _protected_approval_batches_lock:
+                if _protected_approval_batches.get(batch_key) is batch:
+                    _protected_approval_batches.pop(batch_key, None)
+            batch["done"].set()
+    else:
+        batch["done"].wait()
+        if not included and batch["result"] is None:
+            return _request_protected_instruction_approval(reasons, paths, task_id)
+    return batch["result"]
 
 
 def _check_protected_instruction_write(paths: list[str],
@@ -949,14 +1075,16 @@ def _check_protected_instruction_write(paths: list[str],
     if not enabled:
         return None
     reasons: list[str] = []
+    protected_paths: list[str] = []
     for p in paths:
         reason = _protected_instruction_reason(
             p, task_id, enabled=enabled, extra_patterns=extra)
         if reason:
             reasons.append(reason)
+            protected_paths.append(p)
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    return _request_protected_instruction_approval(reasons, protected_paths, task_id)
 
 
 def _check_approval_required_write(paths: list[str],

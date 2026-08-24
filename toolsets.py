@@ -85,7 +85,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_request_changes",
     "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
-    "kanban_unblock",
+    "kanban_unblock", "kanban_authorize_instruction_edit",
+    "kanban_recover_instruction_edit",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
@@ -320,14 +321,16 @@ TOOLSETS = {
             "tasks done with structured handoffs, enter first-class review "
             "(request_review — not a block), return review changes, block for human input, "
             "heartbeat during long ops, comment on threads, attach files, and "
-            "(for orchestrators) list, unblock, and fan out tasks."
+            "(for orchestrators) list, unblock, authorize protected instruction edits, "
+            "recover authorized triage tasks, and fan out tasks."
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
             "kanban_request_review", "kanban_request_changes",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
-            "kanban_unblock",
+            "kanban_unblock", "kanban_authorize_instruction_edit",
+            "kanban_recover_instruction_edit",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
         ],
         "includes": [],

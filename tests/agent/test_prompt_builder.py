@@ -1052,6 +1052,73 @@ class TestParallelToolCallGuidance:
         assert PARALLEL_TOOL_CALL_GUIDANCE.lstrip().startswith("#")
 
 
+class TestKanbanGuidanceFor:
+    """kanban_guidance_for() — t_98e5c12e.
+
+    Root cause: some profiles (claude1/claude2, backed by
+    scripts/claude-cli-proxy.py) run a *different* agent binary downstream
+    that never receives Hermes' tool schemas. `kanban_show` still passes
+    every local check_fn gate on those profiles, so it renders as an
+    available tool in this very prompt, but no call to it can ever reach
+    the model. The default guidance text told the worker to rely on those
+    tools and explicitly forbade the one fallback that does work
+    (`hermes kanban <verb>` via terminal), so every such worker either
+    stalled or exited without closing its own card ("protocol violation").
+    """
+
+    def test_default_returns_unmodified_guidance(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE, kanban_guidance_for
+
+        assert kanban_guidance_for(True) == KANBAN_GUIDANCE
+        assert kanban_guidance_for() == KANBAN_GUIDANCE
+
+    def test_unreachable_variant_drops_the_shell_out_prohibition(self):
+        from agent.prompt_builder import kanban_guidance_for
+
+        text = kanban_guidance_for(False)
+        assert "Do not shell out to `hermes kanban <verb>`" not in text
+
+    def test_unreachable_variant_instructs_the_cli_fallback(self):
+        from agent.prompt_builder import kanban_guidance_for
+
+        text = kanban_guidance_for(False)
+        assert "hermes kanban show" in text
+        assert "hermes kanban complete" in text
+        assert "hermes kanban block" in text
+
+    def test_unreachable_variant_preserves_the_rest_of_the_lifecycle_text(self):
+        # Only the one bullet changes — the orchestrator section, workspace
+        # rules, deliverables, etc. must not drift between the two variants.
+        from agent.prompt_builder import kanban_guidance_for
+
+        reachable = kanban_guidance_for(True)
+        unreachable = kanban_guidance_for(False)
+        assert "## Orchestrator mode" in unreachable
+        assert "## Reference details that change outcomes" in unreachable
+        assert reachable.split("## Do NOT")[0] == unreachable.split("## Do NOT")[0]
+
+
+class TestAgentInitKanbanToolsReachModelConfig:
+    """agent_init reads `agent.kanban_tools_reach_model` before building the
+    kanban guidance text, defaulting to True (unaffected) for every profile
+    that does not set it — t_98e5c12e."""
+
+    def test_default_config_yields_reachable_variant(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE, kanban_guidance_for
+
+        _agent_section = {}
+        tools_reach_model = bool(_agent_section.get("kanban_tools_reach_model", True))
+        assert tools_reach_model is True
+        assert kanban_guidance_for(tools_reach_model) == KANBAN_GUIDANCE
+
+    def test_flag_false_yields_unreachable_variant(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE, kanban_guidance_for
+
+        _agent_section = {"kanban_tools_reach_model": False}
+        tools_reach_model = bool(_agent_section.get("kanban_tools_reach_model", True))
+        assert tools_reach_model is False
+        assert kanban_guidance_for(tools_reach_model) != KANBAN_GUIDANCE
+
 
 # =========================================================================
 # Budget warning history stripping

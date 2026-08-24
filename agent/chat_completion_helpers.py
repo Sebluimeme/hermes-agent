@@ -2403,6 +2403,31 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+def _fallback_entry_allows_reason(
+    fb: dict, reason: "FailoverReason | None",
+) -> bool:
+    """Whether an opt-in fallback entry permits this classified failure.
+
+    ``fallback_on`` is intentionally opt-in: existing fallback chains retain
+    their broad recovery behavior.  A constrained chain must receive a
+    classified provider failure; calls from unclassified empty/format paths do
+    not silently hop to a different account or provider.
+    """
+    allowed = fb.get("fallback_on")
+    if allowed is None:
+        return True
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    if not isinstance(allowed, (list, tuple, set)) or reason is None:
+        return False
+    reason_name = getattr(reason, "value", str(reason)).strip().lower()
+    return reason_name in {
+        str(item).strip().lower()
+        for item in allowed
+        if isinstance(item, str) and item.strip()
+    }
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
@@ -2477,6 +2502,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         return False
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1
+    if not _fallback_entry_allows_reason(fb, reason):
+        logger.info(
+            "Fallback skip: %s/%s does not allow failure reason %s",
+            fb.get("provider"), fb.get("model"),
+            getattr(reason, "value", "unclassified"),
+        )
+        return False
     fb_key = _fallback_entry_key(fb)
     unavailable = getattr(agent, "_unavailable_fallback_keys", None)
     if unavailable is None:
@@ -2824,10 +2856,37 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # success path surfaces exactly once via _emit_pending_fallback_notice
         # (see run_agent.py); it is discarded on terminal failure since the
         # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
+        trace = getattr(agent, "_fallback_trace", None)
+        if not isinstance(trace, list):
+            trace = []
+            agent._fallback_trace = trace
+        trace.append({
+            "from_model": old_model,
+            "from_provider": old_provider,
+            "to_model": fb_model,
+            "to_provider": fb_provider,
+            # Keep the post-switch identity explicit for consumers that must
+            # never present a GPT-backed answer as a Claude answer.
+            "resolved_model": agent.model,
+            "resolved_provider": agent.provider,
+            "reason": getattr(reason, "value", None),
+        })
+
+        transition_notice = str(fb.get("transition_notice") or "").strip()
+        if transition_notice:
+            # An explicit transition is operationally significant (for example
+            # a Claude lane finally handing work to GPT).  Emit it at the
+            # switch, not after the fallback's response, and never add the
+            # generic notice that would duplicate it or expose route details.
+            agent._emit_status(transition_notice)
+            agent._pending_fallback_notice = None
+        elif fb.get("suppress_fallback_notice"):
+            agent._pending_fallback_notice = None
+        else:
+            agent._pending_fallback_notice = (
+                f"🔄 Switched to fallback model: {old_model} via {old_provider} "
+                f"→ {fb_model} via {fb_provider}"
+            )
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,

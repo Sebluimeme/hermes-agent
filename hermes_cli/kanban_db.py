@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import hashlib
 import json
 import os
@@ -87,10 +88,12 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
+from zoneinfo import ZoneInfo
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from agent.redact import redact_sensitive_text
 
 _log = logging.getLogger(__name__)
 
@@ -1141,6 +1144,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Persistent routing hint set ONLY by the caller at creation (t_8e9eedfa,
+    # LOT 1). One of ``simple``/``complex``; a worker never modifies its own
+    # card's tier. Drives ``resolve_ordered_route`` for auto-routed (no
+    # explicit assignee) tasks. Missing/invalid values normalize to
+    # ``complex`` (fail-safe) via ``normalize_routing_tier`` — never trust an
+    # unnormalized raw value from this field directly.
+    routing_tier: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1244,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            routing_tier=(
+                row["routing_tier"] if "routing_tier" in keys and row["routing_tier"] else None
             ),
         )
 
@@ -1437,6 +1450,19 @@ CREATE TABLE IF NOT EXISTS task_comments (
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
     created_at INTEGER NOT NULL
+);
+
+-- Task-scoped, durable operator grants for one protected instruction-file
+-- target. This is deliberately separate from comments: comments are untrusted
+-- worker content, while a grant is written only by an operator control surface
+-- and is consumed only by the worker for this exact task/path pair.
+CREATE TABLE IF NOT EXISTS task_instruction_edit_authorizations (
+    task_id      TEXT NOT NULL,
+    target_path  TEXT NOT NULL,
+    granted_by   TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    PRIMARY KEY (task_id, target_path)
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -2679,6 +2705,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "routing_tier" not in cols:
+        # Persistent routing hint (t_8e9eedfa LOT 1): 'simple' or 'complex',
+        # set only by the caller at creation. NULL on existing rows —
+        # normalize_routing_tier() treats NULL as 'complex' (fail-safe), so
+        # no backfill is needed and pre-existing tasks keep the more capable
+        # route rather than silently downgrading to the cheap one.
+        _add_column_if_missing(conn, "tasks", "routing_tier", "routing_tier TEXT")
+
+    # Never backfill historical PIDs: without a captured process start
+    # identity, a PID is not sufficient authority to stop a process safely.
+    from hermes_cli import worker_contracts as _worker_contracts
+    _worker_contracts.ensure_schema(conn)
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3183,6 +3222,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    routing_tier: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3222,10 +3262,28 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``routing_tier`` (t_8e9eedfa LOT 1) is a creation-time-only routing hint
+    -- ``simple`` or ``complex`` -- consumed by ``resolve_ordered_route`` when
+    an auto-routed (no explicit ``assignee``) task is dispatched. There is
+    deliberately no ``set_routing_tier``/update path: only the caller that
+    creates the card may choose its tier; a worker running that card never
+    changes it. An invalid or omitted value is stored as-is (NULL) and reads
+    back as ``complex`` via ``normalize_routing_tier`` -- fail-safe, never a
+    silent downgrade to the cheaper route.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    routing_tier = (routing_tier or "").strip().lower() or None
+    if routing_tier is not None and routing_tier not in VALID_ROUTING_TIERS:
+        raise ValueError(f"routing_tier must be one of {sorted(VALID_ROUTING_TIERS)}, got {routing_tier!r}")
+    audit_text = f"{title or ''}\n{body or ''}".casefold()
+    if goal_mode and ("audit" in audit_text or "read-only" in audit_text or "lecture seule" in audit_text):
+        raise ValueError(
+            "goal_mode is unavailable for short/read-only audits; create a normal task "
+            "so no auxiliary goal judge is launched"
+        )
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3497,8 +3555,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, routing_tier
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3582,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        routing_tier,
                     ),
                 )
                 for pid in parents:
@@ -3552,6 +3611,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "routing_tier": routing_tier,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4001,6 +4061,101 @@ def add_comment(
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
+
+
+def _canonical_instruction_edit_target(target_path: str) -> str:
+    """Return a stable absolute target for an instruction-edit grant.
+
+    Relative targets are rejected rather than resolved against a process cwd:
+    authorization must name one reviewable file, not whatever a later worker's
+    cwd happens to make it mean.
+    """
+    raw = os.path.expanduser(str(target_path or "").strip())
+    if not raw or not os.path.isabs(raw):
+        raise ValueError("instruction edit authorization requires an absolute target path")
+    return os.path.realpath(raw)
+
+
+def authorize_instruction_edit(
+    conn: sqlite3.Connection,
+    task_id: str,
+    target_path: str,
+    *,
+    granted_by: str,
+    reason: str,
+) -> bool:
+    """Persist an explicit operator grant for one task and one instruction file.
+
+    The grant is task-scoped (never a global allowlist), target-scoped, durable,
+    and audited. It intentionally cannot be inferred from a task body/comment:
+    those fields are worker-controlled content.
+    """
+    target = _canonical_instruction_edit_target(target_path)
+    actor = str(granted_by or "").strip()
+    note = str(reason or "").strip()
+    if not actor:
+        raise ValueError("instruction edit authorization requires an operator identity")
+    if not note:
+        raise ValueError("instruction edit authorization requires an explicit reason")
+    now = int(time.time())
+    with write_txn(conn, allow_nested=True):
+        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        conn.execute(
+            "INSERT OR REPLACE INTO task_instruction_edit_authorizations "
+            "(task_id, target_path, granted_by, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+            (task_id, target, actor, note, now),
+        )
+        # Keep the explicit grant visible in the card's human-facing thread,
+        # but never use comments as the trust source: worker comments are data.
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                actor,
+                f"INSTRUCTION EDIT AUTHORIZED: {target}. {note}",
+                now,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "instruction_edit_authorized",
+            {"target_path": target, "granted_by": actor, "reason": note},
+        )
+    return True
+
+
+def has_instruction_edit_authorization(
+    conn: sqlite3.Connection, task_id: str, target_path: str
+) -> bool:
+    """Return whether this exact task has a durable grant for this exact path."""
+    try:
+        target = _canonical_instruction_edit_target(target_path)
+    except ValueError:
+        return False
+    return bool(conn.execute(
+        "SELECT 1 FROM task_instruction_edit_authorizations "
+        "WHERE task_id = ? AND target_path = ?",
+        (task_id, target),
+    ).fetchone())
+
+
+def task_has_instruction_edit_authorization(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Return whether this task has any durable instruction-edit grant.
+
+    This is intentionally broader than :func:`has_instruction_edit_authorization`:
+    callers use it only for incident classification/recovery after a worker has
+    already blocked. The write guard itself remains exact-path and task-scoped.
+    """
+    return bool(conn.execute(
+        "SELECT 1 FROM task_instruction_edit_authorizations "
+        "WHERE task_id = ? LIMIT 1",
+        (task_id,),
+    ).fetchone())
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -5528,6 +5683,20 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        try:
+            from hermes_cli.closure_evidence import classify_closure_evidence
+
+            closure_evidence = classify_closure_evidence(
+                prior_status=prior_status,
+                metadata=metadata if isinstance(metadata, dict) else None,
+            )
+            if closure_evidence.satisfied:
+                completed_payload["evidence"] = {
+                    "kind": closure_evidence.kind,
+                    "detail": closure_evidence.detail,
+                }
+        except Exception:
+            pass
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -6250,6 +6419,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6328,6 +6498,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6386,6 +6557,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6440,6 +6612,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                metadata=metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -6944,6 +7117,58 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 if new_status != "ready" or resume_status != "ready"
                 else None
             ),
+        )
+        return True
+
+
+def recover_triage_after_instruction_authorization(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """Recover a loop-escalated triage task after a durable operator grant.
+
+    This is intentionally narrower than a general ``triage -> ready`` escape
+    hatch: the task must hold at least one task-scoped instruction-edit grant.
+    The reset is auditable and clears the recurrence breaker because the human
+    has supplied the missing authorization that caused the repeated block.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "triage":
+            return False
+        grant = conn.execute(
+            "SELECT target_path, granted_by FROM task_instruction_edit_authorizations "
+            "WHERE task_id = ? ORDER BY created_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if grant is None:
+            return False
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("triage",), now=now,
+            note="instruction-edit authorization recovery",
+        )
+        new_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND status = 'triage'",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "instruction_edit_authorized_recovery",
+            {
+                "status": new_status,
+                "target_path": grant["target_path"],
+                "granted_by": grant["granted_by"],
+            },
         )
         return True
 
@@ -8003,6 +8228,333 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Claude capacity is external evidence.  A missing, unobserved or expired
+# measurement must never be treated as permission to dispatch.
+QUOTA_ROUTING_STATE_PATH = "state/ai-quota-routing.json"
+
+
+# --- Routing tiers (t_8e9eedfa LOT 1) ----------------------------------
+# Persistent per-card routing hint, set only at creation (see
+# create_task's `routing_tier` docstring). Drives the ordered fallback in
+# `resolve_ordered_route` for auto-routed (no explicit assignee) tasks.
+ROUTING_TIER_SIMPLE = "simple"
+ROUTING_TIER_COMPLEX = "complex"
+VALID_ROUTING_TIERS = {ROUTING_TIER_SIMPLE, ROUTING_TIER_COMPLEX}
+# Fail-safe default: an unknown/missing tier always resolves to the more
+# capable route, never the cheaper one.
+DEFAULT_ROUTING_TIER = ROUTING_TIER_COMPLEX
+
+# Spark is a distinct bounded-work profile. Coder is the third durable
+# executor, resolving gpt-5.5 through openai-codex. `default` remains the
+# conversational orchestrator and must never be auto-selected as a writer.
+SPARK_MODEL_OVERRIDE = "gpt-5.3-codex-spark"
+CODER_MODEL_OVERRIDE = None
+
+
+def normalize_routing_tier(value: Optional[str]) -> str:
+    """Normalize a stored/requested routing_tier, fail-safe defaulting to
+    ``complex``. Any value other than the two known tiers -- missing,
+    blank, a typo, or a legacy row that predates this column -- resolves to
+    ``complex``: the more capable route is the fail-safe, never the
+    cheaper one."""
+    normalized = (value or "").strip().lower()
+    return normalized if normalized in VALID_ROUTING_TIERS else DEFAULT_ROUTING_TIER
+
+
+def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool, str]:
+    """Free, local, uniform preflight for one real dispatch route.
+
+    Never makes a network call and never spends a paid model turn -- the
+    paid OAuth canary in ``claude2_oauth_dispatch_guard`` is a separate,
+    transition-gated mechanism (see t_b0bc4445 / LOT 2), deliberately not
+    reused here. Every branch below reads only local, already-cached
+    evidence:
+
+    * ``claude1`` / ``claude2`` -- the same cached quota-routing snapshot
+      ``quota_dispatch_guard`` reads (``state/ai-quota-routing.json``,
+      refreshed for free by ``quota_preflight.py``). Not green unless the
+      cache holds a fresh ``dispatch_allowed`` record.
+    * ``spark`` / ``coder`` -- the OpenAI Codex lanes. They fail OPEN
+      (ok=True) unless a
+      local cache explicitly records it as cooling down, so "no live GPT
+      quota measurement wired up yet" can never strand every route when
+      both Claude lanes are genuinely down. A local launcher/spawn error
+      is NEVER a signal this function consumes (decision (d)): that kind
+      of failure is handled entirely by the existing respawn-guard /
+      consecutive-failures machinery, never by this preflight.
+    """
+    if route in ("claude1", "claude2"):
+        reason = quota_dispatch_guard(route, now=now)
+        return (reason is None, reason or "fresh_available")
+    if route in {"spark", "coder"}:
+        path = Path(
+            os.environ.get("HERMES_KANBAN_QUOTA_ROUTING_PATH", "").strip()
+            or str(kanban_home() / QUOTA_ROUTING_STATE_PATH)
+        )
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            record = (payload.get("agent_cooldowns") or {}).get(route)
+        except (OSError, json.JSONDecodeError, AttributeError):
+            record = None
+        if isinstance(record, dict) and record.get("dispatch_allowed") is False:
+            raw_deadline = record.get("cooldown_until")
+            if isinstance(raw_deadline, str):
+                try:
+                    deadline = __import__("datetime").datetime.fromisoformat(
+                        raw_deadline.replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    deadline = None
+                if deadline is not None:
+                    if (time.time() if now is None else now) < deadline:
+                        return (False, record.get("reason") or "provider_cooldown")
+                    return (True, "cooldown_expired")
+            return (False, record.get("reason") or "provider_cooldown")
+        return (True, "fail_open_last_resort")
+    return (False, f"unknown_route:{route}")
+
+
+def resolve_ordered_route(
+    routing_tier: Optional[str],
+    *,
+    preflight_fn: Callable[[str], "tuple[bool, str]"] = route_preflight_ok,
+) -> "tuple[str, Optional[str], list[dict]]":
+    """Pick the actual ``(assignee, model_override)`` for an auto-routed task.
+
+    Bounded ``simple`` cards are explicitly allowed to use Spark first, then
+    Claude 2, Claude 1, and Coder last. ``complex`` (including an absent or invalid
+    tier) never uses Spark: it keeps the capable Claude 2 -> Claude 1 -> Coder
+    order. This makes the low-risk optimisation opt-in and fail-safe: no
+    ambiguous/legacy card can silently be downgraded to Spark.
+
+    The walk stops at the first green route; both Codex variants fail open
+    unless the local cooldown cache explicitly blocks them (see
+    ``route_preflight_ok``), so this function always returns a route -- it
+    never leaves a task unrouted.
+
+    Returns ``(assignee, model_override, trace)``. ``trace`` records every
+    attempt as ``{"route", "model_override", "ok", "reason"}`` for
+    observability and tests; it is descriptive only, never part of the
+    decision itself.
+    """
+    tier = normalize_routing_tier(routing_tier)
+    if tier == ROUTING_TIER_SIMPLE:
+        chain: list[tuple[str, str, Optional[str]]] = [
+            ("spark", "spark", SPARK_MODEL_OVERRIDE),
+            ("claude2", "claude2", None),
+            ("claude1", "claude1", None),
+            ("coder", "coder", CODER_MODEL_OVERRIDE),
+        ]
+    else:
+        chain = [
+            ("claude2", "claude2", None),
+            ("claude1", "claude1", None),
+            ("coder", "coder", CODER_MODEL_OVERRIDE),
+        ]
+    trace: list[dict] = []
+    for route, chain_assignee, chain_model in chain:
+        ok, reason = preflight_fn(route)
+        trace.append({
+            "route": route,
+            "assignee": chain_assignee,
+            "model_override": chain_model,
+            "ok": ok,
+            "reason": reason,
+        })
+        if ok:
+            return chain_assignee, chain_model, trace
+    # Unreachable in practice -- Coder fails open above -- but kept
+    # as an explicit, honest terminal state instead of an implicit default.
+    _, last_assignee, last_model = chain[-1]
+    return last_assignee, last_model, trace
+
+
+def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None) -> Optional[str]:
+    """Fail closed for Claude until a fresh quota preflight explicitly allows it."""
+    if assignee not in {"claude1", "claude2"}:
+        return None
+    path = Path(os.environ.get("HERMES_KANBAN_QUOTA_ROUTING_PATH", "").strip() or (kanban_home() / QUOTA_ROUTING_STATE_PATH))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        record = (payload.get("agent_cooldowns") or {}).get(assignee)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return "quota_measurement_unknown"
+    if not isinstance(record, dict):
+        return "quota_measurement_unknown"
+    if record.get("dispatch_allowed") is True and record.get("preflight_required") is False:
+        return None
+    raw_deadline = record.get("cooldown_until")
+    if isinstance(raw_deadline, str):
+        try:
+            deadline = __import__("datetime").datetime.fromisoformat(raw_deadline.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return "quota_measurement_unknown"
+        if (time.time() if now is None else now) < deadline:
+            return "provider_cooldown"
+    # Reaching the deadline is not an implicit retry: quota_preflight must
+    # publish a fresh successful read before this profile can be used.
+    return "quota_preflight_required"
+
+
+# --- Paid OAuth canary, gated to transitions only (t_b0bc4445 LOT 2) ------
+# Per-route persisted fingerprint so the paid `claude -p ... PONG` canary in
+# `claude2_oauth_dispatch_guard` only runs on an actual transition, never
+# before every normal dispatch tick. State lives outside the tasks table
+# (it isn't per-card, it's per-route) at CLAUDE2_OAUTH_TRANSITION_STATE_PATH,
+# override-able for tests via HERMES_KANBAN_OAUTH_TRANSITION_PATH -- same
+# pattern as QUOTA_ROUTING_STATE_PATH / HERMES_KANBAN_QUOTA_ROUTING_PATH.
+CLAUDE2_OAUTH_TRANSITION_STATE_PATH = "state/claude2-oauth-transition.json"
+
+
+def _oauth_transition_state_path() -> Path:
+    return Path(
+        os.environ.get("HERMES_KANBAN_OAUTH_TRANSITION_PATH", "").strip()
+        or str(kanban_home() / CLAUDE2_OAUTH_TRANSITION_STATE_PATH)
+    )
+
+
+def load_oauth_transition_state(route: str) -> Optional[dict]:
+    """Read the persisted transition fingerprint for ``route``, or ``None``.
+
+    ``None`` covers both "file missing/unreadable" and "route never
+    recorded" -- both mean decision (a) below (route newly activated).
+    """
+    try:
+        payload = json.loads(_oauth_transition_state_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    record = (payload or {}).get(route)
+    return record if isinstance(record, dict) else None
+
+
+def persist_oauth_transition_state(route: str, record: dict) -> None:
+    """Persist the transition fingerprint for ``route`` after a real canary ran.
+
+    This IS the "proof of result" the task requires: every time the paid
+    canary actually executes, its outcome (ok/error, reason, when) and the
+    fingerprint it was checked against are durably recorded, not just held
+    in memory for one dispatch tick.
+    """
+    path = _oauth_transition_state_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if not isinstance(payload, dict):
+            payload = {}
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    payload[route] = record
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def oauth_canary_transition_required(
+    route: str,
+    *,
+    model_override: Optional[str],
+    provider_override: Optional[str],
+    credentials_mtime: Optional[float],
+    stored: Optional[dict],
+    task_failure_error: Optional[str] = None,
+) -> "tuple[bool, str]":
+    """Decide whether ``route`` needs a fresh paid canary right now.
+
+    Fixed set of transitions (decision fixed by Sébastien, t_b0bc4445 LOT 2)
+    -- a canary runs ONLY when one of these is true, never on a plain
+    steady-state dispatch:
+
+    (a) route newly activated -- no persisted fingerprint yet;
+    (b) OAuth reconnected -- the credentials file's mtime moved since the
+        last recorded check (content is never read, only its mtime);
+    (c) previous provider error -- either the last recorded canary for this
+        route did not come back ``ok``, or THIS task's own last recorded
+        failure looks like a quota/auth blocker (``_RESPAWN_BLOCKER_RE``);
+    (d) model/provider changed -- the resolved model_override/
+        provider_override differ from what was last checked.
+
+    Returns ``(required, trigger)`` -- ``trigger`` is descriptive only
+    (persisted for observability), never part of the decision itself.
+    """
+    if stored is None:
+        return True, "route_newly_activated"
+    if stored.get("last_status") != "ok":
+        return True, "previous_provider_error"
+    if task_failure_error and _RESPAWN_BLOCKER_RE.search(task_failure_error):
+        return True, "previous_provider_error"
+    if credentials_mtime != stored.get("credentials_mtime"):
+        return True, "oauth_reconnected"
+    if (
+        stored.get("model_override") != model_override
+        or stored.get("provider_override") != provider_override
+    ):
+        return True, "model_or_provider_changed"
+    return False, "steady_state"
+
+
+def claude2_oauth_dispatch_guard(conn: sqlite3.Connection, task_id: str, assignee: Optional[str]) -> bool:
+    """Block a Claude 2 card before spawning when its isolated OAuth is unusable.
+
+    The native Hermes profile reaches Claude through a local proxy, but that
+    proxy's real credential source is ``/home/seb/.claude2``.  Probe that exact
+    store first so a known expired OAuth cannot create a worker that exits
+    silently.  The probe never returns provider output to the card.
+
+    The probe itself spends a real paid Claude 2 turn, so it is gated to
+    actual transitions only (t_b0bc4445 LOT 2) via
+    ``oauth_canary_transition_required`` -- see that function's docstring
+    for the fixed list of triggers. On a steady-state dispatch (same route,
+    same model/provider, no OAuth change, last check was ok) this function
+    returns immediately without spending anything.
+    """
+    if assignee != "claude2":
+        return False
+    from hermes_cli.claude_oauth_preflight import (
+        credentials_fingerprint,
+        dispatch_block_reason,
+        probe_claude2_oauth,
+    )
+
+    task = get_task(conn, task_id)
+    model_override = task.model_override if task is not None else None
+    provider_override = task.provider_override if task is not None else None
+    task_failure_error = task.last_failure_error if task is not None else None
+    credentials_mtime = credentials_fingerprint()
+    stored = load_oauth_transition_state(assignee)
+    required, trigger = oauth_canary_transition_required(
+        assignee,
+        model_override=model_override,
+        provider_override=provider_override,
+        credentials_mtime=credentials_mtime,
+        stored=stored,
+        task_failure_error=task_failure_error,
+    )
+    if not required:
+        return False
+
+    probe = probe_claude2_oauth()
+    persist_oauth_transition_state(assignee, {
+        "credentials_mtime": credentials_mtime,
+        "model_override": model_override,
+        "provider_override": provider_override,
+        "last_status": "ok" if probe.ok else "error",
+        "last_checked": time.time(),
+        "last_trigger": trigger,
+        "last_reason": probe.reason,
+    })
+    if probe.ok:
+        return False
+    # Failure blocks the card (existing mechanism) instead of looping: a
+    # blocked task is not re-picked by the ready/review loops until a human
+    # retries it, so the paid canary cannot fire on every tick while OAuth
+    # stays broken -- it fires once per transition, persists "error", and
+    # the card sits blocked until someone acts.
+    block_task(
+        conn,
+        task_id,
+        reason=dispatch_block_reason(probe),
+        kind="capability",
+    )
+    return True
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -8053,6 +8605,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    oauth_blocked: list[str] = field(default_factory=list)
+    """Claude 2 tasks blocked before spawn because the isolated OAuth failed."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -8118,6 +8672,22 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
         ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
         for _pid, _ in ordered[: len(ordered) // 2]:
             _recent_worker_exits.pop(_pid, None)
+
+
+def classify_worker_incident(
+    error_text: str, *, protocol_violation: bool = False, rate_limited: bool = False
+) -> str:
+    """Return a bounded, secret-free incident category for Kanban history."""
+    text = (error_text or "").casefold()
+    if rate_limited or any(token in text for token in ("quota", "rate limit", "429", "provider")):
+        return "provider_limit"
+    if "approval" in text and any(token in text for token in ("timeout", "expired", "timed out")):
+        return "approval_expired"
+    if any(token in text for token in ("security", "guard", "blocked")):
+        return "security_guard"
+    if protocol_violation or "protocol violation" in text or "block loop" in text:
+        return "workflow_bug"
+    return "normal_failure"
 
 
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
@@ -8369,6 +8939,51 @@ def _defer_reclaim_for_live_worker(
         _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
+# Broad internal-vocabulary heuristic: rejects a whole string outright rather
+# than trying to surgically strip a token, because a Kanban/PID/command
+# reference in a worker's own words is almost always administrative detail
+# that must never reach a human-facing surface (Telegram board, `hermes
+# kanban show`). ``\bkanban\b`` deliberately does NOT match inside
+# ``kanban_board_sync.py`` (underscore keeps it one word for \b purposes) --
+# a file path mentioning the subsystem by name is legitimate activity detail.
+# Mirrors kanban_board_sync.py's read-time ``clean_checkpoint_note`` filter;
+# duplicated (not imported) because that script is a standalone file loaded
+# outside the hermes_cli package -- see agent-live-activity-contract.md §5.
+_ACTIVITY_BANNED_VOCAB_RE = re.compile(
+    r"\b(?:kanban|gate|pid|token|commande)\b|\bt_[0-9a-f]+\b", re.IGNORECASE,
+)
+
+
+def sanitize_activity_text(text: Optional[str], *, max_len: int = 120) -> Optional[str]:
+    """Redact + reject free text before it reaches ``task_events.payload``.
+
+    Applied at write time to both ``activity`` and ``heartbeat`` payloads
+    (agent-live-activity-contract.md §5): filtering only at render time
+    (kanban_board_sync.py) left the raw string in the DB, readable by
+    ``hermes kanban show`` / the dashboard / direct DB access.
+
+    Two-stage:
+    1. ``redact_sensitive_text(force=True)`` masks generic secret patterns
+       (API keys, JWTs, connstrings, auth headers) wherever they occur.
+    2. ``_ACTIVITY_BANNED_VOCAB_RE`` rejects the whole string outright when
+       it carries internal-only vocabulary -- there is no safe partial
+       redaction of "which Kanban task/PID this is", so drop it entirely
+       rather than leak an administrative trace.
+
+    Returns ``None`` for empty/whitespace-only input or an outright
+    rejection; otherwise the cleaned, length-capped text.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    collapsed = " ".join(text.split()).strip(" -–—")
+    if not collapsed:
+        return None
+    masked = redact_sensitive_text(collapsed, force=True)
+    if not masked or _ACTIVITY_BANNED_VOCAB_RE.search(masked):
+        return None
+    return masked[:max_len].rstrip() or None
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8383,10 +8998,16 @@ def heartbeat_worker(
     video encode, web crawl) can have its Python still alive while the
     actual work process is stuck; periodic heartbeats catch that.
 
+    ``note`` is sanitized via :func:`sanitize_activity_text` before it is
+    ever written -- a secret or internal identifier in a free-text
+    heartbeat note must never land in the DB, not just be hidden by the
+    Telegram board's render-time filter (agent-live-activity-contract.md §5).
+
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
+    clean_note = sanitize_activity_text(note) if note else None
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -8414,10 +9035,74 @@ def heartbeat_worker(
             )
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            {"note": clean_note} if clean_note else None,
             run_id=run_id,
         )
     return True
+
+
+# Closed action vocabulary for ``activity`` events -- a short, stable label
+# describing *what kind* of tool call just completed, never the raw argument.
+# Any tool name that doesn't map to one of these collapses to "other" rather
+# than leaking an unbounded tool_name string onto the board.
+ACTIVITY_ACTIONS = frozenset({
+    "read_file", "edit_file", "write_file", "patch", "bash", "web_search",
+    "web_fetch", "test_run", "git", "search", "browser", "delegate",
+    "skill", "memory", "vision", "image_gen", "cron", "other",
+})
+
+
+def append_activity_event(
+    *,
+    action: str,
+    target: str = "",
+    task_id: Optional[str] = None,
+    board: Optional[str] = None,
+) -> None:
+    """Record one ``activity`` event: best-effort, zero-cost outside Kanban.
+
+    Guarded by ``HERMES_KANBAN_TASK`` (or an explicit ``task_id``): a strict
+    no-op -- no import beyond this call frame, no DB open, no row written --
+    for any interactive/non-worker session. The CLI's tool-completion
+    renderer (``agent/display.py::_get_cute_tool_message``) calls this
+    unconditionally after building its "┊ <tool> ... Ns" line; the env-var
+    check below is the entire cost of every non-Kanban call.
+
+    ``target`` is sanitized via :func:`sanitize_activity_text` (secret
+    masking + internal-vocabulary rejection) and capped at 80 chars before
+    it is written. Exceptions are swallowed: a DB/disk glitch here must
+    never interrupt the caller's real work -- same best-effort contract as
+    :func:`heartbeat_worker`.
+    """
+    tid = task_id or os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return
+    try:
+        safe_action = str(action or "other").strip().lower()[:32]
+        if safe_action not in ACTIVITY_ACTIONS:
+            safe_action = "other"
+        safe_target = sanitize_activity_text(target, max_len=80)
+        conn = connect(board=board)
+        try:
+            run_id: Optional[int] = None
+            raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+            if raw_run_id:
+                try:
+                    run_id = int(raw_run_id)
+                except ValueError:
+                    run_id = None
+            if run_id is None:
+                run_id = _current_run_id(conn, tid)
+            with write_txn(conn):
+                _append_event(
+                    conn, tid, "activity",
+                    {"action": safe_action, "target": safe_target},
+                    run_id=run_id,
+                )
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
 
 def enforce_max_runtime(
@@ -8849,6 +9534,314 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+# --- fallback_simple_route's chain tables (t_e95f706b) ---------------------
+# Logical role -> real profile names. Each route resolves dynamically so an
+# absent profile blocks visibly instead of creating a permanently ready card.
+_ROUTE_ROLE_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "spark": ("spark",),
+    "claude2": ("claude2",),
+    "claude1": ("claude1",),
+    "coder": ("coder",),
+}
+_ROUTE_ROLE_LABEL = {"spark": "Spark", "claude2": "Claude 2", "claude1": "Claude 1", "coder": "Coder"}
+
+# Ordered fallback chain per normalized routing tier. 'simple' bounded work is
+# explicitly allowed to try Spark first; every other tier -- including an
+# absent/invalid one, which ``normalize_routing_tier`` fail-safes to
+# 'complex' -- never uses Spark and starts at Claude 2. Both chains end at
+# Coder (gpt-5.5/openai-codex), never default: Claude 2 -> Claude 1 -> Coder.
+_ROUTE_CHAIN_BY_TIER: dict[str, tuple[str, ...]] = {
+    ROUTING_TIER_SIMPLE: ("spark", "claude2", "claude1", "coder"),
+    ROUTING_TIER_COMPLEX: ("claude2", "claude1", "coder"),
+}
+
+
+def _route_role_for_assignment(
+    assignee: Optional[str], model_override: Optional[str]
+) -> Optional[str]:
+    """Identify which chain role an (assignee, model_override) pair currently
+    occupies a current profile name."""
+    if assignee == "spark":
+        return "spark"
+    if assignee == "claude2":
+        return "claude2"
+    if assignee == "claude1":
+        return "claude1"
+    if assignee == "coder":
+        return "coder"
+    return None
+
+
+def _resolve_route_profile(role: str) -> Optional["tuple[str, Optional[str]]"]:
+    """Resolve a logical chain role to a real, currently-existing profile.
+
+    Returns ``(assignee, model_override)`` for the first candidate in
+    ``_ROUTE_ROLE_CANDIDATES[role]`` that ``profile_exists()`` confirms is
+    real. Returns ``None`` when every candidate has been renamed/removed --
+    the caller must treat that as a broken chain (block explicitly), never
+    dispatch to a dead profile name (t_47dc2bf0 defect #1).
+    """
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+    for name in _ROUTE_ROLE_CANDIDATES.get(role, ()):
+        if profile_exists is not None and not profile_exists(name):
+            continue
+        model = None
+        if role == "spark":
+            model = SPARK_MODEL_OVERRIDE
+        return name, model
+    return None
+
+
+_PROVIDER_STATUS_RE = re.compile(r"\b(?:http\s*(?:status)?|status(?:_code)?)[\s:=]+(\d{3})\b", re.I)
+_PROVIDER_CODE_RE = re.compile(r"[\"']?(?:error_)?(?:code|type)[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9_.-]+)", re.I)
+_RETRY_AFTER_RE = re.compile(r"\bretry[-_ ]after\s*[:=]\s*(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec(?:onds?)?)?\b", re.I)
+_MINUTES_RE = re.compile(r"\b(?:retry|reset|wait|available)[^\n]{0,60}?\b(?:in\s+)?(\d+(?:\.\d+)?)\s+minutes?\b", re.I)
+_RESET_AT_RE = re.compile(r"\breset_at\s*[:=]\s*[\"']?([^\s,\"'}]+)", re.I)
+_PROVIDER_SECRET_RE = re.compile(
+    r"\b(?:api[_-]?key|token|authorization|bearer|secret)\b\s*[:=]\s*[\"']?[^\s,\"'}]+",
+    re.I,
+)
+
+
+def _safe_provider_error_detail(error: str) -> str:
+    """Keep routing diagnostics useful without persisting provider secrets."""
+    return _PROVIDER_SECRET_RE.sub("[redacted]", redact_sensitive_text(error))[:500]
+
+
+def _parse_explicit_reset_at(text: str) -> Optional[dt.datetime]:
+    """Return an API-supplied ISO reset timestamp, never a guessed one."""
+    match = _RESET_AT_RE.search(text)
+    if not match:
+        return None
+    try:
+        value = match.group(1).replace("Z", "+00:00")
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _latest_spawn_resolution(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[str], Optional[str]]:
+    """Read the model/provider resolved for the failed attempt, not its relay."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'spawned' "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        model = payload.get("model_resolved")
+        provider = payload.get("provider_resolved")
+        return (str(model) if model else None, str(provider) if provider else None)
+    return None, None
+
+
+def capture_claude_provider_reset(
+    conn: sqlite3.Connection, task_id: str, error: str, *, received_at: Optional[float] = None
+) -> Optional[dict[str, Any]]:
+    """Persist a secret-free provider failure observation before a Claude relay.
+
+    Only explicit provider reset evidence is converted to ``reset_at``.  A
+    duration is anchored to the wall-clock receipt time; quota gauges and
+    unstructured error text can never manufacture a return estimate.
+    """
+    task = conn.execute(
+        "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task is None:
+        return None
+    role = _route_role_for_assignment(task["assignee"], task["model_override"])
+    if role not in ("claude2", "claude1"):
+        return None
+    received = float(time.time() if received_at is None else received_at)
+    received_dt = dt.datetime.fromtimestamp(received, tz=dt.timezone.utc)
+    status_match = _PROVIDER_STATUS_RE.search(error)
+    code_match = _PROVIDER_CODE_RE.search(error)
+    model, provider = _latest_spawn_resolution(conn, task_id)
+    payload: dict[str, Any] = {
+        "claude_role": role,
+        "http_status": int(status_match.group(1)) if status_match else None,
+        "error_code": code_match.group(1)[:80] if code_match else None,
+        "model_resolved": model,
+        "provider_resolved": provider,
+        "received_at": received_dt.isoformat(),
+        "reset_at": None,
+        "reset_source": None,
+    }
+    explicit_reset = _parse_explicit_reset_at(error)
+    if explicit_reset is not None:
+        payload["reset_at"] = explicit_reset.isoformat()
+        payload["reset_source"] = "api_reset_at"
+    else:
+        delay_seconds: Optional[float] = None
+        retry = _RETRY_AFTER_RE.search(error)
+        if retry:
+            delay_seconds = float(retry.group(1))
+            if retry.group(2) and retry.group(2).lower().startswith("m"):
+                delay_seconds /= 1000
+        else:
+            minutes = _MINUTES_RE.search(error)
+            if minutes:
+                delay_seconds = float(minutes.group(1)) * 60
+        if delay_seconds is not None and delay_seconds >= 0:
+            payload["reset_at"] = (received_dt + dt.timedelta(seconds=delay_seconds)).isoformat()
+            payload["reset_source"] = "api_retry_after"
+    _append_event(conn, task_id, "claude_provider_reset", payload)
+    return payload
+
+
+def _relay_to_coder_message(conn: sqlite3.Connection, task_id: str) -> str:
+    """Build the sole Coder relay message from API evidence recorded for this task."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claude_provider_reset' "
+        "ORDER BY id ASC", (task_id,),
+    ).fetchall()
+    estimates: dict[str, str] = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+            if payload.get("reset_source") not in {"api_reset_at", "api_retry_after"}:
+                continue
+            role, reset_at = payload.get("claude_role"), payload.get("reset_at")
+            if role not in ("claude2", "claude1") or not isinstance(reset_at, str):
+                continue
+            parsed = dt.datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                continue
+            estimates[role] = parsed.astimezone(ZoneInfo("Europe/Paris")).strftime("%H:%M")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    lines = ["Relais automatique vers Coder."]
+    for role, label in (("claude2", "Claude 2"), ("claude1", "Claude 1")):
+        if role in estimates:
+            lines.append(f"Retour estimé {label} : {estimates[role]}")
+    return "\n".join(lines)
+
+
+def fallback_simple_route(
+    conn: sqlite3.Connection, task_id: str, error: str, *, provider_proven: bool = True,
+) -> bool:
+    """Arm the next real route in a failed card's ordered fallback chain.
+
+    Only proven provider unavailability may advance a card. Local worker,
+    proxy, workspace and protocol failures remain incidents on their existing
+    lane: no silent fallback. A proven card advances through Spark -> Claude 2
+    -> Claude 1 -> Coder for ``simple`` work, or Claude 2 -> Claude 1 ->
+    Coder for ``complex`` work.
+    A card already on the last hop, or whose current assignee doesn't match a
+    recognized chain role (e.g. a hand-assigned control-plane lane), is left
+    untouched: this only ever moves a card ALONG its own chain, never onto
+    one it was never on.
+
+    Each hop's actual profile name is resolved dynamically via
+    ``_resolve_route_profile`` instead of a hardcoded literal, so a future
+    profile rename can't silently strand the chain on a dead name the way
+    the hardcoded ``codex-worker`` entry did after the 2026-08-22 Spark
+    rename (t_47dc2bf0 defect #1). If NO candidate for the next hop resolves,
+    the card is blocked explicitly (``block_kind='capability'``) instead of
+    being left in ``ready`` with an unspawnable assignee -- the same silent
+    symptom as the 2026-08-22 orphan cards (defect #1's consequence, and the
+    general failure mode defect #2's fix must not reintroduce).
+
+    Each newly selected writer gets a fresh retry budget. ``conn`` must
+    already be inside the worker-exit transaction: this function only issues
+    plain ``conn.execute`` calls and never opens its own transaction (see
+    ``write_txn``'s no-implicit-nesting contract).
+    """
+    if not provider_proven:
+        return False
+    safe_error = _safe_provider_error_detail(error)
+    row = conn.execute(
+        "SELECT assignee, routing_tier, model_override FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    tier = normalize_routing_tier(row["routing_tier"])
+    chain = _ROUTE_CHAIN_BY_TIER.get(tier)
+    if chain is None:
+        return False
+    current_role = _route_role_for_assignment(row["assignee"], row["model_override"])
+    if current_role is None or current_role not in chain:
+        return False
+    # The provider observation must precede every transition to a different
+    # writer, so a final Coder relay can only cite the Claude attempt that failed.
+    capture_claude_provider_reset(conn, task_id, error)
+    idx = chain.index(current_role)
+    if idx + 1 >= len(chain):
+        return False  # already on the last hop (Coder) -- nothing further to try
+    next_role = chain[idx + 1]
+    from_route = _ROUTE_ROLE_LABEL.get(current_role, current_role)
+    to_route = _ROUTE_ROLE_LABEL.get(next_role, next_role)
+    resolved = _resolve_route_profile(next_role)
+    if resolved is None:
+        # Every candidate profile for the next hop is gone. Routing there
+        # anyway would just reproduce the exact silent-ready bug this
+        # function exists to fix -- block explicitly so a human sees it.
+        reason = (
+            f"{from_route} failed and no real profile resolves the next hop "
+            f"({to_route}): {safe_error}"
+        )[:500]
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, block_kind = 'capability', "
+            "last_failure_error = ? WHERE id = ?",
+            (reason, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "route_fallback_broken",
+            {
+                "from_route": from_route,
+                "attempted_to_route": to_route,
+                "from_assignee": row["assignee"],
+                "reason": safe_error,
+            },
+        )
+        return True
+    next_assignee, next_model = resolved
+    conn.execute(
+        "UPDATE tasks SET assignee = ?, model_override = ?, provider_override = NULL, "
+        "consecutive_failures = 0, last_failure_error = ? WHERE id = ?",
+        (next_assignee, next_model,
+         f"{from_route} failed; automatic fallback to {to_route}: {safe_error}"[:500], task_id),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "simple_route_fallback",
+        {
+            "from_route": from_route,
+            "to_route": to_route,
+            "from_assignee": row["assignee"],
+            "to_assignee": next_assignee,
+            "from_model": row["model_override"],
+            "to_model": next_model,
+            "reason": safe_error,
+        },
+    )
+    if next_role == "coder":
+        already_relayed = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'relayed_to_coder' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if already_relayed is None:
+            _append_event(
+                conn, task_id, "relayed_to_coder",
+                {"message": _relay_to_coder_message(conn, task_id)},
+            )
+    return True
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -8885,8 +9878,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, bool]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, simple_route_fallback)
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
@@ -8925,13 +9918,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # surfaced to the retry worker via the prior-attempt error in
                 # ``build_worker_context`` (guidance approach from #61817).
                 protocol_violation = True
+                # State the FACT (clean exit, no terminal call) and the run's
+                # elapsed time; do NOT assert the cause. A clean exit means
+                # "forgot the paperwork" as often as "was cut mid-work" — on
+                # 2026-08-21/23 a ~600 s ceiling silently interrupted every
+                # worker, and this message blamed each one for sloppiness it
+                # was not guilty of. The elapsed time is what lets a reader
+                # tell the two apart: a wall of identical durations across
+                # unrelated tasks is an interruption, not forgetfulness.
+                _elapsed = None
+                if started_at is not None:
+                    try:
+                        _elapsed = max(0, int(time.time() - float(started_at)))
+                    except (TypeError, ValueError):
+                        _elapsed = None
                 error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
+                    "worker exited cleanly (rc=0) after "
+                    f"{_elapsed if _elapsed is not None else '?'}s without "
+                    "calling kanban_complete or kanban_block. Either it "
+                    "finished the work and skipped the terminal call, or it "
+                    "was interrupted mid-work — the elapsed time above tells "
+                    "them apart, and repeated identical durations mean an "
+                    "external interruption, not a worker mistake. Either way "
+                    "the run counts as failed: verify what the prior run "
+                    "actually left behind, then report via kanban_complete."
                 )
                 event_kind = "protocol_violation"
                 event_payload = {
@@ -8977,6 +9987,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            event_payload["incident_category"] = classify_worker_incident(
+                error_text,
+                protocol_violation=protocol_violation,
+                rate_limited=rate_limited_exit,
+            )
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -9036,10 +10051,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                             "WHERE id = ?",
                             (error_text[:500], row["id"]),
                         )
+                    simple_route_fallback = fallback_simple_route(
+                        conn, row["id"], error_text, provider_proven=False,
+                    )
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, simple_route_fallback)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
@@ -9061,10 +10079,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, simple_route_fallback in crash_details:
+            if simple_route_fallback:
+                continue
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, error_text, simple_route_fallback in crash_details:
+            if simple_route_fallback:
+                # The failed attempt is durably recorded above. The next route
+                # is a distinct fallback writer, so do not burn its retry
+                # budget or feed this failure into the systemic-error circuit
+                # breaker.
+                continue
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -9361,7 +10387,61 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        task = conn.execute(
+            "SELECT assignee, model_override, provider_override, workspace_path, "
+            "max_runtime_seconds, max_retries FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        contract_managed = False
+        if run_id is not None and task is not None and task["workspace_path"]:
+            from hermes_cli import worker_contracts as _worker_contracts
+            contract_managed = _worker_contracts.register(
+                conn,
+                task_id=task_id,
+                run_id=int(run_id),
+                profile=str(task["assignee"] or ""),
+                model=task["model_override"],
+                pid=int(pid),
+                workspace_path=str(task["workspace_path"]),
+                max_runtime_seconds=task["max_runtime_seconds"],
+                max_retries=task["max_retries"],
+            )
+        # The model/provider actually resolved for this run, not just the
+        # assigned profile -- e.g. a quota-driven relay pins a task to a
+        # GPT-family model via model_override/provider_override while
+        # `assignee` still reads "claude2". When no override was set, the
+        # spawn argv carries no `-m`/`--provider` at all -- the profile's
+        # OWN configured default model is what actually runs, so fall back
+        # to reading it from the profile's config.yaml
+        # (resolve_profile_default_model) rather than persisting None,
+        # which previously left the board unable to distinguish "default
+        # profile model" from "we don't know" (agent-live-activity-
+        # contract.md §2/§4). Best-effort: a resolution failure must never
+        # block the spawn event.
+        model_resolved = task["model_override"] if task is not None else None
+        provider_resolved = task["provider_override"] if task is not None else None
+        if task is not None and not model_resolved:
+            try:
+                from hermes_cli.profiles import resolve_profile_default_model
+                default_model, default_provider = resolve_profile_default_model(
+                    str(task["assignee"] or "")
+                )
+                model_resolved = default_model
+                provider_resolved = provider_resolved or default_provider
+            except Exception:
+                pass
+        _append_event(
+            conn, task_id, "spawned",
+            {
+                "pid": int(pid),
+                "contract_managed": contract_managed,
+                # None only when resolution itself failed (missing/unreadable
+                # profile config) -- not merely "no override was set".
+                "model_resolved": model_resolved,
+                "provider_resolved": provider_resolved,
+            },
+            run_id=run_id,
+        )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -9887,6 +10967,57 @@ def dispatch_once(
     return result
 
 
+def _block_orphaned_assignee(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+    *,
+    dry_run: bool,
+) -> bool:
+    """Block a ready/review card whose assignee is a profile that used to
+    exist and was renamed away (t_153f78d8).
+
+    ``profile_exists(assignee) is False`` alone is NOT enough to tell a dead
+    profile name apart from an intentional control-plane lane (e.g.
+    ``orion-cc``) that was never a Hermes profile and is meant to sit in
+    ``ready``/``review`` until a human terminal claims it directly — see the
+    comment at the two call sites. So this only fires for names the rename
+    ledger (``hermes_cli.profiles``) can PROVE used to be a real, now-renamed
+    profile; every other non-profile assignee keeps the existing silent
+    "nonspawnable, OK" bucket unchanged.
+
+    Returns True iff the card was (or, in dry-run, would be) blocked —
+    callers append the id to ``result.auto_blocked`` and skip the normal
+    nonspawnable bucket for it either way.
+    """
+    try:
+        from hermes_cli.profiles import resolve_renamed_profile
+    except Exception:
+        return False
+    try:
+        resolved = resolve_renamed_profile(assignee)
+    except Exception:
+        _log.debug(
+            "kanban dispatch: resolve_renamed_profile(%r) failed", assignee, exc_info=True,
+        )
+        return False
+    if not resolved:
+        return False
+    reason = (
+        f"profil inconnu : {assignee} — reassigner la carte "
+        f"(profil renommé en '{resolved}')"
+    )[:500]
+    if not dry_run:
+        # block_task manages its own write_txn (no implicit nesting — see
+        # its docstring) and already appends a 'blocked' event carrying
+        # reason + metadata, so this is a single self-contained call.
+        block_task(
+            conn, task_id, reason=reason, kind="capability",
+            metadata={"assignee": assignee, "resolved_to": resolved},
+        )
+    return True
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -9942,6 +11073,10 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    # Contracts are created only by _set_worker_pid after a dispatcher spawn.
+    # A manual Claude/Desktop session has no contract and cannot be stopped.
+    from hermes_cli import worker_contracts as _worker_contracts
+    _worker_contracts.reconcile(conn)
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -10034,7 +11169,7 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, routing_tier FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10111,6 +11246,23 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # Bounded work: Spark -> Claude 2 -> Claude 1 -> Coder; all other work
+    # retains Claude 2 -> Claude 1 -> Coder routing.
+    # Enabled by default: it only ever engages for tasks with NO explicit
+    # assignee, and it only supersedes a ``kanban.default_assignee`` config
+    # that itself points at one of the four routes this chain already
+    # covers (unset, or spark/claude1/claude2/coder) -- an operator-chosen
+    # default pointing at some other lane (e.g. a control-plane terminal)
+    # is left completely untouched. Off switch: kanban.tiered_routing_enabled.
+    try:
+        from hermes_cli.config import load_config as _load_kanban_cfg
+        _tiered_cfg = (_load_kanban_cfg().get("kanban", {}) or {})
+        _tiered_routing_enabled = bool(_tiered_cfg.get("tiered_routing_enabled", True))
+    except Exception:
+        _tiered_routing_enabled = True
+    _tiered_routing_applies = _tiered_routing_enabled and (
+        _default_assignee is None or _default_assignee in ("spark", "claude1", "claude2", "coder")
+    )
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -10126,7 +11278,42 @@ def _dispatch_once_locked(
             # board state consistent: the task is now legitimately owned
             # by ``kanban.default_assignee``, not "unassigned but secretly
             # routed".
-            if _default_assignee and _default_assignee_resolved:
+            if _tiered_routing_applies:
+                _tier_assignee, _tier_model, _tier_trace = resolve_ordered_route(
+                    row["routing_tier"] if "routing_tier" in row.keys() else None
+                )
+                # Dry-run: show what WOULD happen (auto-assign + spawn) without
+                # mutating the DB. Real run: mutate the row + emit the
+                # 'assigned' event so the board state matches what just happened.
+                if not dry_run:
+                    try:
+                        with write_txn(conn):
+                            conn.execute(
+                                "UPDATE tasks SET assignee = ?, "
+                                "model_override = COALESCE(model_override, ?) "
+                                "WHERE id = ? AND (assignee IS NULL OR assignee = '')",
+                                (_tier_assignee, _tier_model, row["id"]),
+                            )
+                            _append_event(
+                                conn, row["id"], "assigned",
+                                {
+                                    "assignee": _tier_assignee,
+                                    "model_override": _tier_model,
+                                    "source": "routing_tier_chain",
+                                    "trace": _tier_trace,
+                                },
+                            )
+                    except Exception:
+                        _log.debug(
+                            "kanban dispatch: failed to apply routing_tier_chain "
+                            "assignee=%r to task %s",
+                            _tier_assignee, row["id"], exc_info=True,
+                        )
+                        result.skipped_unassigned.append(row["id"])
+                        continue
+                row_assignee = _tier_assignee
+                result.auto_assigned_default.append(row["id"])
+            elif _default_assignee and _default_assignee_resolved:
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.
@@ -10173,6 +11360,14 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
+            # Distinguish a dead (renamed-away) profile name -- which must
+            # never sit silently in `ready` forever (t_153f78d8: the
+            # codex-worker -> spark rename left 13 cards invisible to both
+            # the gateway log and the board) -- from a genuine control-plane
+            # lane, which is meant to sit here until a human claims it.
+            if _block_orphaned_assignee(conn, row["id"], row_assignee, dry_run=dry_run):
+                result.auto_blocked.append(row["id"])
+                continue
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -10180,6 +11375,28 @@ def _dispatch_once_locked(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        quota_reason = quota_dispatch_guard(row_assignee)
+        if quota_reason is not None:
+            result.respawn_guarded.append((row["id"], quota_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(conn, row["id"], "provider_cooldown", {"reason": quota_reason})
+                    # The card's current assignee is not currently usable
+                    # (quota_dispatch_guard refused it) -- advance it one hop
+                    # in its ordered fallback chain instead of deferring on
+                    # this same unusable assignee every tick forever
+                    # (t_47dc2bf0: "aucun autre agent ne prend le relais,
+                    # meme si Claude 1 et Spark sont libres"). No-op for a
+                    # card not on a recognized chain role (e.g. a
+                    # hand-assigned control-plane lane) or already on its
+                    # last hop; the next tick re-evaluates the new assignee
+                    # under this same guard, so a still-dead chain cascades
+                    # one confirmed hop per tick rather than all at once.
+                    fallback_simple_route(conn, row["id"], quota_reason, provider_proven=True)
+            continue
+        if not dry_run and claude2_oauth_dispatch_guard(conn, row["id"], row_assignee):
+            result.oauth_blocked.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -10327,7 +11544,20 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
+            if _block_orphaned_assignee(conn, row["id"], row["assignee"], dry_run=dry_run):
+                result.auto_blocked.append(row["id"])
+                continue
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        quota_reason = quota_dispatch_guard(row["assignee"])
+        if quota_reason is not None:
+            result.respawn_guarded.append((row["id"], quota_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(conn, row["id"], "provider_cooldown", {"reason": quota_reason})
+            continue
+        if not dry_run and claude2_oauth_dispatch_guard(conn, row["id"], row["assignee"]):
+            result.oauth_blocked.append(row["id"])
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -10397,6 +11627,16 @@ def _dispatch_once_locked(
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
+            # A review worker may use a different model than the implementer.
+            # This is an independent verification handoff, never a provider
+            # fallback. Keep an explicit durable event so board renderers do
+            # not infer a fictitious Claude→GPT relay from the reviewer model.
+            with write_txn(conn):
+                _append_event(
+                    conn, claimed.id, "reviewer_handoff",
+                    {"reviewer": claimed.assignee, "source": "review_lane"},
+                    run_id=_current_run_id(conn, claimed.id),
+                )
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
@@ -10683,6 +11923,33 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 _retagged_workspace_roots: set[str] = set()
 
 
+def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optional[str]:
+    """Return the immediately preceding transient worker session, if reusable.
+
+    Deliberate human blocks, crashes, and any intervening run keep the current
+    fresh-worker handoff behavior. Only a just-unblocked ``transient`` block is
+    a safe continuation of the exact worker conversation.
+    """
+    try:
+        with contextlib.closing(connect(board=board)) as conn:
+            task = get_task(conn, task_id)
+            if task is None or task.block_kind != "transient":
+                return None
+            runs = list_runs(conn, task_id)
+            previous = runs[-2] if runs and runs[-1].ended_at is None else (
+                runs[-1] if runs else None
+            )
+            if previous is None or previous.outcome != "blocked":
+                return None
+            if not isinstance(previous.metadata, dict):
+                return None
+            session_id = previous.metadata.get("worker_session_id")
+            return session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+    except Exception as exc:
+        _log.debug("kanban worker: transient session resume lookup skipped (%s)", exc)
+        return None
+
+
 def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     """Reclaim pre-tag worker rows in state.db so they leave the session lists.
 
@@ -10732,7 +11999,13 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    resume_session_id = _transient_resume_session_id(task.id, board=board)
+    prompt = (
+        f"continue kanban task {task.id} from the existing session; first verify "
+        "the current board state and do not repeat already completed reads"
+        if resume_session_id
+        else f"work kanban task {task.id}"
+    )
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -10763,6 +12036,8 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    if resume_session_id:
+        env["HERMES_KANBAN_RESUME_SESSION_ID"] = resume_session_id
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -10848,6 +12123,8 @@ def _default_spawn(
         # profile-local worker sessions still register configured hooks.
         "--accept-hooks",
     ]
+    if resume_session_id:
+        cmd.extend(["--resume", resume_session_id])
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but

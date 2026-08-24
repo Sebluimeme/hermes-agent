@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import ast
 import contextlib
 import contextvars
 import fnmatch
@@ -1769,6 +1770,98 @@ def _read_tool_exec_flag(tool: str, args: list[str]) -> tuple[str, str] | None:
     return None
 
 
+_READ_ONLY_SQLITE_PRAGMA_RE = re.compile(
+    r"^PRAGMA\s+(?:"
+    r"compile_options|database_list|foreign_key_list|index_info|index_list|"
+    r"integrity_check|quick_check|schema_version|table_info|table_xinfo|user_version"
+    r")(?:\s*\([^)]*\))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_read_only_sqlite_uri(value: str) -> bool:
+    """Accept only a SQLite ``file:`` URI with an exact ``mode=ro`` parameter."""
+    from urllib.parse import parse_qsl, urlsplit
+
+    try:
+        uri = urlsplit(value)
+        query = parse_qsl(uri.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return False
+    modes = [item for key, item in query if key == "mode"]
+    return (
+        uri.scheme == "file"
+        and not uri.fragment
+        and modes == ["ro"]
+    )
+
+
+def _is_read_only_python_diagnostic(args: list[str]) -> bool:
+    """Accept one deliberately tiny ``python -c`` diagnostic subset.
+
+    This is not a general Python sandbox.  It accepts only a single inline
+    program made of literal file reads or SQLite ``mode=ro`` SELECT/PRAGMA
+    queries, then printing their result.  Everything unfamiliar fails closed.
+    """
+    if len(args) != 2 or args[0] != "-c" or len(args[1]) > 4096:
+        return False
+    try:
+        tree = ast.parse(args[1], mode="exec")
+    except (SyntaxError, ValueError):
+        return False
+
+    safe_nodes = (
+        ast.Module, ast.Import, ast.ImportFrom, ast.alias, ast.Assign,
+        ast.Expr, ast.Call, ast.Attribute, ast.Name, ast.Load, ast.Store,
+        ast.Constant, ast.keyword,
+    )
+    has_read = False
+    for node in ast.walk(tree):
+        if not isinstance(node, safe_nodes):
+            return False
+        if isinstance(node, ast.Import):
+            if any(alias.name != "sqlite3" or alias.asname for alias in node.names):
+                return False
+        if isinstance(node, ast.ImportFrom):
+            if node.module != "pathlib" or any(
+                alias.name != "Path" or alias.asname for alias in node.names
+            ):
+                return False
+        if isinstance(node, ast.Name) and node.id in {
+            "eval", "exec", "open", "compile", "__import__", "getattr", "setattr",
+        }:
+            return False
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id == "print":
+                    continue
+                if func.id == "Path" and len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    continue
+                return False
+            if not isinstance(func, ast.Attribute):
+                return False
+            if func.attr in {"read_text", "exists", "stat", "fetchone", "fetchall"}:
+                has_read = True
+                continue
+            if func.attr == "connect" and isinstance(func.value, ast.Name) and func.value.id == "sqlite3":
+                if not node.args or not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+                    return False
+                if not _is_read_only_sqlite_uri(node.args[0].value) or not any(
+                    kw.arg == "uri" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                    for kw in node.keywords
+                ):
+                    return False
+                has_read = True
+                continue
+            if func.attr == "execute" and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                query = node.args[0].value.strip().upper()
+                if query.startswith("SELECT ") or _READ_ONLY_SQLITE_PRAGMA_RE.fullmatch(query):
+                    continue
+            return False
+    return has_read
+
+
 def _execution_flag_findings(command: str):
     """Yield scoped execution mechanisms and any executable payloads."""
     for segment in _iter_top_level_shell_segments(command):
@@ -1789,6 +1882,8 @@ def _execution_flag_findings(command: str):
             if family:
                 flag = _interpreter_exec_flag(family, tokens[1:])
                 if flag:
+                    if family == "python" and flag == "-c" and _is_read_only_python_diagnostic(tokens[1:]):
+                        continue
                     yield ("script execution via -e/-c flag", None)
                     continue
                 if any(token.startswith("<<") for token in tokens[1:]):
@@ -2671,6 +2766,35 @@ def resolve_gateway_approval(session_key: str, choice: str,
             entry.reason = reason
         entry.event.set()
     return len(targets)
+
+
+def enqueue_gateway_approval(session_key: str, approval_data: dict) -> "_ApprovalEntry":
+    """Create a pending gateway-approval entry with no agent thread waiting on it.
+
+    ``_await_gateway_decision`` enqueues an entry AND blocks the calling
+    (agent) thread on it in the same call. The Kanban worker-approval bridge
+    (``gateway/kanban_watchers.py::_kanban_worker_approval_bridge``) has no
+    agent thread to block: the worker it's acting for is blocked in a
+    *different process*, polling a file. The bridge instead awaits this
+    entry's event as an asyncio task on the gateway's own event loop, so the
+    gateway's ``ea:`` Telegram callback handler can resolve it with the
+    exact same, unmodified ``resolve_gateway_approval()`` call it already
+    uses for live in-session approvals.
+    """
+    entry = _ApprovalEntry(approval_data)
+    with _lock:
+        _gateway_queues.setdefault(session_key, []).append(entry)
+    return entry
+
+
+def drop_gateway_approval_entry(session_key: str, entry: "_ApprovalEntry") -> None:
+    """Remove one specific queued entry (e.g. after the bridge's own timeout)."""
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if queue and entry in queue:
+            queue.remove(entry)
+        if queue is not None and not queue:
+            _gateway_queues.pop(session_key, None)
 
 
 def list_gateway_approvals(session_key: str) -> list[dict]:

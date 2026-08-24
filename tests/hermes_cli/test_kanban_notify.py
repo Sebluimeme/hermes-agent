@@ -363,7 +363,14 @@ async def test_notifier_notify_wake_does_not_wake_on_status_event(kanban_home):
             timeout=10.0,
         )
 
-    fake_adapter.send.assert_awaited_once()
+    # AGENTS.md "Silence Kanban intermédiaire": a bare `status` event
+    # (dashboard drag-drop, internal transition) must never leak as a
+    # Telegram/Discord ping — only a terminal outcome does (see TERMINAL_KINDS
+    # in gateway/kanban_watchers.py, which excludes "status" from the claim
+    # query at the SQL level). This assertion was stale (asserted the
+    # opposite, pre-dating that filter) and silently failing until corrected
+    # here.
+    fake_adapter.send.assert_not_awaited()
     wake_mock.assert_not_awaited()
 
 
@@ -538,7 +545,20 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     # The user is notified about the abnormal event...
     fake_adapter.send.assert_called_once()
-    assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
+    sent_text = fake_adapter.send.call_args[0][1]
+    if kind in ("crashed", "timed_out"):
+        # AGENTS.md "Anomalie / Impact / Solution / Preuve" — a relevant
+        # anomaly must never reach Sébastien as a bare status word; it must
+        # carry the three-part structure so he can act without opening the
+        # card. This is the real contract; asserting the raw kind name here
+        # was incidental (it only held for "crashed" via title bleed-through
+        # and for "gave_up" via a hardcoded phrase, and broke for
+        # "timed_out" — see AGENTS.md "Anomalie / Impact / Solution / Preuve").
+        assert "Impact :" in sent_text
+        assert "Solution :" in sent_text
+        assert "Preuve :" in sent_text
+    else:
+        assert kind.replace('_', ' ') in sent_text
 
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside

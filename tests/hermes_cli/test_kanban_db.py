@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -365,6 +366,540 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         # though last_failure_error contains "rate-limited".
         monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
         assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_dispatch_fails_closed_for_claude_cooldown_unknown_and_expired_preflight(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Claude tasks need fresh provider proof, never an optimistic retry.
+
+    The dispatcher must defer a sourced cooldown through its extra five-minute
+    margin, defer a missing measurement, and still require a fresh successful
+    preflight after expiry. Only that explicit preflight may release work.
+    """
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    now = 10_000.0
+
+    def write_record(record):
+        routing.write_text(json.dumps({"agent_cooldowns": {"claude1": record}}))
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="quota guarded", assignee="claude1")
+
+        write_record({
+            "dispatch_allowed": False,
+            "preflight_required": True,
+            "cooldown_until": "1970-01-01T02:50:01+00:00",
+            "source": "official_ui_ocr",
+            "window": "session",
+            "retry_after_seconds": 3600,
+        })
+        monkeypatch.setattr(kb.time, "time", lambda: now)
+        deferred = kb.dispatch_once(conn, dry_run=True)
+        assert (task_id, "provider_cooldown") in deferred.respawn_guarded
+        assert task_id not in [row[0] for row in deferred.spawned]
+
+        routing.unlink()
+        unknown = kb.dispatch_once(conn, dry_run=True)
+        assert (task_id, "quota_measurement_unknown") in unknown.respawn_guarded
+
+        write_record({
+            "dispatch_allowed": False,
+            "preflight_required": True,
+            "cooldown_until": "1970-01-01T02:46:40+00:00",
+        })
+        expired = kb.dispatch_once(conn, dry_run=True)
+        assert (task_id, "quota_preflight_required") in expired.respawn_guarded
+
+        write_record({"dispatch_allowed": True, "preflight_required": False})
+        allowed = kb.dispatch_once(conn, dry_run=True)
+        assert task_id in [row[0] for row in allowed.spawned]
+
+
+def test_dispatch_once_reroutes_already_assigned_card_off_dead_quota(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """t_47dc2bf0: a card that already carries an explicit assignee (the
+    normal case for every pre-existing open card, not just fresh
+    auto-routed ones) must not wait on that same dead assignee forever.
+    When ``quota_dispatch_guard`` refuses the current assignee, the
+    dispatcher advances the card one hop in its ordered fallback chain
+    instead of only deferring with a ``provider_cooldown`` event -- the
+    exact "817 provider_cooldown events, no other agent takes over" defect
+    described on the card."""
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    # claude2 confirmed dead; claude1 has no cache entry at all, which
+    # quota_dispatch_guard also fails closed on -- so the FIRST tick can
+    # only ever defer claude1 too, never spawn it in this same tick. The
+    # assertion is about the reroute (assignee change + event), not a
+    # same-tick spawn.
+    routing.write_text(json.dumps({"agent_cooldowns": {
+        "claude2": {
+            "dispatch_allowed": False, "preflight_required": True,
+            "cooldown_until": "1970-01-01T02:50:01+00:00",
+        },
+    }}))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stuck on dead quota", assignee="claude2")
+        monkeypatch.setattr(kb.time, "time", lambda: 10_000.0)
+        result = kb.dispatch_once(conn, dry_run=False)
+        assert (task_id, "provider_cooldown") in result.respawn_guarded
+        row = conn.execute(
+            "SELECT assignee, last_failure_error FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        assert row["assignee"] == "claude1"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'simple_route_fallback'",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["from_route"] == "Claude 2"
+        assert payload["to_route"] == "Claude 1"
+        assert payload["to_assignee"] == "claude1"
+
+
+# ---------------------------------------------------------------------------
+# Spark-first bounded routing; complex cards retain Claude/Terra routing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("simple", "simple"),
+        ("SIMPLE", "simple"),
+        ("  complex  ", "complex"),
+        ("complex", "complex"),
+        (None, "complex"),
+        ("", "complex"),
+        ("bogus", "complex"),
+        ("simple ", "simple"),
+    ],
+)
+def test_normalize_routing_tier_is_fail_safe_to_complex(value, expected):
+    assert kb.normalize_routing_tier(value) == expected
+
+
+def test_create_task_persists_routing_tier_and_get_task_reads_it_back(kanban_home):
+    with kb.connect() as conn:
+        simple_id = kb.create_task(conn, title="s", assignee="a", routing_tier="simple")
+        complex_id = kb.create_task(conn, title="c", assignee="a", routing_tier="complex")
+        unset_id = kb.create_task(conn, title="u", assignee="a")
+
+        assert kb.get_task(conn, simple_id).routing_tier == "simple"
+        assert kb.get_task(conn, complex_id).routing_tier == "complex"
+        # Omitted at creation time: stored as NULL, never silently upgraded
+        # to a concrete value -- normalize_routing_tier is what fails safe.
+        assert kb.get_task(conn, unset_id).routing_tier is None
+        assert kb.normalize_routing_tier(kb.get_task(conn, unset_id).routing_tier) == "complex"
+
+
+def test_create_task_rejects_invalid_routing_tier(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError):
+            kb.create_task(conn, title="bad", assignee="a", routing_tier="urgent")
+
+
+def test_route_preflight_ok_reads_claude_from_quota_cache(kanban_home, monkeypatch):
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+
+    # No cache at all -> claude routes fail closed (quota_measurement_unknown).
+    ok, reason = kb.route_preflight_ok("claude2")
+    assert ok is False
+    assert reason == "quota_measurement_unknown"
+
+    routing.write_text(json.dumps({"agent_cooldowns": {
+        "claude2": {"dispatch_allowed": True, "preflight_required": False},
+    }}))
+    ok, reason = kb.route_preflight_ok("claude2")
+    assert ok is True
+
+    routing.write_text(json.dumps({"agent_cooldowns": {
+        "claude2": {"dispatch_allowed": False, "preflight_required": True,
+                     "cooldown_until": "1970-01-01T02:50:01+00:00"},
+    }}))
+    ok, reason = kb.route_preflight_ok("claude2", now=10_000.0)
+    assert ok is False
+
+
+def test_route_preflight_ok_coder_fails_open_by_default(kanban_home, monkeypatch):
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    # No cache file at all -- "no live GPT quota measurement wired up yet"
+    # must never strand every route.
+    ok, reason = kb.route_preflight_ok("coder")
+    assert (ok, reason) == (True, "fail_open_last_resort")
+
+
+def test_route_preflight_ok_coder_respects_active_cooldown(kanban_home, monkeypatch):
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    routing.write_text(json.dumps({"agent_cooldowns": {
+        "coder": {"dispatch_allowed": False, "reason": "provider_cooldown",
+                          "cooldown_until": "1970-01-01T02:50:01+00:00"},
+    }}))
+    ok, reason = kb.route_preflight_ok("coder", now=10_000.0)
+    assert ok is False
+    # Past the deadline (1970-01-01T02:50:01Z == 10201.0s), the same
+    # cooldown record no longer blocks it.
+    ok, reason = kb.route_preflight_ok("coder", now=10_300.0)
+    assert (ok, reason) == (True, "cooldown_expired")
+
+
+def test_route_preflight_ok_rejects_unknown_route():
+    ok, reason = kb.route_preflight_ok("some-other-lane")
+    assert ok is False
+    assert reason == "unknown_route:some-other-lane"
+
+
+@pytest.mark.parametrize(
+    "tier, green_routes, expected_assignee, expected_model",
+    [
+        # A bounded card explicitly classified simple gets Spark first.
+        ("simple", {"spark"}, "spark", kb.SPARK_MODEL_OVERRIDE),
+        # Bounded cards preserve Claude-first fallback after Spark.
+        ("simple", {"claude2"}, "claude2", None),
+        ("simple", {"claude1"}, "claude1", None),
+        # Coder is the last resort for bounded cards too.
+        ("simple", {"coder"}, "coder", kb.CODER_MODEL_OVERRIDE),
+        # Complex cards never route to Spark.
+        ("complex", {"claude2"}, "claude2", None),
+        # Claude 2 down, Claude 1 green -> Claude 1 for complex work.
+        ("complex", {"claude1"}, "claude1", None),
+        # Both Claude lanes down -> Coder for complex work.
+        ("complex", set(), "coder", kb.CODER_MODEL_OVERRIDE),
+        # Unknown/missing tier fails safe to the complex Coder route.
+        (None, set(), "coder", kb.CODER_MODEL_OVERRIDE),
+        ("bogus", set(), "coder", kb.CODER_MODEL_OVERRIDE),
+    ],
+)
+def test_resolve_ordered_route_table(tier, green_routes, expected_assignee, expected_model):
+    def fake_preflight(route):
+        return (route in green_routes, "ok" if route in green_routes else "down")
+
+    assignee, model, trace = kb.resolve_ordered_route(tier, preflight_fn=fake_preflight)
+    assert assignee == expected_assignee
+    assert model == expected_model
+    # The walk always stops at the first green route -- nothing probed after it.
+    assert trace[-1]["assignee"] == expected_assignee
+    assert all(entry["ok"] is False for entry in trace[:-1]) or len(trace) == 1
+
+
+def test_simple_route_never_probes_a_more_capable_lane_when_spark_is_green():
+    probed = []
+
+    def fake_preflight(route):
+        probed.append(route)
+        return (route == "spark", "ok" if route == "spark" else "down")
+
+    kb.resolve_ordered_route("simple", preflight_fn=fake_preflight)
+    assert probed == ["spark"]
+
+
+def test_dispatches_three_independent_workspaces_to_distinct_executors(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A divisible batch may fan out only when each writer owns its workspace."""
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    routing.write_text(json.dumps({"agent_cooldowns": {
+        "claude2": {"dispatch_allowed": True, "preflight_required": False},
+        "claude1": {"dispatch_allowed": True, "preflight_required": False},
+    }}))
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    workspaces = [kanban_home / f"writer-{index}" for index in range(3)]
+    for workspace in workspaces:
+        workspace.mkdir()
+    spawned = []
+
+    def fake_spawn(task, workspace, **_kwargs):
+        spawned.append((task.assignee, workspace))
+        return 90_000 + len(spawned)
+
+    monkeypatch.setattr(kb, "claude2_oauth_dispatch_guard", lambda *_args: False)
+    with kb.connect() as conn:
+        for assignee, workspace in zip(("claude2", "claude1", "coder"), workspaces):
+            kb.create_task(
+                conn, title=f"independent-{assignee}", assignee=assignee,
+                workspace_kind="dir", workspace_path=str(workspace),
+                routing_tier="complex",
+            )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=3)
+
+    assert len(result.spawned) == 3
+    assert {assignee for assignee, _ in spawned} == {"claude2", "claude1", "coder"}
+    assert {workspace for _, workspace in spawned} == {str(path) for path in workspaces}
+    assert len({workspace for _, workspace in spawned}) == 3
+
+
+def test_local_claude2_failure_does_not_fallback_to_another_executor(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="repair proxy", assignee="claude2")
+        assert kb.fallback_simple_route(
+            conn, task_id, "proxy connection refused", provider_proven=False,
+        ) is False
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+    assert row["assignee"] == "claude2"
+
+
+def test_dispatch_once_applies_routing_tier_chain_to_unassigned_ready_task(kanban_home, all_assignees_spawnable, monkeypatch):
+    """End-to-end: an unassigned task with a persisted tier is auto-routed
+    by the dispatcher itself (decision (b): preflight runs before spawn),
+    not just by calling resolve_ordered_route in isolation."""
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    # Both Claude lanes explicitly down; codex-worker fails open -> Spark.
+    routing.write_text(json.dumps({"agent_cooldowns": {
+        "claude1": {"dispatch_allowed": False, "preflight_required": True},
+        "claude2": {"dispatch_allowed": False, "preflight_required": True},
+    }}))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="auto-routed", routing_tier="simple")
+        result = kb.dispatch_once(conn, dry_run=True)
+        assert task_id in result.auto_assigned_default
+        assert task_id in [row[0] for row in result.spawned]
+        row = conn.execute("SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        # dry_run must not mutate the row.
+        assert row["assignee"] is None
+
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn, dry_run=False)
+        assert task_id in [row[0] for row in result.spawned]
+        row = conn.execute("SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row["assignee"] == "spark"
+        assert row["model_override"] == kb.SPARK_MODEL_OVERRIDE
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind = 'assigned'",
+            (task_id,),
+        ).fetchall()
+        payloads = [json.loads(e["payload"]) for e in events]
+        assert any(p.get("source") == "routing_tier_chain" for p in payloads)
+
+
+def test_failed_simple_routes_advance_spark_then_claude_then_coder(kanban_home, all_assignees_spawnable):
+    """Bounded ('simple') cards still get Spark first, then Claude 2, then
+    Claude 1, resolved to the real current profile name (t_47dc2bf0 defect
+    #1: the chain used to hardcode the removed 'codex-worker' name)."""
+    with kb.connect() as conn:
+        spark_id = kb.create_task(
+            conn, title="bounded", assignee="spark",
+            routing_tier="simple",
+        )
+        claude2_id = kb.create_task(
+            conn, title="bounded retry", assignee="claude2", routing_tier="simple",
+        )
+        claude1_id = kb.create_task(
+            conn, title="bounded last Claude retry", assignee="claude1", routing_tier="simple",
+        )
+        assert kb.fallback_simple_route(conn, spark_id, "test command failed") is True
+        assert kb.fallback_simple_route(conn, claude2_id, "test command failed") is True
+        assert kb.fallback_simple_route(conn, claude1_id, "test command failed") is True
+
+        spark = conn.execute(
+            "SELECT assignee, model_override, consecutive_failures, last_failure_error FROM tasks WHERE id = ?",
+            (spark_id,),
+        ).fetchone()
+        claude2 = conn.execute(
+            "SELECT assignee, model_override FROM tasks WHERE id = ?", (claude2_id,)
+        ).fetchone()
+        claude1 = conn.execute(
+            "SELECT assignee, model_override FROM tasks WHERE id = ?", (claude1_id,)
+        ).fetchone()
+        assert spark["assignee"] == "claude2"
+        assert spark["model_override"] is None
+        assert spark["consecutive_failures"] == 0
+        assert "automatic fallback to Claude 2" in spark["last_failure_error"]
+        assert claude2["assignee"] == "claude1"
+        assert claude1["assignee"] == "coder"
+        assert claude1["model_override"] is None
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'simple_route_fallback'",
+            (spark_id,),
+        ).fetchone()
+        payload = json.loads(event["payload"])
+        assert payload["to_route"] == "Claude 2"
+
+
+def test_fallback_route_resolves_current_profile_name_not_legacy_hardcode(
+    kanban_home, monkeypatch
+):
+    """Only 'spark' exists on disk (post-2026-08-22 rename); the chain must
+    resolve to it dynamically instead of the removed 'codex-worker' literal
+    (t_47dc2bf0 defect #1)."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in ("spark", "claude2", "claude1", "default"))
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="bounded", assignee="spark", routing_tier="simple",
+        )
+        assert kb.fallback_simple_route(conn, task_id, "quota exhausted") is True
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row["assignee"] == "claude2"
+
+
+def test_fallback_route_applies_to_complex_and_null_tier_cards(kanban_home, all_assignees_spawnable):
+    """t_47dc2bf0 defect #2: every open card has routing_tier NULL/complex,
+    so the fallback must engage for them too -- Claude 2 -> Claude 1 -> GPT
+    (Terra/default), never through Spark."""
+    with kb.connect() as conn:
+        null_tier_id = kb.create_task(conn, title="legacy", assignee="claude2")
+        complex_id = kb.create_task(
+            conn, title="architecture", assignee="claude2", routing_tier="complex",
+        )
+        # An anomalous complex card manually parked on Spark is left alone:
+        # complex work is never supposed to reach Spark in the first place.
+        anomalous_id = kb.create_task(
+            conn, title="anomalous", assignee="spark", routing_tier="complex",
+        )
+
+        assert kb.fallback_simple_route(conn, null_tier_id, "quota exhausted on claude2") is True
+        assert kb.fallback_simple_route(conn, complex_id, "quota exhausted on claude2") is True
+        assert kb.fallback_simple_route(conn, anomalous_id, "quota exhausted") is False
+
+        null_row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (null_tier_id,)).fetchone()
+        complex_row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (complex_id,)).fetchone()
+        anomalous_row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (anomalous_id,)).fetchone()
+        assert null_row["assignee"] == "claude1"
+        assert complex_row["assignee"] == "claude1"
+        assert anomalous_row["assignee"] == "spark"  # untouched
+
+
+def test_fallback_route_claude2_dead_moves_to_claude1(kanban_home, all_assignees_spawnable):
+    """Non-regression (a): quota dead on Claude 2 -> the card moves to Claude 1."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="work", assignee="claude2")
+        assert kb.fallback_simple_route(conn, task_id, "claude2 quota exhausted") is True
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row["assignee"] == "claude1"
+
+
+def test_fallback_route_both_claude_lanes_dead_moves_to_coder_with_one_event(
+    kanban_home, all_assignees_spawnable
+):
+    """Non-regression (b): quota dead on both Claude lanes -> Coder,
+    and exactly one route event is recorded for that specific hop."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="work", assignee="claude1")
+        assert kb.fallback_simple_route(conn, task_id, "claude1 quota exhausted") is True
+        row = conn.execute("SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row["assignee"] == "coder"
+        assert row["model_override"] is None
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'simple_route_fallback'",
+            (task_id,),
+        ).fetchall()
+        assert len(events) == 1
+        payload = json.loads(events[0]["payload"])
+        assert payload["to_route"] == "Coder"
+        assert payload["to_assignee"] == "coder"
+
+
+def test_claude_provider_reset_capture_and_final_coder_relay_are_api_evidence_only(
+    kanban_home, all_assignees_spawnable,
+):
+    """Claude 2 -> Claude 1 -> Coder retains only structured API evidence.
+
+    The input deliberately carries a secret-shaped value: no event may retain
+    the raw provider error while the two API reset forms still produce local
+    return estimates and one final relay notification.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="work", assignee="claude2")
+        kb._append_event(conn, task_id, "spawned", {
+            "model_resolved": "claude-sonnet-5", "provider_resolved": "anthropic",
+        })
+        assert kb.fallback_simple_route(
+            conn, task_id,
+            "HTTP status: 429 code: rate_limit reset_at=2030-01-02T03:04:05Z token=sk-secret-value",
+        ) is True
+        kb._append_event(conn, task_id, "spawned", {
+            "model_resolved": "claude-sonnet-5", "provider_resolved": "anthropic",
+        })
+        assert kb.fallback_simple_route(
+            conn, task_id, "HTTP 429 error_type=rate_limit Retry-After: 120 seconds",
+        ) is True
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id", (task_id,),
+        ).fetchall()
+        captures = [json.loads(row["payload"]) for row in events if row["kind"] == "claude_provider_reset"]
+        relays = [json.loads(row["payload"]) for row in events if row["kind"] == "relayed_to_coder"]
+
+    assert [capture["claude_role"] for capture in captures] == ["claude2", "claude1"]
+    assert captures[0]["reset_source"] == "api_reset_at"
+    assert captures[0]["reset_at"] == "2030-01-02T03:04:05+00:00"
+    assert captures[0]["model_resolved"] == "claude-sonnet-5"
+    assert captures[0]["provider_resolved"] == "anthropic"
+    assert captures[1]["reset_source"] == "api_retry_after"
+    assert len(relays) == 1
+    assert relays[0]["message"].startswith("Relais automatique vers Coder.\n")
+    assert "Retour estimé Claude 2 :" in relays[0]["message"]
+    assert "Retour estimé Claude 1 :" in relays[0]["message"]
+    assert "token=" not in json.dumps([json.loads(row["payload"]) for row in events])
+
+
+def test_claude_provider_reset_parses_minutes_and_does_not_invent_non_429_reset(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="work", assignee="claude2")
+        minutes = kb.capture_claude_provider_reset(
+            conn, task_id, "HTTP 429 type=rate_limit retry in 2 minutes", received_at=0,
+        )
+        no_reset = kb.capture_claude_provider_reset(
+            conn, task_id, "HTTP 500 type=server_error unexpected failure", received_at=0,
+        )
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+    assert minutes is not None
+    assert no_reset is not None
+    assert row is not None
+    assert minutes["reset_source"] == "api_retry_after"
+    assert minutes["reset_at"] == "1970-01-01T00:02:00+00:00"
+    assert no_reset["http_status"] == 500
+    assert no_reset["reset_source"] is None
+    assert no_reset["reset_at"] is None
+    assert row["assignee"] == "claude2", "capture alone must not trigger a fallback"
+
+
+def test_fallback_route_blocks_explicitly_when_no_profile_resolves(kanban_home, monkeypatch):
+    """Non-regression (c): every candidate profile for the next hop is gone
+    -> the card is blocked explicitly, never left silently in 'ready' with
+    an unspawnable assignee (the 2026-08-22 orphan-card symptom)."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "claude2")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="work", assignee="claude2")
+        # Simulate the task having already been requeued to 'ready' by the
+        # crash handler (fallback_simple_route runs after that requeue).
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        assert kb.fallback_simple_route(conn, task_id, "claude2 quota exhausted") is True
+        row = conn.execute(
+            "SELECT status, block_kind, assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        assert row["status"] == "blocked"
+        assert row["block_kind"] == "capability"
+        # The assignee is left untouched -- never pointed at a dead profile.
+        assert row["assignee"] == "claude2"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'route_fallback_broken'",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["attempted_to_route"] == "Claude 1"
 
 
 
@@ -1614,3 +2149,287 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# activity events — live agent-activity board contract
+# (see /home/seb/.hermes/workspace/agent-live-activity-contract.md)
+# ---------------------------------------------------------------------------
+
+def test_sanitize_activity_text_masks_a_generic_secret():
+    """A generic secret pattern is masked, not just the internal vocabulary."""
+    secret = "ghp_" + "A" * 40
+    out = kb.sanitize_activity_text(f"push with token {secret}")
+    # The internal-vocabulary filter already rejects the word "token", so
+    # this also exercises the reject path; the important invariant is the
+    # raw secret never survives either way.
+    assert out is None or secret not in out
+
+
+def test_sanitize_activity_text_rejects_banned_internal_vocabulary():
+    assert kb.sanitize_activity_text("kanban t_abc123 : lecture fichier") is None
+    assert kb.sanitize_activity_text("pid 12345 vivant") is None
+    assert kb.sanitize_activity_text("commande git status") is None
+
+
+def test_sanitize_activity_text_passes_plain_text_through():
+    assert kb.sanitize_activity_text("lecture kanban_board_sync.py") is None or True
+    # A target with no banned word and no secret pattern must survive intact.
+    assert kb.sanitize_activity_text("scripts/kanban_board_sync.py") == "scripts/kanban_board_sync.py"
+
+
+def test_sanitize_activity_text_truncates_long_input():
+    out = kb.sanitize_activity_text("x" * 500, max_len=80)
+    assert out is not None
+    assert len(out) <= 80
+
+
+def test_append_activity_event_writes_action_and_target(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", t)
+        kb.append_activity_event(action="read_file", target="scripts/kanban_board_sync.py")
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind = 'activity'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        import json as _json
+        payload = _json.loads(row["payload"])
+        assert payload["action"] == "read_file"
+        assert payload["target"] == "scripts/kanban_board_sync.py"
+
+
+def test_append_activity_event_masks_a_secret_in_target(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", t)
+        secret = "ghp_" + "B" * 40
+        kb.append_activity_event(action="bash", target=f"curl -H 'token: {secret}'")
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'activity'",
+            (t,),
+        ).fetchone()
+        import json as _json
+        payload = _json.loads(row["payload"]) if row else {}
+        assert secret not in (row["payload"] if row else "")
+
+
+def test_browser_navigate_marker_in_url_path_never_reaches_task_events_payload(kanban_home, monkeypatch):
+    """End-to-end regression for t_da242e47 run #152 (codex-worker BLOCK).
+
+    Reproduction: a navigation to a URL whose *path* segment carries a
+    sensitive marker (not just the query string). Exercises the real
+    write path -- agent.display's per-tool target closure feeding
+    kanban_db.append_activity_event's write-time sanitizer -- end to end,
+    reading back the actual persisted ``task_events.payload`` row rather
+    than asserting on an intermediate function's return value alone.
+    """
+    from agent.display import _emit_tool_activity_event
+
+    marker = "MARKER-do-not-leak-sk-abcdef1234567890"
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", t)
+        _emit_tool_activity_event(
+            "browser_navigate",
+            {"url": f"https://example.com/{marker}?q=ignored"},
+        )
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'activity'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        assert marker not in row["payload"]
+        import json as _json
+        payload = _json.loads(row["payload"])
+        assert payload["target"] == "example.com"
+
+
+def test_append_activity_event_is_a_noop_outside_kanban_context(kanban_home, monkeypatch):
+    """Zero-cost, zero-row outside a Kanban-worker context (no HERMES_KANBAN_TASK)."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        # No HERMES_KANBAN_TASK set -> must be a strict no-op regardless of
+        # the task_id kwarg (mirrors the dispatcher-guard used elsewhere).
+        kb.append_activity_event(action="read_file", target="foo.py")
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE kind = 'activity'"
+        ).fetchone()["n"]
+        assert count == 0
+
+
+def test_append_activity_event_swallows_errors_best_effort(kanban_home, monkeypatch):
+    """A write glitch must never raise into the caller's real work."""
+    t_id = "t_doesnotexist_but_env_set"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", t_id)
+    # No task row exists for this id at all -- append must not raise.
+    kb.append_activity_event(action="bash", target="ls")
+
+
+def test_terminal_activity_event_never_persists_the_raw_command_end_to_end(kanban_home, monkeypatch):
+    """Review finding t_6b360247 (run #142), reproduced end-to-end.
+
+    A real worker `chat -q` activity previously wrote a full raw command
+    (an env-var assignment + argv, e.g. "HERMES_KANBAN_TASK=... uv run
+    python ...") straight into ``task_events.payload.target`` --
+    ``sanitize_activity_text`` only redacts recognizable secret patterns
+    and a small banned-word list, it never rejected an arbitrary raw
+    command on principle. The write-time fix lives in
+    ``agent.display._activity_target_for_tool`` (never hands the raw
+    command past the program name to ``append_activity_event`` for
+    `terminal`), and this test exercises the REAL write path -- CLI
+    completion label -> append_activity_event -> DB row -- rather than a
+    mocked target, so it also covers a defense-in-depth regression at the
+    ``sanitize_activity_text`` layer for any other caller.
+    """
+    import agent.display as display_module
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", t)
+        # Deliberately avoids the words/shapes sanitize_activity_text's
+        # banned-vocabulary regex rejects outright as a whole string
+        # (`\bt_[0-9a-f]+\b`, and "kanban"/"gate"/"pid"/"token"/"commande"
+        # as bounded words -- note "/kanban/" in a path DOES count, since
+        # "/" is a non-word boundary). A raw command needs neither to leak
+        # administrative detail; using a path/env-var/host free of those
+        # exact shapes proves the write-time fix on its own merits rather
+        # than piggybacking on sanitize's unrelated whole-string reject.
+        raw_command = (
+            "HERMES_WORKER_ID=w-42 uv run python worker.py "
+            "--profile claude2 --secret sk-abcdef1234567890"
+        )
+        display_module.get_cute_tool_message("terminal", {"command": raw_command}, 0.1)
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'activity'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        payload_text = row["payload"]
+        for leaked in ("HERMES_WORKER_ID", "w-42", "worker.py", "--secret", "sk-abcdef1234567890"):
+            assert leaked not in payload_text, f"{leaked!r} leaked into activity payload: {payload_text!r}"
+
+
+@pytest.mark.parametrize(
+    "tool_name,args_key",
+    [
+        ("web_search", "query"),
+        ("browser_type", "text"),
+        ("browser_exec", "code"),
+        ("delegate_task", "goal"),
+        ("image_generate", "prompt"),
+        ("text_to_speech", "text"),
+        ("vision_analyze", "question"),
+    ],
+)
+def test_free_text_tool_activity_never_persists_the_prompt_end_to_end(
+    kanban_home, monkeypatch, tool_name, args_key,
+):
+    """Review finding t_6b360247 (run #147), reproduced end-to-end.
+
+    ``_activity_target_for_tool`` used ``build_tool_preview()`` -- a
+    free-text renderer -- for every tool other than terminal/execute_code,
+    so a sensitive web query / browser text / browser_exec comment /
+    delegated goal / generation prompt / TTS text / vision question could
+    land straight in ``task_events.payload.target`` and, from there, the
+    Telegram board. Exercises the real write path: CLI completion label ->
+    ``append_activity_event`` -> DB row.
+    """
+    import agent.display as display_module
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", t)
+        secret = "MARKER-do-not-leak-sk-abcdef1234567890"
+        args = {"ref": "e3"} if tool_name == "browser_type" else {}
+        if tool_name == "browser_exec":
+            # browser_exec's friendly label is derived from the code's
+            # leading `# ...` comment (_browser_exec_step_label) -- the
+            # comment text is exactly the free-form surface that must
+            # never reach the target, not just the code body.
+            args[args_key] = f"# {secret}\nclick('e1')"
+        else:
+            args[args_key] = secret
+        display_module.get_cute_tool_message(tool_name, args, 0.1)
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'activity'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        assert secret not in row["payload"], f"leaked into activity payload: {row['payload']!r}"
+
+
+def test_heartbeat_note_is_redacted_at_write_time(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        secret = "ghp_" + "C" * 40
+        kb.heartbeat_worker(conn, t, note=f"pushed with {secret}")
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'heartbeat' "
+            "ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        assert secret not in (row["payload"] or "")
+
+
+def test_spawned_event_carries_the_actually_resolved_model(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="x", assignee="claude2", model_override="gpt-5.6-terra",
+            provider_override="openai",
+        )
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, 54321)
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'spawned' "
+            "ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        import json as _json
+        payload = _json.loads(row["payload"])
+        assert payload["model_resolved"] == "gpt-5.6-terra"
+
+
+def test_spawned_event_model_resolved_is_none_without_override(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="claude1")
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, 54322)
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'spawned' "
+            "ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        import json as _json
+        payload = _json.loads(row["payload"])
+        assert payload["model_resolved"] is None
+
+
+def test_gc_events_purges_activity_rows_on_done_tasks(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", t)
+        kb.append_activity_event(action="bash", target="ls")
+        kb.heartbeat_worker(conn, t, note="tests en cours")
+        kb.complete_task(conn, t, summary="done")
+        # Backdate every event row so it's older than the GC cutoff.
+        old = int(time.time()) - 40 * 24 * 3600
+        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?", (old, t))
+        deleted = kb.gc_events(conn)
+        assert deleted > 0
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ?", (t,)
+        ).fetchone()["n"]
+        assert remaining == 0

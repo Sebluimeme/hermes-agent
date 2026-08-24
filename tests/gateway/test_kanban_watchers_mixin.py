@@ -18,6 +18,8 @@ KANBAN_METHODS = [
     "_kanban_unsub",
     "_kanban_rewind",
     "_deliver_kanban_artifacts",
+    "_kanban_worker_approval_bridge",
+    "_dispatch_kanban_worker_approval",
 ]
 
 

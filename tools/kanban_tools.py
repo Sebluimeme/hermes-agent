@@ -34,6 +34,7 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli import closure_evidence
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -765,6 +766,15 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and keep this task alive."
                 )
 
+            # LOT 4 — a card cannot become 'done' on bare assertion. See
+            # hermes_cli/closure_evidence.py for the accepted evidence kinds.
+            closure_rejection = closure_evidence.closure_gate(
+                prior_status=getattr(task, "status", None),
+                metadata=metadata,
+            )
+            if closure_rejection is not None:
+                return tool_error(f"kanban_complete: {closure_rejection}")
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -840,6 +850,15 @@ def _handle_block(args: dict, **kw) -> str:
             return tool_error(
                 f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
             )
+        # A transient block is explicitly safe to retry. Preserve this worker's
+        # session id in the closed run so the dispatcher can resume the same
+        # conversation after an explicit unblock. Human/capability blocks keep
+        # their existing fresh-worker behavior.
+        metadata = (
+            _stamp_worker_session_metadata(tid, None)
+            if kind == "transient"
+            else None
+        )
         # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
         # judge gate in #38367). kanban_block is a second exit path out of
         # the goal loop — run_kanban_goal_loop() treats ANY `blocked` status
@@ -870,6 +889,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                metadata=metadata,
             )
             if not ok:
                 return tool_error(
@@ -1413,6 +1433,7 @@ def _handle_create(args: dict, **kw) -> str:
     provider_override = args.get("provider")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
+    routing_tier = args.get("routing_tier")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1461,6 +1482,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                routing_tier=routing_tier,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1639,6 +1661,82 @@ def _handle_unblock(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_unblock failed")
         return tool_error(f"kanban_unblock: {e}")
+
+
+def _handle_authorize_instruction_edit(args: dict, **kw) -> str:
+    """Record an explicit, exact-path instruction-edit grant for one task."""
+    delegated_err = _reject_delegated_child_mutation("kanban_authorize_instruction_edit")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_authorize_instruction_edit")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    target_path = args.get("target_path")
+    reason = args.get("reason")
+    if not tid:
+        return tool_error("task_id is required")
+    if not target_path:
+        return tool_error("target_path is required")
+    if not reason or not str(reason).strip():
+        return tool_error("reason is required and must record explicit user authorization")
+    # Model-controlled input must not forge the author recorded in the audit
+    # trail. The active orchestrator identity is the only authority surfaced.
+    author = os.environ.get("HERMES_PROFILE") or "orchestrator"
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            kb.authorize_instruction_edit(
+                conn,
+                str(tid),
+                str(target_path),
+                granted_by=author,
+                reason=redact_sensitive_text(str(reason).strip(), force=True),
+            )
+            return _ok(
+                task_id=str(tid),
+                target_path=kb._canonical_instruction_edit_target(str(target_path)),
+                granted_by=author,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_authorize_instruction_edit: {e}")
+    except Exception as e:
+        logger.exception("kanban_authorize_instruction_edit failed")
+        return tool_error(f"kanban_authorize_instruction_edit: {e}")
+
+
+def _handle_recover_instruction_edit(args: dict, **kw) -> str:
+    """Recover an authorized instruction-edit task from triage to its landing state."""
+    delegated_err = _reject_delegated_child_mutation("kanban_recover_instruction_edit")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_recover_instruction_edit")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            if not kb.recover_triage_after_instruction_authorization(conn, str(tid)):
+                return tool_error(
+                    f"cannot recover {tid}: it must be in triage with a durable "
+                    "instruction-edit authorization"
+                )
+            task = kb.get_task(conn, str(tid))
+            return _ok(task_id=str(tid), status=task.status if task else None)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_recover_instruction_edit: {e}")
+    except Exception as e:
+        logger.exception("kanban_recover_instruction_edit failed")
+        return tool_error(f"kanban_recover_instruction_edit: {e}")
 
 
 def _handle_link(args: dict, **kw) -> str:
@@ -2303,6 +2401,23 @@ KANBAN_CREATE_SCHEMA = {
                     "to a different one. Requires 'model'."
                 ),
             },
+            "routing_tier": {
+                "type": "string",
+                "enum": ["simple", "complex"],
+                "description": (
+                    "Creation-time-only routing hint used when a downstream "
+                    "card ends up unassigned. Use 'simple' only for an "
+                    "explicitly bounded, low-risk task (reading, research, "
+                    "inventory, a small tested transformation/correction): "
+                    "it routes Spark -> Claude2 -> Claude1 -> Terra. Use 'complex' for "
+                    "architecture, security, credentials, migrations, "
+                    "external actions, important UI, or multi-file changes; "
+                    "it routes Claude2 -> Claude1 -> Terra and never Spark. "
+                    "Has no effect on this card itself since 'assignee' is "
+                    "required here. There is no way to change it later. "
+                    "Omit for the fail-safe default (complex)."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
@@ -2324,6 +2439,50 @@ KANBAN_UNBLOCK_SCHEMA = {
                 "type": "string",
                 "description": "Blocked task id to move to ready or parent-gated todo.",
             },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
+KANBAN_AUTHORIZE_INSTRUCTION_EDIT_SCHEMA = {
+    "name": "kanban_authorize_instruction_edit",
+    "description": (
+        "Record Sébastien's explicit authorization for one Kanban task to edit "
+        "one protected instruction file. Orchestrator-only: call only after the "
+        "user has explicitly authorized this exact task and absolute target path. "
+        "The durable grant is audit-recorded and does not authorize any other task "
+        "or path; dispatcher-spawned workers never see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Task receiving the grant."},
+            "target_path": {
+                "type": "string",
+                "description": "Exact absolute path of the protected instruction file.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Explicit user authorization note retained in the audit trail.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "target_path", "reason"],
+    },
+}
+
+KANBAN_RECOVER_INSTRUCTION_EDIT_SCHEMA = {
+    "name": "kanban_recover_instruction_edit",
+    "description": (
+        "Recover a task from triage after its durable instruction-edit authorization "
+        "has been recorded. Orchestrator-only; the transition is audit-recorded and "
+        "fails unless that exact authorization exists."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Authorized triage task to recover."},
             "board": _board_schema_prop(),
         },
         "required": ["task_id"],
@@ -2466,6 +2625,24 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
     handler=_handle_unblock,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="▶",
+)
+
+registry.register(
+    name="kanban_authorize_instruction_edit",
+    toolset="kanban",
+    schema=KANBAN_AUTHORIZE_INSTRUCTION_EDIT_SCHEMA,
+    handler=_handle_authorize_instruction_edit,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🔐",
+)
+
+registry.register(
+    name="kanban_recover_instruction_edit",
+    toolset="kanban",
+    schema=KANBAN_RECOVER_INSTRUCTION_EDIT_SCHEMA,
+    handler=_handle_recover_instruction_edit,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
 )

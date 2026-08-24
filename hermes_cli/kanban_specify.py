@@ -249,6 +249,50 @@ def specify_task(
     return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
 
 
+def specify_task_as_is(
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    author: Optional[str] = None,
+) -> SpecifyOutcome:
+    """Promote a triage task to ``todo`` without calling the auxiliary LLM.
+
+    For cards whose body is already a concrete, exploitable spec (a blocked
+    card's ``kanban block`` reason, a manually-written spec, …) — rewriting
+    it through the LLM only risks losing the exact wording that made it
+    actionable. This is a thin, LLM-free wrapper over
+    ``kanban_db.specify_triage_task``: it never touches ``title``/``body``
+    unless the caller explicitly passes them, and it never imports or calls
+    ``agent.auxiliary_client.call_llm``.
+
+    Returns an outcome mirroring ``specify_task`` so CLI callers can share
+    the same reporting path.
+    """
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+    if task is None:
+        return SpecifyOutcome(task_id, False, "unknown task id")
+    if task.status != "triage":
+        return SpecifyOutcome(
+            task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+
+    with kb.connect_closing() as conn:
+        ok = kb.specify_triage_task(
+            conn,
+            task_id,
+            title=title,
+            body=body,
+            author=author or _profile_author(),
+        )
+    if not ok:
+        return SpecifyOutcome(
+            task_id, False, "task moved out of triage before promotion"
+        )
+    return SpecifyOutcome(task_id, True, "specified as-is", new_title=title)
+
+
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column.
 

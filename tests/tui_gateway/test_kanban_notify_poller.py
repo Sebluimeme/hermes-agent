@@ -257,6 +257,19 @@ class TestFormatKanbanEventText:
         assert "first line" in text
         assert "second" not in text
 
+    def test_completed_includes_structured_closure_evidence(self):
+        ev = SimpleNamespace(
+            kind="completed",
+            payload={
+                "summary": "terminee",
+                "evidence": {"kind": "test", "detail": "pytest OK"},
+            },
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert text is not None
+        assert "Preuve Kanban : test" in text
+        assert "terminee — Preuve Kanban" in text
+
     def test_timed_out_with_bad_payload_does_not_raise(self):
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")

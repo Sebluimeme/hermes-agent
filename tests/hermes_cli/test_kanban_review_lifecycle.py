@@ -522,9 +522,16 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
 
         monkeypatch.setattr(kb, "check_respawn_guard", lambda _conn, _task_id, **_kw: None)
         result = kb.dispatch_once(conn, spawn_fn=spawn)
+        handoff = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'reviewer_handoff' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
 
     assert task_id in [task[0] for task in result.spawned]
     assert captured == [["domain-specific-review", "sdlc-review"]]
+    assert handoff is not None
+    assert json.loads(handoff["payload"]) == {"reviewer": "reviewer", "source": "review_lane"}
 
 
 def test_review_dispatch_honors_global_and_per_profile_caps(

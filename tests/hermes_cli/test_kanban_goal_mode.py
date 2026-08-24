@@ -89,6 +89,18 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
     assert task.goal_max_turns is None
 
 
+def test_goal_mode_rejects_short_read_only_audit(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="auxiliary goal judge"):
+            kb.create_task(
+                conn,
+                title="Read-only security audit",
+                assignee="worker",
+                workspace_kind="scratch",
+                goal_mode=True,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Spawn env
 # ---------------------------------------------------------------------------
@@ -155,6 +167,11 @@ class TestCLIJudgeGate:
             goal_mode=goal_mode,
             title="Finish report",
             body="acceptance: criteria",
+            # LOT 4 closure evidence gate: simulate a card approved from the
+            # review lane so this test exercises only the judge gate it's
+            # named for, not the separate evidence gate (see
+            # test_kanban_closure_gate.py for that one).
+            status="review",
         )
         fake_conn = MagicMock()
         complete_calls: list = []

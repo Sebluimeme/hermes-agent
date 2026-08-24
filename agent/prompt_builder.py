@@ -354,6 +354,52 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+# Bullet swapped into KANBAN_GUIDANCE when the active profile's backend does
+# not deliver Hermes' custom tool schemas to the model at all (e.g. a profile
+# routed through a bridging CLI proxy that drives a *different* agent binary
+# with its own fixed built-in toolset — see `kanban_guidance_for()`). In that
+# case the `kanban_*` entries are registered locally and pass every gate, so
+# they render as available in this very prompt, but no call to them can ever
+# reach the model: they are dead schema. Telling the worker "use the tools"
+# is actively wrong there, and forbidding the one thing that *does* work
+# (the CLI) turns every such run into a false "protocol violation" — the
+# worker finishes the task but can never close its own card.
+_KANBAN_GUIDANCE_SHELL_OUT_BULLET = (
+    "- Do not shell out to `hermes kanban <verb>` for board operations. Use "
+    "the `kanban_*` tools — they work across all terminal backends.\n"
+)
+_KANBAN_GUIDANCE_TOOLS_UNREACHABLE_BULLET = (
+    "- **The `kanban_*` entries above are not reachable as tool calls in "
+    "this session** — this profile's backend does not forward Hermes' tool "
+    "schemas to the model (e.g. a CLI-proxy backend that runs its own agent "
+    "binary with its own fixed toolset). Use `hermes kanban <verb>` in your "
+    "terminal tool for every lifecycle action instead — `hermes kanban "
+    "show`, `hermes kanban complete $HERMES_KANBAN_TASK --result \"...\"`, "
+    "`hermes kanban block $HERMES_KANBAN_TASK --reason \"...\"`, `hermes "
+    "kanban heartbeat $HERMES_KANBAN_TASK --note \"...\"`, `hermes kanban "
+    "comment $HERMES_KANBAN_TASK \"...\"` — it reaches the same "
+    "`~/.hermes/kanban.db` and is the fully-supported path for this "
+    "backend. Do not exit without calling one of `complete`/`block` this "
+    "way just because the tool-call form isn't available.\n"
+)
+
+
+def kanban_guidance_for(tools_reach_model: bool = True) -> str:
+    """Return the kanban worker/orchestrator guidance for this session.
+
+    ``tools_reach_model=False`` swaps the "Do not shell out" prohibition for
+    an explicit instruction to use ``hermes kanban <verb>`` instead, for
+    profiles whose backend never delivers the `kanban_*` tool schemas to the
+    model (config: ``agent.kanban_tools_reach_model: false``). Defaults to
+    the historical text so every existing profile is unaffected.
+    """
+    if tools_reach_model:
+        return KANBAN_GUIDANCE
+    return KANBAN_GUIDANCE.replace(
+        _KANBAN_GUIDANCE_SHELL_OUT_BULLET,
+        _KANBAN_GUIDANCE_TOOLS_UNREACHABLE_BULLET,
+    )
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

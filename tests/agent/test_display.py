@@ -314,3 +314,207 @@ class TestBuildStatusPhrase:
             assert build_status_phrase("terminal", {"command": "ls"}) is None
         finally:
             set_friendly_tool_labels(True)
+
+
+# ---------------------------------------------------------------------------
+# get_cute_tool_message() -> live agent-activity board event emission
+# (see /home/seb/.hermes/workspace/agent-live-activity-contract.md)
+# ---------------------------------------------------------------------------
+
+class TestToolActivityEventEmission:
+    def test_emits_activity_event_when_inside_a_kanban_task(self, monkeypatch):
+        # Patch the real hermes_cli.kanban_db symbol -- display.py does a
+        # lazy `from hermes_cli import kanban_db as _kdb` inside the guarded
+        # call, so once that module is already imported in-process (it is,
+        # by the wider test suite) faking sys.modules alone does not
+        # intercept it; the attribute must be patched on the real module.
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+        calls = []
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.append_activity_event",
+            lambda **kw: calls.append(kw),
+        )
+        get_cute_tool_message("read_file", {"path": "foo.py"}, 0.1)
+        assert len(calls) == 1
+        assert calls[0]["action"] == "read_file"
+        assert "foo.py" in calls[0]["target"]
+
+    def test_no_event_outside_kanban_context(self, monkeypatch):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        calls = []
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.append_activity_event",
+            lambda **kw: calls.append(kw),
+        )
+        get_cute_tool_message("read_file", {"path": "foo.py"}, 0.1)
+        assert calls == []
+
+    def test_activity_action_maps_git_and_test_run_from_terminal_command(self):
+        from agent.display import _activity_action_for_tool
+        assert _activity_action_for_tool("terminal", {"command": "git status"}) == "git"
+        assert _activity_action_for_tool("terminal", {"command": "pytest -q"}) == "test_run"
+        assert _activity_action_for_tool("terminal", {"command": "ls -la"}) == "bash"
+        assert _activity_action_for_tool("unknown_tool_xyz", {}) == "other"
+
+    def test_a_broken_event_emitter_never_breaks_the_rendered_line(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.append_activity_event",
+            MagicMock(side_effect=RuntimeError("db glitch")),
+        )
+        line = get_cute_tool_message("read_file", {"path": "foo.py"}, 0.1)
+        assert "read" in line
+
+    def test_terminal_activity_target_never_carries_the_raw_command(self, monkeypatch):
+        # Review finding t_6b360247 (run #142): a real worker activity wrote
+        # a raw command straight into task_events.payload.target, e.g.
+        # "HERMES_KANBAN_TASK=... uv run python ...". sanitize_activity_text
+        # only redacts recognizable secret PATTERNS and a small banned-
+        # vocabulary word list -- it never rejects a raw command line on
+        # principle, so an admin env-var assignment or an arbitrary argument
+        # sails straight through it. The fix must never hand the raw/full
+        # command to append_activity_event's target in the first place
+        # (agent-live-activity-contract.md §5: "cible structurée/fermée
+        # ... pour terminal").
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+        calls = []
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.append_activity_event",
+            lambda **kw: calls.append(kw),
+        )
+        raw_command = (
+            "HERMES_KANBAN_TASK=t_9075 uv run python worker.py "
+            "--profile claude2 --secret sk-abcdef1234567890"
+        )
+        get_cute_tool_message("terminal", {"command": raw_command}, 0.1)
+        assert len(calls) == 1
+        target = calls[0]["target"] or ""
+        assert "HERMES_KANBAN_TASK" not in target
+        assert "t_9075" not in target
+        assert "worker.py" not in target
+        assert "--secret" not in target
+        assert "sk-abcdef1234567890" not in target
+        assert target != raw_command
+
+    def test_execute_code_activity_target_never_carries_the_raw_code(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_test")
+        calls = []
+        monkeypatch.setattr(
+            "hermes_cli.kanban_db.append_activity_event",
+            lambda **kw: calls.append(kw),
+        )
+        raw_code = "requests.post(url, headers={'Authorization': 'Bearer sk-abcdef1234567890'})"
+        get_cute_tool_message("execute_code", {"code": raw_code}, 0.1)
+        assert len(calls) == 1
+        target = calls[0]["target"] or ""
+        assert "sk-abcdef1234567890" not in target
+        assert "Authorization" not in target
+        assert target != raw_code
+
+
+# ---------------------------------------------------------------------------
+# _activity_target_for_tool() -- closed target vocabulary (review finding
+# t_6b360247 run #147, BLOCK): every tool other than terminal/execute_code
+# fell through to build_tool_preview(), a free-text renderer, so a sensitive
+# web query / browser text / delegated goal / generation prompt could land
+# in task_events.payload.target and the Telegram board. Fix: a closed table
+# — file basename, program name, controlled host, or no target at all for
+# any text/prompt-carrying tool.
+# ---------------------------------------------------------------------------
+
+class TestActivityTargetClosedVocabulary:
+    SENSITIVE = "MARKER-do-not-leak-sk-abcdef1234567890"
+
+    def _target(self, tool_name, args):
+        from agent.display import _activity_target_for_tool
+        return _activity_target_for_tool(tool_name, args)
+
+    # -- texte/prompt tools : never a target, only the closed action -------
+
+    def test_web_search_query_never_becomes_the_target(self):
+        target = self._target("web_search", {"query": self.SENSITIVE})
+        assert self.SENSITIVE not in target
+
+    def test_browser_type_text_never_becomes_the_target(self):
+        target = self._target("browser_type", {"ref": "e3", "text": self.SENSITIVE})
+        assert target == ""
+
+    def test_browser_exec_comment_never_becomes_the_target(self):
+        target = self._target(
+            "browser_exec", {"code": f"# {self.SENSITIVE}\nclick('e1')"}
+        )
+        assert target == ""
+
+    def test_delegate_task_goal_never_becomes_the_target(self):
+        target = self._target("delegate_task", {"goal": self.SENSITIVE})
+        assert target == ""
+
+    def test_image_generate_prompt_never_becomes_the_target(self):
+        target = self._target("image_generate", {"prompt": self.SENSITIVE})
+        assert target == ""
+
+    def test_text_to_speech_text_never_becomes_the_target(self):
+        target = self._target("text_to_speech", {"text": self.SENSITIVE})
+        assert target == ""
+
+    def test_vision_analyze_question_never_becomes_the_target(self):
+        target = self._target("vision_analyze", {"question": self.SENSITIVE})
+        assert target == ""
+
+    # -- fichier : basename only, never full free text ----------------------
+
+    def test_read_file_target_is_basename_only(self):
+        target = self._target("read_file", {"path": "/home/seb/secret-project/foo.py"})
+        assert target == "foo.py"
+
+    def test_write_file_target_is_basename_only(self):
+        target = self._target("write_file", {"path": "/home/seb/secret-project/bar.py", "content": self.SENSITIVE})
+        assert target == "bar.py"
+        assert self.SENSITIVE not in target
+
+    def test_patch_target_is_basename_only(self):
+        target = self._target("patch", {"path": "/home/seb/secret-project/baz.py", "old_string": self.SENSITIVE})
+        assert target == "baz.py"
+        assert self.SENSITIVE not in target
+
+    def test_search_files_target_never_carries_the_pattern(self):
+        target = self._target("search_files", {"pattern": self.SENSITIVE, "path": "."})
+        assert self.SENSITIVE not in target
+
+    # -- web/navigation : controlled host only, never query/full URL -------
+
+    def test_web_extract_target_is_host_only(self):
+        target = self._target("web_extract", {"urls": ["https://example.com/secret/path?token=abc"]})
+        assert target == "example.com"
+        assert "token" not in target
+        assert "secret" not in target
+
+    def test_browser_navigate_target_strips_query_string(self):
+        target = self._target(
+            "browser_navigate", {"url": f"https://example.com/account?session={self.SENSITIVE}"}
+        )
+        assert self.SENSITIVE not in target
+        assert "example.com" in target
+
+    def test_browser_navigate_target_never_carries_the_path(self):
+        # Reviewer reproduction (t_da242e47 run #152, codex-worker): a
+        # navigation URL whose *path* segment carries a sensitive marker --
+        # not just the query string -- must not leak either. The path is
+        # unqualifiable free text (an attacker/user can put anything there),
+        # so the only safe target is the bare hostname.
+        target = self._target(
+            "browser_navigate",
+            {"url": f"https://example.com/{self.SENSITIVE}?q=ignored"},
+        )
+        assert self.SENSITIVE not in target
+        assert target == "example.com"
+
+    def test_browser_navigate_falls_back_when_url_unparseable(self):
+        target = self._target("browser_navigate", {"url": "not a url"})
+        assert target == "navigation web"
+
+    # -- unknown tool : no target -------------------------------------------
+
+    def test_unknown_tool_never_gets_a_target(self):
+        target = self._target("some_future_tool_xyz", {"prompt": self.SENSITIVE})
+        assert target == ""
