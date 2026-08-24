@@ -2669,10 +2669,10 @@ class AIAgent:
         return cleaned
 
     @staticmethod
-    def _extract_api_error_context(error: Exception) -> Dict[str, Any]:
+    def _extract_api_error_context(error: Exception, **kwargs: Any) -> Dict[str, Any]:
         """Forwarder — see ``agent.agent_runtime_helpers.extract_api_error_context``."""
         from agent.agent_runtime_helpers import extract_api_error_context
-        return extract_api_error_context(error)
+        return extract_api_error_context(error, **kwargs)
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""

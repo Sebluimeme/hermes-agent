@@ -29,6 +29,7 @@ import re
 import threading
 import time
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -3898,9 +3899,46 @@ def cleanup_dead_connections(agent) -> bool:
 
 
 
-def extract_api_error_context(error: Exception) -> Dict[str, Any]:
-    """Extract structured rate-limit details from provider errors."""
+def extract_api_error_context(
+    error: Exception,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    observed_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Capture non-secret failure facts before credential or provider fallback.
+
+    ``reset_at`` is emitted only when the API supplied an explicit timestamp or
+    a duration with an identified source.  Durations are anchored to the real
+    observation timestamp so a pool never invents a quota-reset time.
+    """
     context: Dict[str, Any] = {}
+    now = time.time() if observed_at is None else observed_at
+    if isinstance(provider, str) and provider.strip():
+        context["provider"] = provider.strip()
+    if isinstance(model, str) and model.strip():
+        context["model"] = model.strip()
+
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        context["status_code"] = status_code
+
+    def set_explicit_reset(value: Any, source: str) -> None:
+        if value not in {None, ""} and "reset_at" not in context:
+            context["reset_at"] = value
+            context["reset_source"] = source
+
+    def set_reset_after(value: Any, source: str) -> None:
+        if value in {None, ""} or "reset_at" in context:
+            return
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return
+        if seconds < 0:
+            return
+        context["reset_at"] = now + seconds
+        context["reset_source"] = source
 
     body = getattr(error, "body", None)
     payload = None
@@ -3920,27 +3958,27 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
         for key in ("resets_at", "reset_at"):
             value = payload.get(key)
             if value not in {None, ""}:
-                context["reset_at"] = value
+                set_explicit_reset(value, f"api.{key}")
                 break
         retry_after = payload.get("retry_after")
-        if retry_after not in {None, ""} and "reset_at" not in context:
-            try:
-                context["reset_at"] = time.time() + float(retry_after)
-            except (TypeError, ValueError):
-                pass
+        set_reset_after(retry_after, "api.retry_after")
 
     response = getattr(error, "response", None)
     headers = getattr(response, "headers", None)
     if headers:
+        response_status = getattr(response, "status_code", None)
+        if isinstance(response_status, int) and "status_code" not in context:
+            context["status_code"] = response_status
         retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        set_reset_after(retry_after, "http.retry-after")
         if retry_after and "reset_at" not in context:
             try:
-                context["reset_at"] = time.time() + float(retry_after)
-            except (TypeError, ValueError):
+                context["reset_at"] = parsedate_to_datetime(retry_after).timestamp()
+                context["reset_source"] = "http.retry-after-date"
+            except (TypeError, ValueError, IndexError, OverflowError):
                 pass
         ratelimit_reset = headers.get("x-ratelimit-reset")
-        if ratelimit_reset and "reset_at" not in context:
-            context["reset_at"] = ratelimit_reset
+        set_explicit_reset(ratelimit_reset, "http.x-ratelimit-reset")
 
     if "message" not in context:
         raw_message = str(error).strip()
@@ -3954,7 +3992,7 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
             if delay_match:
                 value = float(delay_match.group(1))
                 seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
-                context["reset_at"] = time.time() + seconds
+                set_reset_after(seconds, "api.message.quota_reset_delay")
             else:
                 resets_in_match = re.search(
                     r"resets?\s+in\s+"
@@ -3968,7 +4006,10 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                     hours = float(resets_in_match.group(1) or 0)
                     minutes = float(resets_in_match.group(2) or 0)
                     seconds = float(resets_in_match.group(3) or 0)
-                    context["reset_at"] = time.time() + (hours * 3600) + (minutes * 60) + seconds
+                    set_reset_after(
+                        (hours * 3600) + (minutes * 60) + seconds,
+                        "api.message.resets_in",
+                    )
                 else:
                     sec_match = re.search(
                         r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
@@ -3976,7 +4017,7 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                         re.IGNORECASE,
                     )
                     if sec_match:
-                        context["reset_at"] = time.time() + float(sec_match.group(1))
+                        set_reset_after(float(sec_match.group(1)), "api.message.retry_after")
 
     return context
 

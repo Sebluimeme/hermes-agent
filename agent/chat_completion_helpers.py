@@ -2283,15 +2283,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # the configured presets explicitly instead of raw provider/model slugs.
         # This makes the fallback visible and understandable to the user.
         _preset_fb_from = fb.get("_preset_fallback_from")
-        if _preset_fb_from:
-            _preset_fb_to = fb.get("_preset_fallback_to", "")
+        _preset_fb_to = fb.get("_preset_fallback_to", "")
+        if _preset_fb_from and _preset_fb_to == "chatgpt":
             try:
                 from agent.llm_preset_fallback import format_preset_fallback_notice
+                _failure_context = getattr(agent, "_last_api_failure_context", {})
+                _reset_at = (
+                    _failure_context.get("reset_at")
+                    if isinstance(_failure_context, dict)
+                    and _failure_context.get("reset_source")
+                    else None
+                )
                 _notice = format_preset_fallback_notice(
                     from_preset=_preset_fb_from,
                     to_preset=_preset_fb_to,
                     from_model=old_model,
                     to_model=fb_model,
+                    reset_at=_reset_at,
                 )
             except Exception:
                 _notice = (
@@ -2303,6 +2311,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             # Mark on the agent so restore_primary_runtime knows a preset
             # fallback was active and can emit a "restored" notice next turn.
             agent._active_preset_fallback_from = _preset_fb_from
+            logger.info(
+                "Preset fallback activated: %s/%s → %s/%s (preset %s → %s)",
+                old_provider, old_model, fb_provider, fb_model,
+                _preset_fb_from, _preset_fb_to,
+            )
+        elif _preset_fb_from:
+            # Claude 1 → Claude 2 remains an internal recovery hop. The
+            # human-facing notice is emitted only if the chain reaches GPT.
             logger.info(
                 "Preset fallback activated: %s/%s → %s/%s (preset %s → %s)",
                 old_provider, old_model, fb_provider, fb_model,

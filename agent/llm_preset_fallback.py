@@ -57,8 +57,8 @@ AGENT_ATTR_ACTIVE_FALLBACK_FROM = "_active_preset_fallback_from"
 # ---------------------------------------------------------------------------
 
 FALLBACK_ROUTES: dict[str, tuple[str, ...]] = {
-    "claude1": ("claude2", "chatgpt"),
-    "claude2": ("chatgpt",),
+    "claude2": ("claude1", "chatgpt"),
+    "claude1": ("chatgpt",),
     "chatgpt": ("claude1",),
 }
 
@@ -147,6 +147,7 @@ def format_preset_fallback_notice(
     to_preset: str,
     from_model: str,
     to_model: str,
+    reset_at: object = None,
 ) -> str:
     """Return the one-shot notice emitted when a preset fallback activates.
 
@@ -159,11 +160,13 @@ def format_preset_fallback_notice(
     """
     from_label = _preset_label(from_preset)
     to_label = _preset_label(to_preset)
-    return (
+    notice = (
         f"⚠️ {from_label} ({from_model}) indisponible ce tour — "
-        f"réponse via {to_label} ({to_model}). "
-        f"Prochain message : réessaie {from_label}."
+        f"réponse via {to_label} ({to_model})."
     )
+    if reset_at not in {None, ""}:
+        notice += f" Retour {from_label} estimé vers {reset_at}."
+    return notice
 
 
 def format_preset_restored_notice(preset: str, model: str) -> str:

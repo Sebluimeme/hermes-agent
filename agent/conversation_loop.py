@@ -4147,7 +4147,14 @@ def run_conversation(
                     continue
 
                 status_code = getattr(api_error, "status_code", None)
-                error_context = agent._extract_api_error_context(api_error)
+                error_context = agent._extract_api_error_context(
+                    api_error,
+                    provider=getattr(agent, "provider", ""),
+                    model=getattr(agent, "model", ""),
+                )
+                # Capture facts before pool recovery or fallback mutates the
+                # active runtime identity. No credential data is retained.
+                agent._last_api_failure_context = error_context
 
                 # ── Classify the error for structured recovery decisions ──
                 _compressor = getattr(agent, "context_compressor", None)

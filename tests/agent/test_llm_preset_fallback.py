@@ -110,8 +110,8 @@ class _MinimalAgent:
 
 class TestGetFallbackPresets:
 
-    def test_claude1_falls_back_via_claude2_then_chatgpt(self, fb_mod):
-        assert fb_mod.get_fallback_presets("claude1") == ("claude2", "chatgpt")
+    def test_claude2_falls_back_via_claude1_then_chatgpt(self, fb_mod):
+        assert fb_mod.get_fallback_presets("claude2") == ("claude1", "chatgpt")
 
     def test_chatgpt_falls_back_to_claude1(self, fb_mod):
         assert fb_mod.get_fallback_presets("chatgpt") == ("claude1",)
@@ -125,16 +125,16 @@ class TestGetFallbackPresets:
 
 class TestBuildPresetFallbackChainEntry:
 
-    def test_claude1_active_returns_claude2_entry(self, fb_mod, tmp_path, monkeypatch):
+    def test_claude2_active_returns_claude1_entry(self, fb_mod, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         entry = fb_mod.build_preset_fallback_chain_entry(
-            active_preset="claude1", hermes_home=tmp_path
+            active_preset="claude2", hermes_home=tmp_path
         )
         assert entry is not None
         assert entry["provider"] == "anthropic"
         assert entry["model"]
-        assert entry[fb_mod.PRESET_FALLBACK_MARKER] == "claude1"
-        assert entry[fb_mod.PRESET_FALLBACK_TO_KEY] == "claude2"
+        assert entry[fb_mod.PRESET_FALLBACK_MARKER] == "claude2"
+        assert entry[fb_mod.PRESET_FALLBACK_TO_KEY] == "claude1"
 
     def test_chatgpt_active_returns_claude1_entry(self, fb_mod, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
@@ -159,11 +159,11 @@ class TestBuildPresetFallbackChainEntry:
     def test_base_url_propagated_when_in_yaml(self, fb_mod, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         (tmp_path / "llm_presets.yaml").write_text(
-            "claude2:\n  provider: anthropic\n  model: claude-sonnet-4-6\n  base_url: http://proxy.local:9000\n",
+            "claude1:\n  provider: anthropic\n  model: claude-sonnet-4-6\n  base_url: http://proxy.local:9000\n",
             encoding="utf-8",
         )
         entry = fb_mod.build_preset_fallback_chain_entry(
-            active_preset="claude1", hermes_home=tmp_path
+            active_preset="claude2", hermes_home=tmp_path
         )
         assert entry is not None
         assert entry.get("base_url") == "http://proxy.local:9000"
@@ -199,15 +199,25 @@ class TestFormatNotices:
         assert "claude-opus-5" in notice
         assert "gpt-5.6" in notice
 
-    def test_fallback_notice_mentions_next_turn_retry(self, fb_mod):
+    def test_fallback_notice_does_not_claim_a_return_without_api_evidence(self, fb_mod):
         notice = fb_mod.format_preset_fallback_notice(
             from_preset="opus",
             to_preset="chatgpt",
             from_model="claude-opus-5",
             to_model="gpt-5.6",
         )
-        # Must mention that the next message retries the preferred preset
-        assert "prochain" in notice.lower() or "next" in notice.lower()
+        assert "retour" not in notice.lower()
+
+    def test_fallback_notice_mentions_return_only_with_reset_evidence(self, fb_mod):
+        notice = fb_mod.format_preset_fallback_notice(
+            from_preset="claude1",
+            to_preset="chatgpt",
+            from_model="claude-opus-5",
+            to_model="gpt-5.6",
+            reset_at=1234.0,
+        )
+        assert "retour" in notice.lower()
+        assert "1234.0" in notice
 
     def test_fallback_notice_reverse_direction(self, fb_mod):
         notice = fb_mod.format_preset_fallback_notice(
@@ -311,15 +321,15 @@ class TestPresetFallbackActivation:
 
     # ── Opus → ChatGPT ──
 
-    def test_opus_to_chatgpt_pending_notice_set(self, tmp_path, monkeypatch):
-        """When opus fails, _pending_fallback_notice must mention chatgpt."""
+    def test_claude2_to_claude1_hop_is_resolved_without_gpt_label(self, tmp_path, monkeypatch):
+        """The first Claude fallback resolves Claude 1, never GPT as Claude 2."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         fb_mod = _import("agent.llm_preset_fallback")
-        agent = self._make_agent_with_preset_chain("claude1", tmp_path, monkeypatch)
+        agent = self._make_agent_with_preset_chain("claude2", tmp_path, monkeypatch)
         assert agent._fallback_chain, "Preset entry must be injected"
 
         fb_entry = agent._fallback_chain[0]
-        assert fb_entry[fb_mod.PRESET_FALLBACK_MARKER] == "claude1"
+        assert fb_entry[fb_mod.PRESET_FALLBACK_MARKER] == "claude2"
 
         # Manually invoke the notice path (without real client swap)
         from_preset = fb_entry["_preset_fallback_from"]
@@ -335,7 +345,7 @@ class TestPresetFallbackActivation:
         agent._active_preset_fallback_from = from_preset
 
         assert agent._pending_fallback_notice is not None
-        assert "claude 2" in agent._pending_fallback_notice.lower()
+        assert "claude 1" in agent._pending_fallback_notice.lower()
         assert "claude" in agent._pending_fallback_notice.lower() or "opus" in agent._pending_fallback_notice.lower()
 
     def test_opus_to_chatgpt_active_attr_set(self, tmp_path, monkeypatch):
@@ -365,8 +375,8 @@ class TestPresetFallbackActivation:
 
         assert preset_mod.get_preset(hermes_home=tmp_path) == "claude1"
 
-    def test_opus_to_chatgpt_notice_mentions_next_turn(self, tmp_path, monkeypatch):
-        """Fallback notice must explicitly mention that the next turn retries opus."""
+    def test_opus_to_chatgpt_notice_does_not_invent_return_time(self, tmp_path, monkeypatch):
+        """Fallback notice must not claim a Claude return without API evidence."""
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         fb_mod = _import("agent.llm_preset_fallback")
         notice = fb_mod.format_preset_fallback_notice(
@@ -375,10 +385,7 @@ class TestPresetFallbackActivation:
             from_model="claude-opus-5",
             to_model="gpt-5.6",
         )
-        lower = notice.lower()
-        assert "prochain" in lower or "next" in lower, (
-            f"Notice must mention next turn: {notice!r}"
-        )
+        assert "retour" not in notice.lower()
 
     # ── ChatGPT → Opus ──
 
@@ -431,7 +438,7 @@ class TestPresetFallbackActivation:
         # Global preset must still be "chatgpt"
         assert preset_mod.get_preset(hermes_home=tmp_path) == "chatgpt"
 
-    def test_chatgpt_to_opus_notice_mentions_next_turn(self, tmp_path, monkeypatch):
+    def test_chatgpt_to_opus_notice_does_not_invent_return_time(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GLOBAL_HOME", str(tmp_path))
         fb_mod = _import("agent.llm_preset_fallback")
         notice = fb_mod.format_preset_fallback_notice(
@@ -440,8 +447,7 @@ class TestPresetFallbackActivation:
             from_model="gpt-5.6",
             to_model="claude-opus-5",
         )
-        lower = notice.lower()
-        assert "prochain" in lower or "next" in lower
+        assert "retour" not in notice.lower()
 
 
 # ---------------------------------------------------------------------------
