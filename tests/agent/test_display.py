@@ -56,7 +56,7 @@ class TestBuildToolPreview:
 
 
     def test_browser_type_preview_redacts_api_key(self):
-        secret = "sk-proj-ABCD1234567890EFGH"
+        secret = "sk-proj-EXAMPLE1234567890"
         result = build_tool_preview("browser_type", {"ref": "@e3", "text": secret})
         assert result is not None
         assert secret not in result
@@ -69,13 +69,13 @@ class TestBuildToolPreview:
         assert text in result
 
     def test_browser_type_display_args_redact_api_key(self):
-        secret = "ghp_ABCDEFGHIJ1234567890"
+        secret = "ghp_EXAMPLE1234567890123"
         safe_args = redact_tool_args_for_display(
             "browser_type", {"ref": "@e3", "text": secret}
         )
         assert secret not in str(safe_args)
         assert safe_args["ref"] == "@e3"
-        assert safe_args["text"].startswith("ghp_AB")
+        assert safe_args["text"].startswith("ghp_EX")
 
 
 
@@ -162,7 +162,7 @@ class TestCuteToolMessagePreviewLength:
 
 
     def test_browser_type_cute_message_redacts_api_key(self):
-        secret = "sk-proj-ABCD1234567890EFGH"
+        secret = "sk-proj-EXAMPLE1234567890"
         line = get_cute_tool_message(
             "browser_type",
             {"ref": "@password", "text": secret},
@@ -384,7 +384,7 @@ class TestToolActivityEventEmission:
         )
         raw_command = (
             "HERMES_KANBAN_TASK=t_9075 uv run python worker.py "
-            "--profile claude2 --secret sk-abcdef1234567890"
+            "--profile claude2 --secret sk-EXAMPLE123456789012345"
         )
         get_cute_tool_message("terminal", {"command": raw_command}, 0.1)
         assert len(calls) == 1
@@ -393,7 +393,7 @@ class TestToolActivityEventEmission:
         assert "t_9075" not in target
         assert "worker.py" not in target
         assert "--secret" not in target
-        assert "sk-abcdef1234567890" not in target
+        assert "sk-EXAMPLE123456789012345" not in target
         assert target != raw_command
 
     def test_execute_code_activity_target_never_carries_the_raw_code(self, monkeypatch):
