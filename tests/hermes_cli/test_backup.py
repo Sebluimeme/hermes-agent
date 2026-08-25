@@ -133,6 +133,13 @@ class TestShouldExclude:
         from hermes_cli.backup import _should_exclude
         assert _should_exclude(Path("backups/pre-update-2026-04-27-063400.zip"))
 
+    def test_excludes_regenerable_worktrees_and_next_builds(self):
+        """A full backup must not spend hours copying disposable task/build trees."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("workspace/ecobloc/.worktrees/t_123/app.py"))
+        assert _should_exclude(Path("workspace/site/.next/cache/webpack/0.pack"))
+        assert not _should_exclude(Path("workspace/site/src/app.py"))
+
     def test_excludes_state_snapshots_dir(self):
         """state-snapshots/ is excluded for the same reason as backups/: every
         quick / pre-update snapshot holds its own copy of state.db, so zipping
@@ -1815,7 +1822,6 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
 
 
 

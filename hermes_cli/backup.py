@@ -89,6 +89,8 @@ _EXCLUDED_DIRS = {
     "site-packages",
     # Tool / build caches — all regeneratable.
     ".cache",
+    ".next",          # Next.js build/cache output — regenerated from source
+    ".worktrees",     # linked task worktrees — source lives in their owner repos
     ".tox",
     ".nox",
     ".pytest_cache",
