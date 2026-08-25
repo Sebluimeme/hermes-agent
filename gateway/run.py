@@ -18841,6 +18841,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        from gateway.session_context import set_current_request_text
+        set_current_request_text((event.text or "")[:50_000])
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -20037,6 +20039,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
             )
+            # One code-driven recovery turn for hidden-reasoning exhaustion.
+            # Run it synchronously in the SAME session before finalisation;
+            # queuing here is too late for _run_agent's pending-message drain
+            # and used to leave a notice saying "je reprends" with no actual
+            # retry behind it. The second result is the definitive result, so
+            # the retry is bounded and can only end in a real answer or an
+            # explicit Action requise notification.
+            if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
+                await self._deliver_platform_notice(
+                    source,
+                    "⚠️ Le traitement s'est interrompu avant la réponse finale. "
+                    "Je reprends automatiquement le travail dans la même session.",
+                )
+                _recovery_prompt = (
+                    "[HERMES_RECOVERY_INCOMPLETE] Reprends exactement la demande "
+                    "précédente à partir de l'état et des outils déjà utilisés. "
+                    "Vérifie l'état durable avant toute action pour ne pas répéter "
+                    "les effets de bord, puis livre une réponse finale visible."
+                )
+                _recovery_history = agent_result.get("messages") or history
+                agent_result = await self._run_agent(
+                    message=_recovery_prompt,
+                    context_prompt=context_prompt,
+                    history=_recovery_history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=None,
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=_recovery_prompt,
+                    persist_user_timestamp=time.time(),
+                    persist_user_display_kind="automatic_recovery",
+                    message_type=MessageType.TEXT,
+                )
+                agent_result["incomplete_recovery_attempted"] = True
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
@@ -20084,7 +20123,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # completed assistant turn (#51628). Blank it here so the normal
             # empty-response handling (and the suppression below) applies.
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
-                response = ""
+                # The synchronous recovery above has also exhausted. Surface
+                # the blocker; never classify this as intentional silence.
+                response = (
+                    "🚨 Action requise : la reprise automatique s'est elle aussi "
+                    "interrompue avant la livraison. Répondez « reprends » ; "
+                    "l'état déjà produit est conservé."
+                )
+                # Queued-follow-up delivery reads the finalized result rather
+                # than this local variable, so keep both representations in
+                # sync. The sentinel itself must never reach a peer channel.
+                agent_result["final_response"] = response
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
@@ -20324,6 +20373,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent_failed_early = bool(agent_result.get("failed"))
             hidden_reasoning_incomplete = _is_gateway_hidden_reasoning_incomplete_turn(
                 agent_result
+            ) or bool(
+                agent_result.get("incomplete_recovery_attempted")
+                and not agent_result.get("completed")
             )
             _err_str_for_classify = str(agent_result.get("error", "")).lower()
             # Use specific multi-word phrases (not bare "exceed" or "token")
@@ -20355,7 +20407,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             elif hidden_reasoning_incomplete:
                 logger.warning(
-                    "Suppressing hidden-reasoning-only incomplete gateway turn "
+                    "Recovering hidden-reasoning-only incomplete gateway turn "
                     "for session %s: %s",
                     session_entry.session_id,
                     agent_result.get("error", "processing incomplete"),

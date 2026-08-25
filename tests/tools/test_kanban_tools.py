@@ -632,10 +632,12 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {
-            "child_task": child_out["task_id"],
-            "evidence": {"kind": "test", "detail": "pytest -q: 3 passed"},
+        assert run.metadata["child_task"] == child_out["task_id"]
+        assert run.metadata["evidence"] == {
+            "kind": "test", "detail": "pytest -q: 3 passed",
         }
+        assert run.metadata["checkpoint"]["state"] == "completed"
+        assert run.metadata["checkpoint"]["note"] == "warming up"
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
@@ -1021,6 +1023,11 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
     monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "alt-user-9")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "msg-123")
+    monkeypatch.setenv(
+        "HERMES_SESSION_REQUEST_TEXT",
+        "Demande originale complète, différente du titre de la carte.",
+    )
 
     out = kt._handle_create({
         "title": "auto-sub gateway",
@@ -1041,6 +1048,19 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id_alt"] == "alt-user-9"
     assert s["chat_type"] == "forum"
     assert s["delivery_mode"] == "notify+wake"
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, new_tid)
+        mission = conn.execute(
+            "SELECT request_text FROM missions WHERE id = ?", (task.mission_id,)
+        ).fetchone()
+        assert mission["request_text"] == (
+            "Demande originale complète, différente du titre de la carte."
+        )
+    finally:
+        conn.close()
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

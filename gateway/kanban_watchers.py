@@ -330,16 +330,11 @@ class GatewayKanbanWatchersMixin:
         # task is archived lets the cursor (advanced atomically by
         # claim_unseen_events_for_sub) handle dedup, and any retry-loop
         # event reaches the user.
-        # Per-subscription send-failure counter. Adapter.send raising
-        # means the chat is dead (deleted, bot kicked, etc.) — after N
-        # consecutive send failures the sub is dropped so we don't spin
-        # against a dead chat every 5 seconds forever.
-        # Raised from 3 to 12 (~60s at the 5s tick cadence): now that a
-        # reported SendResult(success=False) also lands here (see the
-        # delivery loop below), a transient Telegram/API outage of a few
-        # ticks must NOT permanently unsubscribe a live review-gate channel.
-        # A genuinely dead chat still drops, just ~60s later — a fine trade
-        # for an unattended gate where a false drop means silent work pileup.
+        # Per-subscription send-failure counter. It is diagnostic only: an
+        # outage must never delete the durable route back to the requester.
+        # Claims are always rewound and retried. At the threshold we log a
+        # high-signal alert, then keep retrying at the normal watcher cadence;
+        # archive and explicit unsubscribe remain the only deletion paths.
         MAX_SEND_FAILURES = 12
         sub_fail_counts: dict[tuple, int] = getattr(
             self, "_kanban_sub_fail_counts", {}
@@ -505,6 +500,9 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            _kb.repair_mission_subscriptions(
+                                conn, notifier_profile=notifier_profile,
+                            )
                             subs = _kb.list_notify_subs(
                                 conn,
                                 notifier_profiles=notifier_profiles,
@@ -582,6 +580,95 @@ class GatewayKanbanWatchersMixin:
                     return deliveries
 
                 deliveries = await asyncio.to_thread(_collect)
+                # Coalesce simultaneous human blockers by destination. Fifteen
+                # parallel cards must produce one Action requise inbox message,
+                # not fifteen Telegram pings. Claims for every member advance
+                # only after the grouped send succeeds; one send failure rewinds
+                # them all for an exact retry on the next tick.
+                _action_groups: dict[tuple, list[dict]] = {}
+                for _delivery in deliveries:
+                    _blocked_events = [
+                        _event for _event in _delivery.get("events", [])
+                        if _event.kind in {"blocked", "block_loop_detected", "gave_up"}
+                    ]
+                    if not _blocked_events:
+                        continue
+                    _sub = _delivery["sub"]
+                    _action_key = (
+                        (_sub.get("platform") or "").lower(),
+                        _sub.get("chat_id") or "",
+                        _sub.get("thread_id") or "",
+                        _sub.get("notifier_profile") or "",
+                    )
+                    _action_groups.setdefault(_action_key, []).append(_delivery)
+                _grouped_ids: set[int] = set()
+                for _action_key, _members in _action_groups.items():
+                    if len(_members) < 2:
+                        continue
+                    _platform_name, _chat_id, _thread_id, _profile = _action_key
+                    try:
+                        _plat = _Platform(_platform_name)
+                        _adapter = self._authorization_adapter(_plat, _profile or None)
+                        if _adapter is None:
+                            raise RuntimeError("adapter disconnected")
+                        _lines = [
+                            f"🚨 Action requise — {len(_members)} tâches en attente"
+                        ]
+                        for _index, _member in enumerate(_members, 1):
+                            _task = _member.get("task")
+                            _event = next(
+                                event for event in _member["events"]
+                                if event.kind in {"blocked", "block_loop_detected", "gave_up"}
+                            )
+                            _reason = "une décision est nécessaire pour continuer"
+                            if _event.payload and _event.payload.get("reason"):
+                                _reason = _GATE_PREFIX_RE.sub(
+                                    "", str(_event.payload["reason"])[:220]
+                                ).strip() or _reason
+                            elif _event.payload and _event.payload.get("error"):
+                                _reason = str(_event.payload["error"])[:220].strip() or _reason
+                            _title = (_task.title if _task else _member["sub"]["task_id"])[:100]
+                            _lines.append(f"{_index}. {_title} — {_reason}")
+                        _lines.append(
+                            "Répondez avec le numéro et l'action demandée ; "
+                            "les autres tâches continuent automatiquement."
+                        )
+                        _group_send = await _adapter.send(
+                            _chat_id,
+                            "\n".join(_lines),
+                            metadata={"thread_id": _thread_id} if _thread_id else None,
+                        )
+                        if getattr(_group_send, "success", True) is False:
+                            raise RuntimeError(
+                                getattr(_group_send, "error", None) or "group send failed"
+                            )
+                        for _member in _members:
+                            await asyncio.to_thread(
+                                self._kanban_advance,
+                                _member["sub"],
+                                _member["cursor"],
+                                _member.get("board"),
+                            )
+                            _grouped_ids.add(id(_member))
+                    except Exception as _group_error:
+                        logger.warning(
+                            "kanban notifier: grouped action inbox delivery failed: %s",
+                            _group_error,
+                        )
+                        for _member in _members:
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                _member["sub"],
+                                _member["cursor"],
+                                _member.get("old_cursor", 0),
+                                _member.get("board"),
+                            )
+                            _grouped_ids.add(id(_member))
+                if _grouped_ids:
+                    deliveries = [
+                        _delivery for _delivery in deliveries
+                        if id(_delivery) not in _grouped_ids
+                    ]
                 for d in deliveries:
                     sub = d["sub"]
                     task = d["task"]
@@ -961,25 +1048,22 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, fails,
                                 MAX_SEND_FAILURES, exc,
                             )
-                            if fails >= MAX_SEND_FAILURES:
-                                logger.warning(
-                                    "kanban notifier: dropping subscription "
-                                    "%s on %s after %d consecutive send failures",
+                            if fails == MAX_SEND_FAILURES:
+                                logger.error(
+                                    "kanban notifier: delivery remains unavailable "
+                                    "for %s on %s after %d attempts; preserving the "
+                                    "subscription and retrying until delivery",
                                     sub["task_id"], platform_str, fails,
                                 )
-                                await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                sub_fail_counts.pop(sub_key, None)
-                            else:
-                                await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    board_slug,
-                                )
-                            # Rewind the pre-send claim on transient failure so
-                            # a later tick can retry. After too many failures,
-                            # dropping the subscription is the terminal action.
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
+                            )
+                            # Rewind every failed claim: no outage, however
+                            # long, is allowed to turn into a lost notification.
                             break
                     else:
                         # All text pings delivered (or intentionally skipped
@@ -1090,25 +1174,21 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], fails,
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
-                                if fails >= MAX_SEND_FAILURES:
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive wake failures",
-                                        sub["task_id"], platform_str, fails,
+                                if fails == MAX_SEND_FAILURES:
+                                    logger.error(
+                                        "kanban notifier: wake remains unavailable "
+                                        "for %s after %d attempts; preserving route",
+                                        sub["task_id"], fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the self-post — the event
-                                    # is NOT lost.
-                                    await asyncio.to_thread(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
-                                    )
+                                # Rewind the pre-send claim so the next tick
+                                # retries; the event and route are never lost.
+                                await asyncio.to_thread(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
                                 continue
 
                         async def _push_wake() -> None:
@@ -1190,25 +1270,22 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], fails,
                                     MAX_SEND_FAILURES, _wk_err, exc_info=True,
                                 )
-                                if fails >= MAX_SEND_FAILURES:
-                                    logger.warning(
-                                        "kanban notifier: dropping subscription "
-                                        "%s on %s after %d consecutive wake failures",
-                                        sub["task_id"], platform_str, fails,
+                                if fails == MAX_SEND_FAILURES:
+                                    logger.error(
+                                        "kanban notifier: wake-only delivery remains "
+                                        "unavailable for %s after %d attempts; "
+                                        "preserving route",
+                                        sub["task_id"], fails,
                                     )
-                                    await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
-                                    sub_fail_counts.pop(sub_key, None)
-                                else:
-                                    # Rewind the pre-send claim so the next
-                                    # tick retries the wake — the event is
-                                    # NOT lost.
-                                    await asyncio.to_thread(
-                                        self._kanban_rewind,
-                                        sub,
-                                        d["cursor"],
-                                        d.get("old_cursor", 0),
-                                        board_slug,
-                                    )
+                                # Rewind the pre-send claim so the next tick
+                                # retries; the event and route are never lost.
+                                await asyncio.to_thread(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
                                 continue
 
                         # Delivery complete (text ping for push adapters, wake
@@ -1276,6 +1353,9 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
             )
+            _task = _kb.get_task(conn, sub["task_id"])
+            if _task is not None and _task.status == "done":
+                _kb.mark_task_delivered(conn, sub["task_id"])
         finally:
             conn.close()
 

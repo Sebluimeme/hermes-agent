@@ -604,6 +604,54 @@ def test_simple_route_never_probes_a_more_capable_lane_when_spark_is_green():
     assert probed == ["spark"]
 
 
+def test_parallel_complex_routes_preserve_coder_until_third_independent_task():
+    green = lambda route: (True, "green")
+    routes, _ = kb.resolve_parallel_routes("complex", 1, preflight_fn=green)
+    assert routes == [("claude2", None)]
+    routes, _ = kb.resolve_parallel_routes("complex", 2, preflight_fn=green)
+    assert routes == [("claude2", None), ("claude1", None)]
+    routes, _ = kb.resolve_parallel_routes("complex", 3, preflight_fn=green)
+    assert routes == [("claude2", None), ("claude1", None), ("coder", None)]
+
+
+def test_parallel_complex_routes_use_coder_when_a_claude_is_unavailable():
+    def preflight(route):
+        return (route != "claude2", "green" if route != "claude2" else "quota")
+
+    routes, _ = kb.resolve_parallel_routes("complex", 2, preflight_fn=preflight)
+    assert routes == [("claude1", None), ("coder", None)]
+
+
+def test_unknown_claude_measurement_preserves_claude_instead_of_opening_coder():
+    def preflight(route):
+        if route == "claude2":
+            return False, "provider_cooldown"
+        if route == "claude1":
+            return False, "quota_preflight_required"
+        return True, "green"
+
+    assignee, _, _ = kb.resolve_ordered_route("complex", preflight_fn=preflight)
+    assert assignee == "claude1"
+    routes, _ = kb.resolve_parallel_routes("complex", 2, preflight_fn=preflight)
+    assert routes == [("claude1", None), ("coder", None)]
+
+
+def test_opus_is_a_claude_only_per_task_override(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="explicit opus", assignee="claude2",
+            model_override=kb.CLAUDE_OPUS_MODEL,
+        )
+        assert kb.get_task(conn, task_id).model_override == kb.CLAUDE_OPUS_MODEL
+        with pytest.raises(ValueError, match="Opus"):
+            kb.create_task(
+                conn, title="invalid opus", assignee="coder",
+                model_override=kb.CLAUDE_OPUS_MODEL,
+            )
+        with pytest.raises(ValueError, match="Opus"):
+            kb.create_task(conn, title="unassigned opus", model_override=kb.CLAUDE_OPUS_MODEL)
+
+
 def test_dispatches_three_independent_workspaces_to_distinct_executors(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
@@ -685,6 +733,155 @@ def test_dispatch_once_applies_routing_tier_chain_to_unassigned_ready_task(kanba
         ).fetchall()
         payloads = [json.loads(e["payload"]) for e in events]
         assert any(p.get("source") == "routing_tier_chain" for p in payloads)
+
+
+def test_fifteen_direct_tasks_finish_in_capacity_waves(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Permanent load canary: direct creates use all three complex lanes."""
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True, exist_ok=True)
+    routing.write_text(json.dumps({"agent_cooldowns": {
+        "claude2": {"dispatch_allowed": True, "preflight_required": False},
+        "claude1": {"dispatch_allowed": True, "preflight_required": False},
+    }}))
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    monkeypatch.setattr(kb, "claude2_oauth_dispatch_guard", lambda *_args: False)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    spawned_profiles = []
+
+    def spawn(task, _workspace, **_kwargs):
+        spawned_profiles.append(task.assignee)
+        return 80_000 + len(spawned_profiles)
+
+    with kb.connect() as conn:
+        task_ids = [
+            kb.create_task(conn, title=f"batch-{index}", routing_tier="complex")
+            for index in range(15)
+        ]
+        for _wave in range(5):
+            result = kb.dispatch_once(
+                conn,
+                spawn_fn=spawn,
+                max_spawn=3,
+                max_in_progress_per_profile=1,
+            )
+            assert len(result.spawned) == 3
+            for task_id, _profile, _workspace in result.spawned:
+                assert kb.complete_task(
+                    conn,
+                    task_id,
+                    summary="verified batch unit",
+                    metadata={"tests_run": ["batch-canary"]},
+                )
+        assert {kb.get_task(conn, task_id).status for task_id in task_ids} == {"done"}
+    assert len(spawned_profiles) == 15
+    assert set(spawned_profiles) == {"claude2", "claude1", "coder"}
+
+
+def test_mission_tracks_action_completion_and_delivery(kanban_home):
+    with kb.connect() as conn:
+        mission_id = kb.ensure_mission(
+            conn,
+            title="mission",
+            request_text="do all work",
+            idempotency_key="telegram:one-message",
+            origin={"platform": "telegram", "chat_id": "42", "message_id": "7"},
+            session_id="session-7",
+        )
+        assert mission_id == kb.ensure_mission(
+            conn,
+            title="duplicate",
+            request_text="duplicate",
+            idempotency_key="telegram:one-message",
+        )
+        task_id = kb.create_task(conn, title="unit", mission_id=mission_id)
+        assert kb.block_task(conn, task_id, reason="choose account", kind="needs_input")
+        mission = conn.execute(
+            "SELECT status FROM missions WHERE id = ?", (mission_id,)
+        ).fetchone()
+        assert mission["status"] == "action_required"
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM human_actions WHERE task_id = ? AND status = 'open'",
+            (task_id,),
+        ).fetchone()["n"] == 1
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="done",
+            metadata={"evidence": {"kind": "test", "detail": "unit passed"}},
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.execution_status == "done"
+        assert task.verification_status == "verified"
+        assert task.delivery_status == "awaiting_delivery"
+        assert kb.mark_task_delivered(conn, task_id)
+        assert conn.execute(
+            "SELECT status FROM missions WHERE id = ?", (mission_id,)
+        ).fetchone()["status"] == "delivered"
+
+
+def test_mission_origin_repairs_missing_notification_subscription(kanban_home):
+    with kb.connect() as conn:
+        mission_id = kb.ensure_mission(
+            conn,
+            title="repair route",
+            request_text="notify me",
+            idempotency_key="repair-sub",
+            origin={
+                "platform": "telegram", "chat_id": "99",
+                "thread_id": "3", "message_id": "11", "user_id": "99",
+            },
+            session_id="origin-session",
+        )
+        task_id = kb.create_task(conn, title="unit", mission_id=mission_id)
+        assert kb.list_notify_subs(conn, task_id=task_id) == []
+        assert kb.repair_mission_subscriptions(conn, notifier_profile="default") == 1
+        sub = kb.list_notify_subs(conn, task_id=task_id)[0]
+        assert (sub["platform"], sub["chat_id"], sub["thread_id"]) == (
+            "telegram", "99", "3",
+        )
+        assert kb.repair_mission_subscriptions(conn, notifier_profile="default") == 0
+
+
+def test_backlog_queue_never_consumes_dispatch_capacity(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    with kb.connect() as conn:
+        active = kb.create_task(conn, title="active", assignee="coder")
+        backlog = kb.create_task(
+            conn, title="later", assignee="coder", queue_class="backlog",
+        )
+        result = kb.dispatch_once(conn, dry_run=True, max_spawn=3)
+        spawned = {row[0] for row in result.spawned}
+        assert active in spawned
+        assert backlog not in spawned
+
+
+def test_checkpoint_preserves_exact_session_for_transient_resume(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="resume", assignee="coder")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert kb.heartbeat_worker(
+            conn,
+            task_id,
+            note="tests complete, integration pending",
+            expected_run_id=run_id,
+            worker_session_id="worker-session-42",
+        )
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="temporary provider interruption",
+            kind="transient",
+            expected_run_id=run_id,
+        )
+        assert kb.unblock_task(conn, task_id)
+    assert kb._transient_resume_session_id(
+        task_id, board=kb.get_current_board(),
+    ) == "worker-session-42"
 
 
 def test_failed_simple_routes_advance_spark_then_claude_then_coder(kanban_home, all_assignees_spawnable):
@@ -782,7 +979,23 @@ def test_fallback_route_claude2_dead_moves_to_claude1(kanban_home, all_assignees
         task_id = kb.create_task(conn, title="work", assignee="claude2")
         assert kb.fallback_simple_route(conn, task_id, "claude2 quota exhausted") is True
         row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        assert row["assignee"] == "claude1"
+    assert row["assignee"] == "claude1"
+
+
+def test_opus_fallback_preserves_model_then_stops_before_coder(
+    kanban_home, all_assignees_spawnable,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="explicit opus", assignee="claude2",
+            model_override=kb.CLAUDE_OPUS_MODEL, routing_tier="complex",
+        )
+        assert kb.fallback_simple_route(conn, task_id, "quota exhausted") is True
+        row = kb.get_task(conn, task_id)
+        assert (row.assignee, row.model_override) == ("claude1", kb.CLAUDE_OPUS_MODEL)
+        assert kb.fallback_simple_route(conn, task_id, "quota exhausted") is False
+        row = kb.get_task(conn, task_id)
+        assert (row.assignee, row.model_override) == ("claude1", kb.CLAUDE_OPUS_MODEL)
 
 
 def test_fallback_route_both_claude_lanes_dead_moves_to_coder_with_one_event(

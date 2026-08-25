@@ -352,11 +352,16 @@ def decompose_task(
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
         assignee_val = None
         if not task.assignee:
-            assignee_val = _normalize_assignee_choice(
-                parsed.get("assignee"),
-                default_assignee=default_assignee,
-                valid_names=valid_names,
-            )
+            if kanban_cfg.get("generalist_worker_pool_routing"):
+                assignee_val, _model, _trace = kb.resolve_ordered_route(
+                    getattr(task, "routing_tier", None)
+                )
+            else:
+                assignee_val = _normalize_assignee_choice(
+                    parsed.get("assignee"),
+                    default_assignee=default_assignee,
+                    valid_names=valid_names,
+                )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
@@ -428,6 +433,41 @@ def decompose_task(
             "assignee": chosen,
             "parents": clean_parents,
         })
+
+    if kanban_cfg.get("generalist_worker_pool_routing"):
+        # Route each dependency wave independently. Siblings in the same wave
+        # can run together and are spread Claude2 -> Claude1 -> Coder (or
+        # Spark first for explicitly simple work); dependent waves wait.
+        depth_cache: dict[int, int] = {}
+
+        def _depth(idx: int, visiting: set[int]) -> int:
+            if idx in depth_cache:
+                return depth_cache[idx]
+            if idx in visiting:
+                raise ValueError("cyclic dependency detected")
+            parents = children[idx]["parents"]
+            value = 0 if not parents else 1 + max(
+                _depth(parent, visiting | {idx}) for parent in parents
+            )
+            depth_cache[idx] = value
+            return value
+
+        try:
+            depths = [_depth(idx, set()) for idx in range(len(children))]
+        except ValueError as exc:
+            return DecomposeOutcome(task_id, False, str(exc))
+        for depth in sorted(set(depths)):
+            indices = [idx for idx, value in enumerate(depths) if value == depth]
+            routes, _trace = kb.resolve_parallel_routes(
+                getattr(task, "routing_tier", None), len(indices)
+            )
+            for idx, (assignee, model_override) in zip(indices, routes):
+                children[idx]["assignee"] = assignee
+                children[idx]["routing_tier"] = kb.normalize_routing_tier(
+                    getattr(task, "routing_tier", None)
+                )
+                if model_override:
+                    children[idx]["model_override"] = model_override
 
     try:
         with kb.connect_closing() as conn:

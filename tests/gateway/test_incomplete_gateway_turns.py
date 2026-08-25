@@ -122,7 +122,7 @@ def _make_event() -> MessageEvent:
 
 
 @pytest.mark.asyncio
-async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, tmp_path):
+async def test_incomplete_codex_turn_is_visible_and_queues_bounded_recovery(monkeypatch, tmp_path):
     adapter = CaptureSlackAdapter()
     runner = _make_runner(adapter)
 
@@ -140,7 +140,12 @@ async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, 
     event = _make_event()
     await adapter._process_message_background(event, build_session_key(event.source))
 
-    assert adapter.sent == []
+    assert runner._run_agent.await_count == 2
+    assert len(adapter.sent) == 2
+    assert "reprends automatiquement" in adapter.sent[0]["content"]
+    assert "Action requise" in adapter.sent[1]["content"]
+    # Recovery is synchronous and bounded; no deferred work is left waiting.
+    assert build_session_key(event.source) not in adapter._pending_messages
     assert runner.session_store.update_session.called
 
     transcript_roles = [

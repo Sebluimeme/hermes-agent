@@ -1151,6 +1151,17 @@ class Task:
     # ``complex`` (fail-safe) via ``normalize_routing_tier`` — never trust an
     # unnormalized raw value from this field directly.
     routing_tier: Optional[str] = None
+    # Durable user-request envelope and code-driven lifecycle dimensions.
+    mission_id: Optional[str] = None
+    queue_class: str = "active"
+    preflight_status: str = "pending"
+    execution_status: str = "pending"
+    verification_status: str = "pending"
+    integration_status: str = "pending"
+    delivery_status: str = "pending"
+    last_checkpoint_at: Optional[int] = None
+    failure_class: Optional[str] = None
+    action_required: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1248,6 +1259,16 @@ class Task:
             routing_tier=(
                 row["routing_tier"] if "routing_tier" in keys and row["routing_tier"] else None
             ),
+            mission_id=row["mission_id"] if "mission_id" in keys else None,
+            queue_class=(row["queue_class"] if "queue_class" in keys and row["queue_class"] else "active"),
+            preflight_status=(row["preflight_status"] if "preflight_status" in keys and row["preflight_status"] else "pending"),
+            execution_status=(row["execution_status"] if "execution_status" in keys and row["execution_status"] else "pending"),
+            verification_status=(row["verification_status"] if "verification_status" in keys and row["verification_status"] else "pending"),
+            integration_status=(row["integration_status"] if "integration_status" in keys and row["integration_status"] else "pending"),
+            delivery_status=(row["delivery_status"] if "delivery_status" in keys and row["delivery_status"] else "pending"),
+            last_checkpoint_at=(row["last_checkpoint_at"] if "last_checkpoint_at" in keys else None),
+            failure_class=(row["failure_class"] if "failure_class" in keys else None),
+            action_required=(row["action_required"] if "action_required" in keys else None),
         )
 
 
@@ -1436,6 +1457,59 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
+    ,mission_id          TEXT
+    ,queue_class         TEXT NOT NULL DEFAULT 'active'
+    ,preflight_status    TEXT NOT NULL DEFAULT 'pending'
+    ,execution_status    TEXT NOT NULL DEFAULT 'pending'
+    ,verification_status TEXT NOT NULL DEFAULT 'pending'
+    ,integration_status  TEXT NOT NULL DEFAULT 'pending'
+    ,delivery_status     TEXT NOT NULL DEFAULT 'pending'
+    ,last_checkpoint_at  INTEGER
+    ,failure_class       TEXT
+    ,next_retry_at       INTEGER
+    ,action_required     TEXT
+);
+
+-- One durable envelope per user request. Cards are implementation details;
+-- the mission retains the original demand, global acceptance contract and
+-- the distinction between work completion and user delivery.
+CREATE TABLE IF NOT EXISTS missions (
+    id                 TEXT PRIMARY KEY,
+    title              TEXT NOT NULL,
+    request_text       TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'active',
+    acceptance_json    TEXT,
+    origin_platform    TEXT,
+    origin_chat_id     TEXT,
+    origin_thread_id   TEXT,
+    origin_message_id  TEXT,
+    origin_user_id     TEXT,
+    session_id         TEXT,
+    idempotency_key    TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    completed_at       INTEGER,
+    delivered_at       INTEGER,
+    last_error         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mission_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    mission_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    payload     TEXT,
+    created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS human_actions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    mission_id  TEXT,
+    task_id     TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    prompt      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'open',
+    created_at  INTEGER NOT NULL,
+    resolved_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1550,6 +1624,10 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_missions_idempotency
+    ON missions(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_mission_events        ON mission_events(mission_id, id);
+CREATE INDEX IF NOT EXISTS idx_human_actions_open    ON human_actions(status, mission_id, created_at);
 """
 
 
@@ -2713,6 +2791,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # route rather than silently downgrading to the cheap one.
         _add_column_if_missing(conn, "tasks", "routing_tier", "routing_tier TEXT")
 
+    _mission_columns = (
+        ("mission_id", "mission_id TEXT"),
+        ("queue_class", "queue_class TEXT NOT NULL DEFAULT 'active'"),
+        ("preflight_status", "preflight_status TEXT NOT NULL DEFAULT 'pending'"),
+        ("execution_status", "execution_status TEXT NOT NULL DEFAULT 'pending'"),
+        ("verification_status", "verification_status TEXT NOT NULL DEFAULT 'pending'"),
+        ("integration_status", "integration_status TEXT NOT NULL DEFAULT 'pending'"),
+        ("delivery_status", "delivery_status TEXT NOT NULL DEFAULT 'pending'"),
+        ("last_checkpoint_at", "last_checkpoint_at INTEGER"),
+        ("failure_class", "failure_class TEXT"),
+        ("next_retry_at", "next_retry_at INTEGER"),
+        ("action_required", "action_required TEXT"),
+    )
+    for _column_name, _column_ddl in _mission_columns:
+        if _column_name not in cols:
+            _add_column_if_missing(conn, "tasks", _column_name, _column_ddl)
+
     # Never backfill historical PIDs: without a captured process start
     # identity, a PID is not sufficient authority to stop a process safely.
     from hermes_cli import worker_contracts as _worker_contracts
@@ -2732,6 +2827,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+    _index_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if {"mission_id", "status"} <= _index_cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_mission ON tasks(mission_id, status)"
+        )
+    if {"queue_class", "status"} <= _index_cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_class, status)"
+        )
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -3171,6 +3275,10 @@ def _new_task_id() -> str:
     return "t_" + secrets.token_hex(4)
 
 
+def _new_mission_id() -> str:
+    return "m_" + secrets.token_hex(6)
+
+
 def _claimer_id() -> str:
     """Return a ``host:pid`` string that identifies this claimer."""
     import socket
@@ -3192,6 +3300,116 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def ensure_mission(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    request_text: str,
+    idempotency_key: Optional[str] = None,
+    acceptance: Optional[dict] = None,
+    origin: Optional[dict] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """Create or reuse the durable envelope for one user request."""
+    if idempotency_key:
+        row = conn.execute(
+            "SELECT id FROM missions WHERE idempotency_key = ?", (idempotency_key,)
+        ).fetchone()
+        if row:
+            return str(row["id"])
+    now = int(time.time())
+    origin = origin or {}
+    mission_id = _new_mission_id()
+    with write_txn(conn, allow_nested=True):
+        try:
+            conn.execute(
+                """
+                INSERT INTO missions (
+                    id, title, request_text, status, acceptance_json,
+                    origin_platform, origin_chat_id, origin_thread_id,
+                    origin_message_id, origin_user_id, session_id,
+                    idempotency_key, created_at, updated_at
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mission_id, title.strip()[:300], request_text.strip(),
+                    json.dumps(acceptance, ensure_ascii=False) if acceptance else None,
+                    origin.get("platform"), origin.get("chat_id"),
+                    origin.get("thread_id"), origin.get("message_id"),
+                    origin.get("user_id"), session_id, idempotency_key, now, now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO mission_events (mission_id, kind, payload, created_at) "
+                "VALUES (?, 'created', ?, ?)",
+                (
+                    mission_id,
+                    json.dumps({"title": title.strip()[:300]}, ensure_ascii=False),
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            if idempotency_key:
+                row = conn.execute(
+                    "SELECT id FROM missions WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if row:
+                    return str(row["id"])
+            raise
+    return mission_id
+
+
+def _refresh_mission_status(conn: sqlite3.Connection, mission_id: Optional[str]) -> None:
+    """Derive mission state from its cards inside the caller's transaction."""
+    if not mission_id:
+        return
+    rows = conn.execute(
+        "SELECT status, delivery_status FROM tasks WHERE mission_id = ? "
+        "AND queue_class = 'active'",
+        (mission_id,),
+    ).fetchall()
+    if not rows:
+        return
+    statuses = {str(row["status"]) for row in rows}
+    now = int(time.time())
+    if statuses & {"blocked", "triage"}:
+        status, completed_at, delivered_at = "action_required", None, None
+    elif statuses <= {"done", "archived"}:
+        delivered = all(row["delivery_status"] == "delivered" for row in rows)
+        status = "delivered" if delivered else "completed"
+        completed_at = now
+        delivered_at = now if delivered else None
+    else:
+        status, completed_at, delivered_at = "active", None, None
+    conn.execute(
+        "UPDATE missions SET status = ?, updated_at = ?, "
+        "completed_at = COALESCE(completed_at, ?), "
+        "delivered_at = COALESCE(delivered_at, ?) WHERE id = ?",
+        (status, now, completed_at, delivered_at, mission_id),
+    )
+
+
+def mark_task_delivered(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Record the distinct delivery phase after a successful notification."""
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT mission_id, delivery_status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        if row["delivery_status"] == "delivered":
+            return True
+        conn.execute(
+            "UPDATE tasks SET delivery_status = 'delivered' WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(conn, task_id, "delivered", {"delivered_at": now})
+        _refresh_mission_status(conn, row["mission_id"])
+    return True
 
 
 def create_task(
@@ -3223,6 +3441,12 @@ def create_task(
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     routing_tier: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    mission_key: Optional[str] = None,
+    mission_request: Optional[str] = None,
+    mission_origin: Optional[dict] = None,
+    acceptance: Optional[dict] = None,
+    queue_class: str = "active",
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3276,6 +3500,9 @@ def create_task(
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     routing_tier = (routing_tier or "").strip().lower() or None
+    queue_class = (queue_class or "active").strip().lower()
+    if queue_class not in {"active", "backlog", "recurring", "idea"}:
+        raise ValueError("queue_class must be active, backlog, recurring, or idea")
     if routing_tier is not None and routing_tier not in VALID_ROUTING_TIERS:
         raise ValueError(f"routing_tier must be one of {sorted(VALID_ROUTING_TIERS)}, got {routing_tier!r}")
     audit_text = f"{title or ''}\n{body or ''}".casefold()
@@ -3287,6 +3514,7 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    _validate_opus_assignment(model_override, assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3405,6 +3633,29 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+
+    # Child cards inherit their parent's mission. Top-level gateway cards use
+    # the platform message id as an idempotent mission key, so fifteen create
+    # calls for one request stay attached to one user-visible outcome.
+    if mission_id is None and parents:
+        _parent_mission = conn.execute(
+            "SELECT mission_id FROM tasks WHERE id IN ("
+            + ",".join("?" * len(parents))
+            + ") AND mission_id IS NOT NULL ORDER BY created_at ASC LIMIT 1",
+            parents,
+        ).fetchone()
+        if _parent_mission:
+            mission_id = _parent_mission["mission_id"]
+    if mission_id is None and mission_key:
+        mission_id = ensure_mission(
+            conn,
+            title=title,
+            request_text=mission_request or body or title,
+            idempotency_key=mission_key,
+            acceptance=acceptance,
+            origin=mission_origin,
+            session_id=session_id,
+        )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3556,7 +3807,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, routing_tier
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        , mission_id, queue_class
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3583,6 +3835,8 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         routing_tier,
+                        mission_id,
+                        queue_class,
                     ),
                 )
                 for pid in parents:
@@ -3612,8 +3866,11 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "routing_tier": routing_tier,
+                        "mission_id": mission_id,
+                        "queue_class": queue_class,
                     },
                 )
+                _refresh_mission_status(conn, mission_id)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -3823,12 +4080,13 @@ def set_model_override(
         provider = None
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
         if row["status"] == "archived":
             raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        _validate_opus_assignment(model, row["assignee"])
         conn.execute(
             "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
             (model, provider, task_id),
@@ -4502,6 +4760,25 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    _existing_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    try:
+        _existing_metadata = (
+            json.loads(_existing_row["metadata"] or "{}")
+            if _existing_row else {}
+        )
+    except (TypeError, json.JSONDecodeError):
+        _existing_metadata = {}
+    if not isinstance(_existing_metadata, dict):
+        _existing_metadata = {}
+    if isinstance(metadata, dict):
+        _existing_metadata.update(metadata)
+    _checkpoint = _existing_metadata.get("checkpoint")
+    if isinstance(_checkpoint, dict):
+        _checkpoint["state"] = outcome
+        _checkpoint["closed_at"] = now
+    _closed_metadata = _existing_metadata or None
     conn.execute(
         """
         UPDATE task_runs
@@ -4522,7 +4799,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(_closed_metadata, ensure_ascii=False) if _closed_metadata else None,
             now,
             run_id,
         ),
@@ -4836,7 +5113,11 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   preflight_status = 'passed',
+                   execution_status = 'running',
+                   next_retry_at = NULL,
+                   action_required = NULL
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
@@ -4874,6 +5155,11 @@ def claim_task(
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
+        )
+        _append_event(
+            conn, task_id, "preflight_passed",
+            {"checks": ["dependencies", "profile", "quota", "capacity"]},
+            run_id=run_id,
         )
         _append_event(
             conn, task_id, "claimed",
@@ -4936,7 +5222,11 @@ def claim_review_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   preflight_status = 'passed',
+                   execution_status = 'reviewing',
+                   next_retry_at = NULL,
+                   action_required = NULL
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
@@ -4972,6 +5262,11 @@ def claim_review_task(
         conn.execute(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
+        )
+        _append_event(
+            conn, task_id, "preflight_passed",
+            {"checks": ["dependencies", "reviewer_profile", "quota", "capacity"]},
+            run_id=run_id,
         )
         _append_event(
             conn, task_id, "claimed",
@@ -5590,7 +5885,7 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, workspace_kind, mission_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
@@ -5605,7 +5900,11 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       execution_status = 'done',
+                       delivery_status = 'awaiting_delivery',
+                       failure_class = NULL,
+                       action_required = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """,
@@ -5622,7 +5921,11 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       execution_status = 'done',
+                       delivery_status = 'awaiting_delivery',
+                       failure_class = NULL,
+                       action_required = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
@@ -5683,6 +5986,7 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        _verified = False
         try:
             from hermes_cli.closure_evidence import classify_closure_evidence
 
@@ -5691,12 +5995,31 @@ def complete_task(
                 metadata=metadata if isinstance(metadata, dict) else None,
             )
             if closure_evidence.satisfied:
+                _verified = True
                 completed_payload["evidence"] = {
                     "kind": closure_evidence.kind,
                     "detail": closure_evidence.detail,
                 }
         except Exception:
             pass
+        _completion_meta = metadata if isinstance(metadata, dict) else {}
+        _integrated = any(
+            _completion_meta.get(key)
+            for key in ("commit_sha", "commit", "merged", "pushed", "pr_url")
+        )
+        conn.execute(
+            "UPDATE tasks SET verification_status = ?, integration_status = ? "
+            "WHERE id = ?",
+            (
+                "verified" if _verified else "unverified",
+                "integrated" if _integrated else (
+                    "not_required"
+                    if prior and prior["workspace_kind"] == "scratch"
+                    else "pending"
+                ),
+                task_id,
+            ),
+        )
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -5718,6 +6041,12 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        conn.execute(
+            "UPDATE human_actions SET status = 'resolved', resolved_at = ? "
+            "WHERE task_id = ? AND status = 'open'",
+            (now, task_id),
+        )
+        _refresh_mission_status(conn, prior["mission_id"] if prior else None)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -6455,7 +6784,7 @@ def block_task(
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            "SELECT status, block_kind, block_recurrences, mission_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if cur_row is None:
@@ -6485,7 +6814,9 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
-                       block_kind    = ?
+                       block_kind    = ?,
+                       execution_status = 'waiting_dependency',
+                       failure_class = 'dependency'
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
@@ -6544,12 +6875,15 @@ def block_task(
                        claim_expires = NULL,
                        worker_pid    = NULL,
                        block_kind    = ?,
-                       block_recurrences = ?
+                       block_recurrences = ?,
+                       execution_status = 'blocked',
+                       failure_class = ?,
+                       action_required = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                (kind, recurrences, kind, reason, task_id) if expected_run_id is None
+                else (kind, recurrences, kind, reason, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -6584,11 +6918,14 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?
+                           block_recurrences = ?,
+                           execution_status = 'blocked',
+                           failure_class = ?,
+                           action_required = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, task_id),
+                    (kind, recurrences, kind, reason, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -6599,12 +6936,15 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
-                           block_recurrences = ?
+                           block_recurrences = ?,
+                           execution_status = 'blocked',
+                           failure_class = ?,
+                           action_required = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    (kind, recurrences, kind, reason, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -6632,6 +6972,17 @@ def block_task(
                 },
                 run_id=run_id,
             )
+        conn.execute(
+            "INSERT INTO human_actions "
+            "(mission_id, task_id, kind, prompt, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'open', ?)",
+            (
+                cur_row["mission_id"], task_id, kind or "needs_input",
+                reason or "Une intervention humaine est nécessaire.",
+                int(time.time()),
+            ),
+        )
+        _refresh_mission_status(conn, cur_row["mission_id"])
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -7073,7 +7424,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, mission_id FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         resume_status = (
@@ -7104,7 +7455,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "execution_status = 'pending', failure_class = NULL, "
+            "action_required = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -7118,6 +7471,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 else None
             ),
         )
+        conn.execute(
+            "UPDATE human_actions SET status = 'resolved', resolved_at = ? "
+            "WHERE task_id = ? AND status = 'open'",
+            (now, task_id),
+        )
+        _refresh_mission_status(conn, current["mission_id"] if current else None)
         return True
 
 
@@ -7620,6 +7979,8 @@ def decompose_triage_task(
             title = child["title"].strip()
             body = child.get("body")
             assignee = _canonical_assignee(child.get("assignee"))
+            child_model = (child.get("model_override") or "").strip() or None
+            _validate_opus_assignment(child_model, assignee)
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -7644,8 +8005,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, model_override, routing_tier) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7656,6 +8017,8 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    child_model,
+                    normalize_routing_tier(child.get("routing_tier")),
                 ),
             )
             _append_event(
@@ -8249,6 +8612,16 @@ DEFAULT_ROUTING_TIER = ROUTING_TIER_COMPLEX
 # conversational orchestrator and must never be auto-selected as a writer.
 SPARK_MODEL_OVERRIDE = "gpt-5.3-codex-spark"
 CODER_MODEL_OVERRIDE = None
+CLAUDE_OPUS_MODEL = "claude-opus-5"
+
+
+def _validate_opus_assignment(model: Optional[str], assignee: Optional[str]) -> None:
+    """Keep Opus an explicit, per-card Claude-only exception."""
+    if model and "opus" in model.casefold() and assignee not in {"claude1", "claude2"}:
+        raise ValueError(
+            "Opus is a per-task override restricted to an explicitly assigned "
+            "claude1 or claude2 card"
+        )
 
 
 def normalize_routing_tier(value: Optional[str]) -> str:
@@ -8309,7 +8682,9 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
                     if (time.time() if now is None else now) < deadline:
                         return (False, record.get("reason") or "provider_cooldown")
                     return (True, "cooldown_expired")
-            return (False, record.get("reason") or "provider_cooldown")
+            # Unknown Codex quota is not evidence of unavailability. Only a
+            # real, future cooldown blocks this fail-open fallback lane.
+            return (True, record.get("reason") or "measurement_unknown_fail_open")
         return (True, "fail_open_last_resort")
     return (False, f"unknown_route:{route}")
 
@@ -8361,12 +8736,55 @@ def resolve_ordered_route(
             "ok": ok,
             "reason": reason,
         })
-        if ok:
+        # Unknown Claude measurement is not proof of provider failure. Keep
+        # the preferred Claude assignment so the quota preflight can refresh
+        # it; do not open Coder merely because telemetry is absent/stale.
+        eligible = ok or reason in {"quota_measurement_unknown", "quota_preflight_required"}
+        if eligible:
             return chain_assignee, chain_model, trace
     # Unreachable in practice -- Coder fails open above -- but kept
     # as an explicit, honest terminal state instead of an implicit default.
     _, last_assignee, last_model = chain[-1]
     return last_assignee, last_model, trace
+
+
+def resolve_parallel_routes(
+    routing_tier: Optional[str],
+    task_count: int,
+    *,
+    preflight_fn: Callable[[str], "tuple[bool, str]"] = route_preflight_ok,
+) -> "tuple[list[tuple[str, Optional[str]]], list[dict]]":
+    """Select distinct workers for one independent wave of work.
+
+    Coder is selected as a third complex lane only when a third independent
+    task exists; otherwise it remains preserved as the Claude fallback.
+    """
+    if task_count <= 0:
+        return [], []
+    tier = normalize_routing_tier(routing_tier)
+    roles = (
+        ("spark", "claude2", "claude1", "coder")
+        if tier == ROUTING_TIER_SIMPLE
+        else ("claude2", "claude1", "coder")
+    )
+    selected: list[tuple[str, Optional[str]]] = []
+    trace: list[dict] = []
+    for role in roles:
+        ok, reason = preflight_fn(role)
+        trace.append({"route": role, "ok": ok, "reason": reason})
+        eligible = ok or reason in {"quota_measurement_unknown", "quota_preflight_required"}
+        if eligible:
+            selected.append((
+                role,
+                SPARK_MODEL_OVERRIDE if role == "spark" else (
+                    CODER_MODEL_OVERRIDE if role == "coder" else None
+                ),
+            ))
+        if len(selected) >= min(task_count, 3):
+            break
+    if not selected:
+        selected = [("coder", CODER_MODEL_OVERRIDE)]
+    return [selected[i % len(selected)] for i in range(task_count)], trace
 
 
 def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None) -> Optional[str]:
@@ -8990,6 +9408,7 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    worker_session_id: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -9011,15 +9430,15 @@ def heartbeat_worker(
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
+                "UPDATE tasks SET last_heartbeat_at = ?, last_checkpoint_at = ? "
                 "WHERE id = ? AND status = 'running'",
-                (now, task_id),
+                (now, now, task_id),
             )
         else:
             cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
+                "UPDATE tasks SET last_heartbeat_at = ?, last_checkpoint_at = ? "
                 "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
+                (now, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -9032,6 +9451,39 @@ def heartbeat_worker(
             conn.execute(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
                 (now, run_id),
+            )
+            # Keep a structured, restart-safe checkpoint on the active run.
+            # This is written by the runtime heartbeat bridge, not left to the
+            # model's memory, so a quota exit/crash can resume the exact worker
+            # session and inspect the last known phase instead of starting at
+            # zero. Merge with existing handoff metadata to preserve callers'
+            # fields.
+            _meta_row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            try:
+                _run_meta = json.loads(_meta_row["metadata"] or "{}") if _meta_row else {}
+            except (TypeError, json.JSONDecodeError):
+                _run_meta = {}
+            if not isinstance(_run_meta, dict):
+                _run_meta = {}
+            _checkpoint = _run_meta.get("checkpoint")
+            if not isinstance(_checkpoint, dict):
+                _checkpoint = {}
+            _checkpoint.update({
+                "recorded_at": now,
+                "state": "running",
+            })
+            if clean_note:
+                _checkpoint["note"] = clean_note
+            _session = (worker_session_id or "").strip()
+            if _session:
+                _checkpoint["worker_session_id"] = _session
+                _run_meta["worker_session_id"] = _session
+            _run_meta["checkpoint"] = _checkpoint
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(_run_meta, ensure_ascii=False), run_id),
             )
         _append_event(
             conn, task_id, "heartbeat",
@@ -9227,8 +9679,8 @@ def enforce_max_runtime(
 
 # Heartbeat staleness heartbeat gap — if a running task hasn't sent a
 # heartbeat in this many seconds it's considered inactive regardless of
-# the ``dispatch_stale_timeout_seconds`` threshold.  Hardcoded at 1 hour
-# to match the original spec (">4h started + no commits in 1h").
+# the ``dispatch_stale_timeout_seconds`` threshold. The effective gap below
+# is tightened with the configured stale timeout, with a five-minute floor.
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
@@ -9286,7 +9738,11 @@ def detect_stale_running(
 
         last_hb = row["last_heartbeat_at"]
         hb_age = (now - int(last_hb)) if last_hb is not None else None
-        if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+        heartbeat_gap = min(
+            _STALE_HEARTBEAT_GAP_SECONDS,
+            max(300, int(stale_timeout_seconds)),
+        )
+        if hb_age is not None and hb_age < heartbeat_gap:
             continue  # recent heartbeat → still alive
 
         pid = row["worker_pid"]
@@ -9776,6 +10232,9 @@ def fallback_simple_route(
     # writer, so a final Coder relay can only cite the Claude attempt that failed.
     capture_claude_provider_reset(conn, task_id, error)
     idx = chain.index(current_role)
+    is_opus = bool(row["model_override"] and "opus" in row["model_override"].casefold())
+    if is_opus and current_role == "claude1":
+        return False  # an explicit Opus task may not degrade to Coder/Sonnet
     if idx + 1 >= len(chain):
         return False  # already on the last hop (Coder) -- nothing further to try
     next_role = chain[idx + 1]
@@ -9809,6 +10268,10 @@ def fallback_simple_route(
         )
         return True
     next_assignee, next_model = resolved
+    if is_opus:
+        if next_role != "claude1":
+            return False
+        next_model = row["model_override"]
     conn.execute(
         "UPDATE tasks SET assignee = ?, model_override = ?, provider_override = NULL, "
         "consecutive_failures = 0, last_failure_error = ? WHERE id = ?",
@@ -10235,7 +10698,7 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, mission_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -10348,6 +10811,31 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+        _retry_at = None if blocked else int(time.time()) + min(
+            900, 30 * (2 ** max(0, failures - 1))
+        )
+        conn.execute(
+            "UPDATE tasks SET failure_class = ?, execution_status = ?, "
+            "preflight_status = CASE WHEN ? = 'spawn_failed' THEN 'failed' "
+            "ELSE preflight_status END, next_retry_at = ?, "
+            "action_required = ? WHERE id = ?",
+            (
+                outcome,
+                "blocked" if blocked else "retrying",
+                outcome,
+                _retry_at,
+                error[:500] if blocked else None,
+                task_id,
+            ),
+        )
+        if blocked:
+            conn.execute(
+                "INSERT INTO human_actions "
+                "(mission_id, task_id, kind, prompt, status, created_at) "
+                "VALUES (?, ?, 'execution_failure', ?, 'open', ?)",
+                (row["mission_id"], task_id, error[:500], int(time.time())),
+            )
+        _refresh_mission_status(conn, row["mission_id"])
     return blocked
 
 
@@ -11171,6 +11659,8 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee, routing_tier FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        "AND queue_class = 'active' "
+        "AND (next_retry_at IS NULL OR next_retry_at <= CAST(strftime('%s','now') AS INTEGER)) "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -11180,6 +11670,8 @@ def _dispatch_once_locked(
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
+            "AND queue_class = 'active' "
+            "AND (next_retry_at IS NULL OR next_retry_at <= CAST(strftime('%s','now') AS INTEGER)) "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
@@ -11263,6 +11755,35 @@ def _dispatch_once_locked(
     _tiered_routing_applies = _tiered_routing_enabled and (
         _default_assignee is None or _default_assignee in ("spark", "claude1", "claude2", "coder")
     )
+
+    # Route a whole ready wave as a wave, not as N unrelated first choices.
+    # Calling resolve_ordered_route independently for fifteen unassigned cards
+    # selected claude2 fifteen times and the per-profile cap then serialized
+    # the batch.  Build a deterministic capacity plan up front so independent
+    # work occupies the available lanes (up to the global concurrency cap)
+    # while retaining each tier's ordered/fail-safe eligibility rules.
+    _parallel_auto_routes: dict[str, tuple[str, Optional[str], list[dict]]] = {}
+    if _tiered_routing_applies:
+        for _wave_tier in (ROUTING_TIER_SIMPLE, ROUTING_TIER_COMPLEX):
+            _wave_rows = [
+                _row for _row in ready_rows
+                if not _row["assignee"]
+                and normalize_routing_tier(
+                    _row["routing_tier"]
+                    if "routing_tier" in _row.keys() else None
+                ) == _wave_tier
+            ]
+            _routes, _wave_trace = resolve_parallel_routes(
+                _wave_tier, len(_wave_rows)
+            )
+            for _wave_row, (_route_assignee, _route_model) in zip(
+                _wave_rows, _routes
+            ):
+                _parallel_auto_routes[_wave_row["id"]] = (
+                    _route_assignee,
+                    _route_model,
+                    _wave_trace,
+                )
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -11279,8 +11800,12 @@ def _dispatch_once_locked(
             # by ``kanban.default_assignee``, not "unassigned but secretly
             # routed".
             if _tiered_routing_applies:
-                _tier_assignee, _tier_model, _tier_trace = resolve_ordered_route(
-                    row["routing_tier"] if "routing_tier" in row.keys() else None
+                _tier_assignee, _tier_model, _tier_trace = _parallel_auto_routes.get(
+                    row["id"],
+                    resolve_ordered_route(
+                        row["routing_tier"]
+                        if "routing_tier" in row.keys() else None
+                    ),
                 )
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
@@ -11300,6 +11825,7 @@ def _dispatch_once_locked(
                                     "assignee": _tier_assignee,
                                     "model_override": _tier_model,
                                     "source": "routing_tier_chain",
+                                    "wave_routed": True,
                                     "trace": _tier_trace,
                                 },
                             )
@@ -11924,22 +12450,32 @@ _retagged_workspace_roots: set[str] = set()
 
 
 def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optional[str]:
-    """Return the immediately preceding transient worker session, if reusable.
+    """Return the immediately preceding resumable worker session.
 
-    Deliberate human blocks, crashes, and any intervening run keep the current
-    fresh-worker handoff behavior. Only a just-unblocked ``transient`` block is
-    a safe continuation of the exact worker conversation.
+    A runtime checkpoint makes quota exits, crashes, timeouts, stale reclaims,
+    and transient blocks resumable in the exact session. Human/capability/
+    dependency blocks intentionally start from a fresh operator-approved
+    handoff. The historical function name is retained for compatibility.
     """
     try:
         with contextlib.closing(connect(board=board)) as conn:
             task = get_task(conn, task_id)
-            if task is None or task.block_kind != "transient":
+            if task is None:
                 return None
             runs = list_runs(conn, task_id)
             previous = runs[-2] if runs and runs[-1].ended_at is None else (
                 runs[-1] if runs else None
             )
-            if previous is None or previous.outcome != "blocked":
+            if previous is None or previous.outcome not in {
+                "blocked", "rate_limited", "crashed", "timed_out", "stale",
+            }:
+                return None
+            if previous.profile and task.assignee and previous.profile != task.assignee:
+                # A provider fallback changed executor identity. Reuse the
+                # durable checkpoint/handoff, but never open profile A's exact
+                # conversation as profile B.
+                return None
+            if previous.outcome == "blocked" and task.block_kind != "transient":
                 return None
             if not isinstance(previous.metadata, dict):
                 return None
@@ -12861,6 +13397,53 @@ def list_notify_subs(
             )
         out.append(item)
     return out
+
+
+def repair_mission_subscriptions(
+    conn: sqlite3.Connection, *, notifier_profile: Optional[str] = None,
+) -> int:
+    """Rebuild missing task delivery routes from durable mission origins.
+
+    Task creation and subscription are separate historical APIs. A crash or
+    SQLite lock between them used to leave a valid task permanently silent.
+    Missions retain the origin independently, so every notifier tick can heal
+    that gap idempotently before claiming events.
+    """
+    rows = conn.execute(
+        """
+        SELECT t.id AS task_id, m.origin_platform AS platform,
+               m.origin_chat_id AS chat_id, m.origin_thread_id AS thread_id,
+               m.origin_user_id AS user_id, m.origin_message_id AS message_id,
+               m.session_id AS session_id
+          FROM tasks t JOIN missions m ON m.id = t.mission_id
+         WHERE m.origin_platform IS NOT NULL
+           AND m.origin_chat_id IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = t.id
+           )
+        """
+    ).fetchall()
+    repaired = 0
+    for row in rows:
+        metadata = {
+            "thread_id": row["thread_id"],
+            "origin_message_id": row["message_id"],
+            "session_id": row["session_id"],
+            "repaired_from_mission": True,
+        }
+        add_notify_sub(
+            conn,
+            task_id=row["task_id"],
+            platform=row["platform"],
+            chat_id=row["chat_id"],
+            thread_id=row["thread_id"],
+            user_id=row["user_id"],
+            notifier_profile=notifier_profile,
+            delivery_mode="notify+wake",
+            delivery_metadata={k: v for k, v in metadata.items() if v},
+        )
+        repaired += 1
+    return repaired
 
 
 def count_notify_subs(

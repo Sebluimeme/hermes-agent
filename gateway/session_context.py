@@ -100,6 +100,9 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+# Exact text that commissioned the current turn.  Durable work missions use it
+# instead of reconstructing the request from a shortened Kanban card body.
+_SESSION_REQUEST_TEXT: ContextVar = ContextVar("HERMES_SESSION_REQUEST_TEXT", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -150,12 +153,18 @@ _VAR_MAP = {
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
+    "HERMES_SESSION_REQUEST_TEXT": _SESSION_REQUEST_TEXT,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_CRON_SESSION": _CRON_SESSION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
 }
+
+
+def set_current_request_text(request_text: str) -> None:
+    """Bind the exact commissioning text to the current async turn."""
+    _SESSION_REQUEST_TEXT.set(request_text)
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -272,6 +281,7 @@ def set_session_vars(
         _SESSION_ID.set(session_id),
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
+        _SESSION_REQUEST_TEXT.set(""),
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
@@ -311,6 +321,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
+        _SESSION_REQUEST_TEXT,
         _SESSION_PROFILE,
         _CRON_SESSION,
     ):

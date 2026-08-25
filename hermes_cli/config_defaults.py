@@ -2658,6 +2658,8 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Optional deterministic pool assignment for independent fan-out waves.
+        "generalist_worker_pool_routing": False,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
@@ -2672,7 +2674,10 @@ DEFAULT_CONFIG = {
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
-        "dispatch_stale_timeout_seconds": 14400,
+        # Reclaim a worker that has produced no runtime heartbeat for ten
+        # minutes. The heartbeat bridge writes every minute, so active work is
+        # unaffected while a live-but-wedged process no longer hides for 4h.
+        "dispatch_stale_timeout_seconds": 600,
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible

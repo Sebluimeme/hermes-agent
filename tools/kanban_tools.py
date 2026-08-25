@@ -344,7 +344,13 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn,
+                    tid,
+                    note=None,
+                    expected_run_id=run_id,
+                    worker_session_id=os.environ.get("HERMES_SESSION_ID"),
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -1080,6 +1086,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 tid,
                 note=note,
                 expected_run_id=_worker_run_id(tid),
+                worker_session_id=os.environ.get("HERMES_SESSION_ID"),
             )
             if not ok:
                 return tool_error(
@@ -1373,11 +1380,6 @@ def _handle_create(args: dict, **kw) -> str:
     if not title or not str(title).strip():
         return tool_error("title is required")
     assignee = args.get("assignee")
-    if not assignee:
-        return tool_error(
-            "assignee is required — name the profile that should execute this "
-            "task (the dispatcher will only spawn tasks with an assignee)"
-        )
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1434,6 +1436,8 @@ def _handle_create(args: dict, **kw) -> str:
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     routing_tier = args.get("routing_tier")
+    queue_class = args.get("queue_class") or "active"
+    acceptance = args.get("acceptance")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1444,6 +1448,20 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            from gateway.session_context import get_session_env
+
+            _origin_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+            _origin_chat = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            _origin_thread = get_session_env("HERMES_SESSION_THREAD_ID", "")
+            _origin_message = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+            _origin_user = get_session_env("HERMES_SESSION_USER_ID", "")
+            _mission_request = get_session_env("HERMES_SESSION_REQUEST_TEXT", "")
+            _mission_key = None
+            if _origin_platform and _origin_chat and _origin_message:
+                _mission_key = ":".join((
+                    "gateway", _origin_platform, _origin_chat,
+                    _origin_thread or "-", _origin_message,
+                ))
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
@@ -1458,7 +1476,7 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
-                assignee=str(assignee),
+                assignee=str(assignee) if assignee else None,
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
@@ -1483,6 +1501,17 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 routing_tier=routing_tier,
+                mission_key=_mission_key,
+                mission_request=_mission_request or body or str(title),
+                mission_origin={
+                    "platform": _origin_platform or None,
+                    "chat_id": _origin_chat or None,
+                    "thread_id": _origin_thread or None,
+                    "message_id": _origin_message or None,
+                    "user_id": _origin_user or None,
+                },
+                acceptance=acceptance if isinstance(acceptance, dict) else None,
+                queue_class=str(queue_class),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1493,6 +1522,8 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                mission_id=new_task.mission_id if new_task else None,
+                queue_class=new_task.queue_class if new_task else None,
             )
         finally:
             conn.close()
@@ -1613,15 +1644,26 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
-        _kb.add_notify_sub(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id, user_id_alt=user_id_alt,
-            chat_type=chat_type,
-            notifier_profile=notifier_profile,
-            delivery_mode=delivery_mode,
-            delivery_metadata=delivery_metadata or None,
-        )
+        _last_sub_error: Optional[Exception] = None
+        for _attempt in range(3):
+            try:
+                _kb.add_notify_sub(
+                    conn, task_id=task_id,
+                    platform=platform, chat_id=chat_id,
+                    thread_id=thread_id, user_id=user_id, user_id_alt=user_id_alt,
+                    chat_type=chat_type,
+                    notifier_profile=notifier_profile,
+                    delivery_mode=delivery_mode,
+                    delivery_metadata=delivery_metadata or None,
+                )
+                _last_sub_error = None
+                break
+            except Exception as _sub_error:
+                _last_sub_error = _sub_error
+                if _attempt < 2:
+                    __import__("time").sleep(0.05 * (2 ** _attempt))
+        if _last_sub_error is not None:
+            raise _last_sub_error
         return True
     except Exception as _exc:
         logger.warning(
@@ -2233,9 +2275,8 @@ KANBAN_CREATE_SCHEMA = {
         "Create a new kanban task, optionally as a child of the current "
         "one (pass the current task id in ``parents``). Used by "
         "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks, link them into a pipeline, then complete your own task. "
+        "Omit assignee to use the central routing policy."
     ),
     "parameters": {
         "type": "object",
@@ -2247,10 +2288,8 @@ KANBAN_CREATE_SCHEMA = {
             "assignee": {
                 "type": "string",
                 "description": (
-                    "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "Optional explicit profile. Omit it to let the central "
+                    "dispatcher choose from Spark/Claude2/Claude1/Coder."
                 ),
             },
             "body": {
@@ -2387,7 +2426,9 @@ KANBAN_CREATE_SCHEMA = {
                     "Pin the dispatched worker to this model instead of "
                     "the assignee profile's configured model. Use the "
                     "exact model name the target provider expects. Omit "
-                    "to use the profile default."
+                    "to use the profile default. Opus is allowed only after "
+                    "an explicit user request, on an explicitly assigned "
+                    "claude1/claude2 card; it never changes profile defaults."
                 ),
             },
             "provider": {
@@ -2409,18 +2450,33 @@ KANBAN_CREATE_SCHEMA = {
                     "card ends up unassigned. Use 'simple' only for an "
                     "explicitly bounded, low-risk task (reading, research, "
                     "inventory, a small tested transformation/correction): "
-                    "it routes Spark -> Claude2 -> Claude1 -> Terra. Use 'complex' for "
+                    "it routes Spark -> Claude2 -> Claude1 -> Coder. Use 'complex' for "
                     "architecture, security, credentials, migrations, "
                     "external actions, important UI, or multi-file changes; "
-                    "it routes Claude2 -> Claude1 -> Terra and never Spark. "
-                    "Has no effect on this card itself since 'assignee' is "
-                    "required here. There is no way to change it later. "
+                    "it routes Claude2 -> Claude1 -> Coder and never Spark. "
+                    "It is used when assignee is omitted. There is no way to change it later. "
                     "Omit for the fail-safe default (complex)."
+                ),
+            },
+            "queue_class": {
+                "type": "string",
+                "enum": ["active", "backlog", "recurring", "idea"],
+                "description": (
+                    "Execution lane. User-request work defaults to active; "
+                    "backlog, recurring and idea cards are retained but never "
+                    "consume the active dispatcher pool."
+                ),
+            },
+            "acceptance": {
+                "type": "object",
+                "description": (
+                    "Optional global acceptance contract for the user mission. "
+                    "It is preserved above all child cards."
                 ),
             },
             "board": _board_schema_prop(),
         },
-        "required": ["title", "assignee"],
+        "required": ["title"],
     },
 }
 
