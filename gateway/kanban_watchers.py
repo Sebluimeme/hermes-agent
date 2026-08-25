@@ -747,6 +747,20 @@ class GatewayKanbanWatchersMixin:
                     # "Task X completed" and re-decomposes work that already
                     # exists on the board.
                     wake_handoff = ""
+                    # Sébastien 2026-08-25 (t_62e8c688): a "completed" event on
+                    # a push adapter with an owning session used to ALWAYS send
+                    # the raw technical ping below (task id, board tag, "Preuve
+                    # Kanban") in addition to waking that session — and the
+                    # woken agent's own AGENTS.md "Clôture automatique" reply a
+                    # few seconds later duplicated it with a human synthesis.
+                    # AGENTS.md "Silence Kanban intermédiaire" is explicit that
+                    # only the synthesis should reach him. Set when the
+                    # completed branch below defers to the wake instead of
+                    # sending, so the wake call after this loop is promoted
+                    # from best-effort to the same gated rewind/retry contract
+                    # `wake`-only subscriptions already use — the completion is
+                    # never silently lost just because the raw ping is skipped.
+                    _completed_defers_to_wake = False
                     for ev in d["events"]:
                         kind = ev.kind
                         has_instruction_grant = bool(d.get("has_instruction_grant"))
@@ -787,6 +801,24 @@ class GatewayKanbanWatchersMixin:
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{proof}{handoff}"
                             )
+                            # Defer to the wake instead of sending the raw
+                            # ping when a live session will describe this
+                            # completion in its own words (see the
+                            # `_completed_defers_to_wake` note above the
+                            # `for ev in d["events"]` loop). Requires an
+                            # actual session to wake — with no session_id
+                            # (legacy rows / sessionless workers) or a
+                            # non-push adapter, nothing else will ever tell
+                            # the user, so the raw ping stays the delivery.
+                            from gateway.wake import adapter_supports_push as _completed_push_ok
+                            if (
+                                wake_agent
+                                and _completed_push_ok(adapter)
+                                and task
+                                and getattr(task, "session_id", None)
+                            ):
+                                _completed_defers_to_wake = True
+                                continue
                         elif kind == "blocked":
                             # A block is a terminal state for automatic
                             # execution: nothing more happens without
@@ -1271,15 +1303,20 @@ class GatewayKanbanWatchersMixin:
                                 sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
                             )
 
-                        if _is_push_adapter and not send_passive and _wake_kinds:
-                            # Wake-only (delivery_mode='wake') push sub: the
-                            # text ping was intentionally skipped above, so
-                            # the wake IS the sole delivery. It must succeed
-                            # BEFORE the cursor advances — advancing first
-                            # would let a failed wake (previously swallowed
-                            # by the best-effort except below) permanently
-                            # lose the event. Mirrors the non-push
-                            # (api_server) self-post ordering above.
+                        if _is_push_adapter and _wake_kinds and (
+                            not send_passive or _completed_defers_to_wake
+                        ):
+                            # Wake-only (delivery_mode='wake') push sub, OR a
+                            # notify+wake completed event that deferred to the
+                            # wake instead of sending its raw ping (see
+                            # `_completed_defers_to_wake`): either way the
+                            # wake IS the sole delivery for at least one event
+                            # in this batch. It must succeed BEFORE the cursor
+                            # advances — advancing first would let a failed
+                            # wake (previously swallowed by the best-effort
+                            # except below) permanently lose the event.
+                            # Mirrors the non-push (api_server) self-post
+                            # ordering above.
                             try:
                                 await _push_wake()
                                 sub_fail_counts.pop(sub_key, None)
@@ -1327,10 +1364,18 @@ class GatewayKanbanWatchersMixin:
                         # work for review corrections and continuation. The
                         # retained cursor prevents replay while preserving the
                         # original delivery and wake ownership for that cycle.
-                        if _is_push_adapter and send_passive and _wake_kinds:
+                        if (
+                            _is_push_adapter
+                            and send_passive
+                            and not _completed_defers_to_wake
+                            and _wake_kinds
+                        ):
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
-                            # injection stays best-effort.
+                            # injection stays best-effort. Excludes the
+                            # deferred-completed case, which was already
+                            # handled as a gated delivery above — attempting
+                            # it again here would wake the session twice.
                             try:
                                 await _push_wake()
                             except Exception as _wk_err:

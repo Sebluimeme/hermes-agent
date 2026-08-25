@@ -82,6 +82,16 @@ def _unseen_terminal_events(tid):
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
+    """DM-topic metadata replays onto the raw ping for a `blocked` event.
+
+    Uses `blocked` (not `completed`) deliberately: since t_62e8c688, a
+    `completed` event on a push adapter with an owning session defers to the
+    wake instead of sending a raw ping at all (see
+    test_completed_event_defers_raw_ping_to_wake_synthesis below), so it no
+    longer exercises this metadata-replay path. `blocked` is an "alerte
+    pertinente" that still sends its own clean ping regardless of wake, so it
+    keeps this regression (DM-topic reply routing) covered.
+    """
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -109,7 +119,7 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
                 "thread_id": "20197",
             },
         )
-        kb.complete_task(conn, tid, summary="done")
+        assert kb.block_task(conn, tid, reason="needs a decision", kind="capability")
     finally:
         conn.close()
 
@@ -202,6 +212,88 @@ def test_completed_notification_carries_structured_closure_evidence(tmp_path, mo
     assert "Preuve Kanban : test" in message
     assert "python -m pytest tests/hermes_cli/test_kanban_closure_gate.py OK" in message
     assert "Correction terminee — Preuve Kanban" in message
+
+
+def test_completed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):
+    """t_62e8c688: a `completed` event must reach Sébastien exactly once.
+
+    Before this fix, a push-adapter subscription with an owning session
+    (the normal shape for any interactive Telegram/Discord card, since
+    ``_maybe_auto_subscribe`` always stamps gateway sessions
+    ``delivery_mode="notify+wake"``) delivered the raw technical ping
+    below ("✔ [...] Kanban t_xxx done — title — Preuve Kanban : ...")
+    immediately, THEN woke the creator session, which produced its own
+    normal "clôture automatique" synthesis a moment later — two messages
+    for one completion (AGENTS.md "Silence Kanban intermédiaire": only the
+    human synthesis should ever reach him).
+
+    This pins the fix: the raw technical ping is suppressed entirely
+    (`adapter.sent` stays empty — no task id, no checkmark, no board tag,
+    no raw "Preuve Kanban" line ever reaches the chat directly) while the
+    wake still fires exactly once, carrying the worker's summary and
+    evidence into the synthetic turn so the woken agent can still compose
+    an informed human synthesis from it.
+    """
+    db_path = tmp_path / "completed-defers-to-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Corriger le double message Kanban",
+            assignee="worker",
+            session_id="agent:main:telegram:group:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(
+            conn,
+            tid,
+            summary="Correction terminee",
+            metadata={
+                "evidence": {
+                    "kind": "test",
+                    "detail": "pytest tests/gateway/test_kanban_notifier.py OK",
+                }
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # No raw technical ping reaches the chat at all — not the checkmark
+    # line, not the task id, not a duplicate.
+    assert adapter.sent == [], (
+        f"a completed event with an owning session must defer entirely to "
+        f"the wake synthesis, got a raw ping too: {adapter.sent}"
+    )
+    # Exactly one wake, carrying the worker's summary and evidence so the
+    # woken agent's own synthesis stays informed by the real result.
+    assert len(adapter.handled) == 1
+    wake_text = adapter.handled[0].text
+    assert tid in wake_text  # internal wake context may reference the id
+    assert "Correction terminee" in wake_text
+    assert "pytest tests/gateway/test_kanban_notifier.py OK" in wake_text
+
+    # Cursor advanced — the completed event is not left claimable forever.
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["completed"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -394,7 +486,13 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
 def test_notifier_subscription_survives_done_reopen_until_archive(
     tmp_path, monkeypatch,
 ):
-    """Done is reversible; archive alone ends notification ownership."""
+    """Done is reversible; archive alone ends notification ownership.
+
+    All events here are `completed` on a push adapter with an owning
+    session, so since t_62e8c688 the raw ping is deferred to the wake
+    (`adapter.sent` stays empty throughout) — the wake carries the same
+    chat/thread/profile routing the raw ping used to.
+    """
     db_path = tmp_path / "done-reopen-archive.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -427,10 +525,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
+    assert adapter.sent == [], "completed defers to the wake; no raw ping"
     assert len(adapter.handled) == 1
-    assert adapter.sent[0]["chat_id"] == "origin-chat"
-    assert adapter.sent[0]["metadata"]["thread_id"] == "origin-thread"
     assert adapter.handled[0].source.thread_id == "origin-thread"
     assert adapter.handled[0].source.profile == "reviewer"
 
@@ -447,7 +543,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner = _make_runner(adapter)
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    assert len(adapter.sent) == 1
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
 
     conn = kb.connect()
@@ -465,9 +561,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     # Internal reopen status is silent; only the second completion delivers
     # and wakes the exact original session/thread.
-    assert len(adapter.sent) == 2
+    assert adapter.sent == []
     assert len(adapter.handled) == 2
-    assert all(item["chat_id"] == "origin-chat" for item in adapter.sent)
     assert adapter.handled[-1].source.thread_id == "origin-thread"
     assert adapter.handled[-1].source.profile == "reviewer"
 
@@ -486,7 +581,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     # Archive itself is intentionally silent, but consumes its event and
     # removes the subscription so no later historical event can replay.
-    assert len(adapter.sent) == 2
+    assert adapter.sent == []
     assert len(adapter.handled) == 2
     conn = kb.connect()
     try:
@@ -523,7 +618,8 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
-    assert len(adapter.sent) == 1
+    # completed defers to the wake (t_62e8c688); no raw ping is sent.
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
 
