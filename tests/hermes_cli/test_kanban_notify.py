@@ -204,8 +204,7 @@ def test_child_task_inherits_parent_chat_type(kanban_home):
 
 @pytest.mark.asyncio
 async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
-    """notify+wake delivers the passive message AND wakes the agent; a plain
-    notify sub only sends. The agent is woken only for the notify+wake sub."""
+    """Two simultaneous blockers become one human action inbox message."""
     import hermes_cli.kanban_db as kb
     from gateway.run import GatewayRunner
     from gateway.config import Platform
@@ -256,13 +255,15 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
             timeout=10.0,
         )
 
-    # Both subs still get a passive send (notify AND notify+wake send).
-    assert len(sent_msgs) == 2
-    assert any("passive block" in m for m in sent_msgs)
-    assert any("active block" in m for m in sent_msgs)
-    # Only the notify+wake sub woke the agent, exactly once.
-    wake_mock.assert_awaited_once()
-    assert active_tid in wake_mock.await_args.kwargs["text"]
+    # Simultaneous human blockers are coalesced into one action inbox while
+    # retaining both task reasons.
+    assert len(sent_msgs) == 1
+    assert "Action requise — 2 tâches" in sent_msgs[0]
+    assert "passive block" in sent_msgs[0]
+    assert "active block" in sent_msgs[0]
+    # A human decision is now required; do not wake an agent to spin while it
+    # cannot progress. The operator's reply will trigger the continuation.
+    wake_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

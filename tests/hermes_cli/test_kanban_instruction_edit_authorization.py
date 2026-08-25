@@ -25,6 +25,10 @@ def test_headless_worker_rejects_protected_write_without_authorization(
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setattr(
+        "tools.worker_approval.request_decision",
+        lambda **_: {"resolved": False, "choice": "timeout"},
+    )
 
     result = _write(tmp_path / "AGENTS.md", task_id=task_id)
 
@@ -56,6 +60,10 @@ def test_durable_task_authorization_allows_only_its_target(
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setattr(
+        "tools.worker_approval.request_decision",
+        lambda **_: {"resolved": False, "choice": "timeout"},
+    )
 
     allowed = _write(tmp_path / "AGENTS.md", task_id=task_id)
     denied = _write(tmp_path / "CLAUDE.md", task_id=task_id)

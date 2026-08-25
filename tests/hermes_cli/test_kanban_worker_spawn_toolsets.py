@@ -185,8 +185,8 @@ def test_default_spawn_resumes_only_unblocked_transient_worker(monkeypatch, tmp_
     assert captured["cmd"][-1].startswith(f"continue kanban task {tid}")
 
 
-def test_default_spawn_keeps_human_block_and_crash_as_fresh_context(monkeypatch, tmp_path):
-    """needs_input and a crash must not inherit the prior worker session."""
+def test_default_spawn_keeps_human_block_fresh_and_resumes_crash(monkeypatch, tmp_path):
+    """Human decisions start fresh; transient crashes resume the checkpoint."""
     root = tmp_path / ".hermes"
     (root / "profiles" / "elias").mkdir(parents=True)
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
@@ -245,8 +245,9 @@ def test_default_spawn_keeps_human_block_and_crash_as_fresh_context(monkeypatch,
         assert crashed_task is not None
 
     kb._default_spawn(crashed_task, str(workspace))
-    assert "--resume" not in captured["cmd"]
-    assert captured["cmd"][-1] == f"work kanban task {crash_tid}"
+    assert captured["env"]["HERMES_KANBAN_RESUME_SESSION_ID"] == "crashed-session"
+    assert captured["cmd"][captured["cmd"].index("--resume") + 1] == "crashed-session"
+    assert captured["cmd"][-1].startswith(f"continue kanban task {crash_tid}")
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
