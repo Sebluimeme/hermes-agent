@@ -48,6 +48,12 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+KANBAN_SHOW_DEFAULT_COMMENT_LIMIT = 5
+KANBAN_SHOW_DEFAULT_EVENT_LIMIT = 12
+KANBAN_SHOW_DEFAULT_RUN_LIMIT = 4
+_SHOW_CURSORS: dict[
+    tuple[str, str, str, str], tuple[int, int, int, str, int | None]
+] = {}
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -226,6 +232,19 @@ def _connect(board: Optional[str] = None):
     """
     from hermes_cli import kanban_db as kb
     return kb, kb.connect(board=board)
+
+
+def _request_session_id() -> str:
+    """Best-effort request-local identity used only for read-result dedupe."""
+    try:
+        from gateway.session_context import get_session_env
+
+        scoped = get_session_env("HERMES_SESSION_ID", "")
+        if scoped:
+            return str(scoped)
+    except Exception:
+        pass
+    return os.environ.get("HERMES_SESSION_ID", "") or "unscoped"
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
@@ -522,14 +541,21 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _handle_show(args: dict, **kw) -> str:
-    """Read a task's full state: task row, parents, children, comments,
-    runs (attempt history), and the last N events."""
+    """Read current task state with compact defaults and cursor dedupe."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    detail = str(args.get("detail") or "compact").strip().lower()
+    if detail not in {"compact", "full"}:
+        return tool_error("detail must be 'compact' or 'full'")
+    try:
+        since_event_id = max(0, int(args.get("since_event_id") or 0))
+        since_comment_id = max(0, int(args.get("since_comment_id") or 0))
+    except (TypeError, ValueError):
+        return tool_error("since_event_id and since_comment_id must be integers")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -542,8 +568,62 @@ def _handle_show(args: dict, **kw) -> str:
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
 
+            last_event_id = events[-1].id if events else 0
+            last_comment_id = comments[-1].id if comments else 0
+            last_run_id = runs[-1].id if runs else 0
+            cursor = {
+                "event_id": last_event_id,
+                "comment_id": last_comment_id,
+                "run_id": last_run_id,
+            }
+            call_shape = json.dumps(
+                {
+                    "task_id_explicit": args.get("task_id"),
+                    "board_explicit": args.get("board"),
+                    "detail": detail,
+                    "since_event_id": since_event_id,
+                    "since_comment_id": since_comment_id,
+                },
+                sort_keys=True,
+                default=str,
+            )
+            cache_key = (
+                _request_session_id(), tid, str(board or "default"), call_shape,
+            )
+            state_marker = (
+                last_event_id,
+                last_comment_id,
+                last_run_id,
+                str(task.status),
+                task.current_run_id,
+            )
+            if (
+                detail == "compact"
+                and not since_event_id
+                and not since_comment_id
+                and _SHOW_CURSORS.get(cache_key) == state_marker
+            ):
+                return json.dumps({
+                    "ok": True,
+                    "task_id": tid,
+                    "unchanged": True,
+                    "cursor": cursor,
+                    "message": (
+                        "No Kanban changes since this session's previous read; "
+                        "continue from the already loaded task state."
+                    ),
+                })
+            _SHOW_CURSORS[cache_key] = state_marker
+            if len(_SHOW_CURSORS) > 4096:
+                # Process-local cache only; clearing it merely causes one full
+                # compact response on the next read.
+                _SHOW_CURSORS.clear()
+
             def _task_dict(t):
-                return {
+                body = t.body
+                if detail == "compact" and isinstance(body, str) and len(body) > 2500:
+                    body = body[:2500] + "…"
+                payload = {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
@@ -557,6 +637,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
                 }
+                payload["body"] = body
+                return payload
 
             def _run_dict(r):
                 return {
@@ -567,27 +649,55 @@ def _handle_show(args: dict, **kw) -> str:
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
-            return json.dumps({
+            if since_event_id:
+                selected_events = [event for event in events if event.id > since_event_id]
+            else:
+                selected_events = (
+                    events[-50:] if detail == "full"
+                    else events[-KANBAN_SHOW_DEFAULT_EVENT_LIMIT:]
+                )
+            if since_comment_id:
+                selected_comments = [comment for comment in comments if comment.id > since_comment_id]
+            else:
+                selected_comments = (
+                    comments[-50:] if detail == "full"
+                    else comments[-KANBAN_SHOW_DEFAULT_COMMENT_LIMIT:]
+                )
+            selected_runs = (
+                runs[-20:] if detail == "full"
+                else runs[-KANBAN_SHOW_DEFAULT_RUN_LIMIT:]
+            )
+            payload = {
+                "ok": True,
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
                 "comments": [
-                    {"author": c.author, "body": c.body,
+                    {"id": c.id, "author": c.author, "body": c.body,
                      "created_at": c.created_at}
-                    for c in comments
+                    for c in selected_comments
                 ],
                 "events": [
-                    {"kind": e.kind, "payload": e.payload,
+                    {"id": e.id, "kind": e.kind, "payload": e.payload,
                      "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
+                    for e in selected_events
                 ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
-            })
+                "runs": [_run_dict(r) for r in selected_runs],
+                "cursor": cursor,
+                "truncated": {
+                    "comments": max(0, len(comments) - len(selected_comments)),
+                    "events": max(0, len(events) - len(selected_events)),
+                    "runs": max(0, len(runs) - len(selected_runs)),
+                    "body": bool(
+                        detail == "compact"
+                        and isinstance(task.body, str)
+                        and len(task.body) > 2500
+                    ),
+                },
+            }
+            if detail == "full":
+                payload["worker_context"] = kb.build_worker_context(conn, tid)
+            return json.dumps(payload)
         finally:
             conn.close()
     except ValueError as e:
@@ -828,6 +938,82 @@ def _handle_complete(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_complete failed")
         return tool_error(f"kanban_complete: {e}")
+
+
+def _handle_completion_ready(args: dict, **kw) -> str:
+    """Project the closure gate before a worker attempts a terminal write."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    metadata = args.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return tool_error("metadata must be an object")
+    artifacts = args.get("artifacts") or []
+    if isinstance(artifacts, str):
+        artifacts = [artifacts]
+    if not isinstance(artifacts, (list, tuple)):
+        return tool_error("artifacts must be a list")
+    if artifacts:
+        metadata = dict(metadata)
+        existing = metadata.get("artifacts")
+        metadata["artifacts"] = list(existing or []) + [
+            str(path).strip() for path in artifacts if str(path).strip()
+        ]
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            evidence = closure_evidence.classify_closure_evidence(
+                prior_status=task.status,
+                metadata=metadata,
+            )
+            missing: list[str] = []
+            if task.status not in {"running", "ready", "blocked", "review"}:
+                missing.append(
+                    "task must be running, ready, blocked, or in review"
+                )
+            if not evidence.satisfied:
+                missing.append(
+                    "structured evidence: metadata.evidence test/canary, "
+                    "a real artifact, or approval from review"
+                )
+            if task.status != "review" and not (args.get("summary") or args.get("result")):
+                missing.append("summary or result")
+            return json.dumps({
+                "ok": True,
+                "task_id": tid,
+                "ready": not missing,
+                "evidence": {
+                    "kind": evidence.kind,
+                    "detail": evidence.detail,
+                },
+                "missing": missing,
+                "next": (
+                    "call kanban_complete once with the same metadata/artifacts"
+                    if not missing else
+                    "collect the listed evidence before calling kanban_complete"
+                ),
+                "example_metadata": (
+                    None if evidence.satisfied else {
+                        "evidence": {
+                            "kind": "test",
+                            "detail": "<exact command and successful result>",
+                        }
+                    }
+                ),
+            })
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_completion_ready: {e}")
+    except Exception as e:
+        logger.exception("kanban_completion_ready failed")
+        return tool_error(f"kanban_completion_ready: {e}")
 
 
 def _handle_block(args: dict, **kw) -> str:
@@ -1534,6 +1720,166 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _handle_create_many(args: dict, **kw) -> str:
+    """Create an idempotent task graph in one database transaction."""
+    delegated_err = _reject_delegated_child_mutation("kanban_create_many")
+    if delegated_err:
+        return delegated_err
+    items = args.get("tasks")
+    if not isinstance(items, list) or not items:
+        return tool_error("tasks must be a non-empty list")
+    if len(items) > 50:
+        return tool_error("kanban_create_many accepts at most 50 tasks")
+    defaults = args.get("defaults") or {}
+    if not isinstance(defaults, dict):
+        return tool_error("defaults must be an object")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            from gateway.session_context import get_session_env
+            from tools.async_delegation import _current_origin_session_id
+
+            origin_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+            origin_chat = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            origin_thread = get_session_env("HERMES_SESSION_THREAD_ID", "")
+            origin_message = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+            origin_user = get_session_env("HERMES_SESSION_USER_ID", "")
+            mission_request = get_session_env("HERMES_SESSION_REQUEST_TEXT", "")
+            mission_key = None
+            if origin_platform and origin_chat and origin_message:
+                mission_key = ":".join((
+                    "gateway", origin_platform, origin_chat,
+                    origin_thread or "-", origin_message,
+                ))
+            batch_key = str(args.get("idempotency_key") or mission_key or "").strip()
+            session_id = (
+                args.get("session_id")
+                or _current_origin_session_id()
+                or os.environ.get("HERMES_SESSION_ID")
+            )
+            created_by = os.environ.get("HERMES_PROFILE") or "worker"
+            tenant_default = defaults.get("tenant") or os.environ.get("HERMES_TENANT")
+            self_task = None
+            self_tid = os.environ.get("HERMES_KANBAN_TASK")
+            if self_tid:
+                self_task = kb.get_task(conn, self_tid)
+
+            specs: list[dict[str, Any]] = []
+            for index, raw in enumerate(items):
+                if not isinstance(raw, dict):
+                    return tool_error(f"tasks[{index}] must be an object")
+                merged = dict(defaults)
+                merged.update(raw)
+                title = str(merged.get("title") or "").strip()
+                if not title:
+                    return tool_error(f"tasks[{index}].title is required")
+                key = str(merged.get("key") or f"task-{index + 1}").strip()
+                skills = merged.get("skills")
+                if isinstance(skills, str):
+                    skills = [skills]
+                if skills is not None and not isinstance(skills, (list, tuple)):
+                    return tool_error(f"tasks[{index}].skills must be a list")
+                model = merged.get("model")
+                provider = merged.get("provider")
+                if provider and not model:
+                    return tool_error(f"tasks[{index}].provider requires model")
+                workspace_kind = merged.get("workspace_kind")
+                workspace_path = merged.get("workspace_path")
+                project_id = merged.get("project") or merged.get("project_id")
+                project_source_task_id = None
+                if workspace_kind is None:
+                    workspace_kind = "scratch"
+                if (
+                    project_id is None
+                    and merged.get("workspace_kind") is None
+                    and workspace_path is None
+                    and self_task is not None
+                    and self_task.project_id
+                ):
+                    project_id = self_task.project_id
+                    project_source_task_id = self_task.id
+                item_idempotency = merged.get("idempotency_key")
+                if not item_idempotency and batch_key:
+                    item_idempotency = f"{batch_key}:{key}"
+                specs.append({
+                    "key": key,
+                    "title": title,
+                    "body": merged.get("body"),
+                    "assignee": (
+                        str(merged["assignee"]) if merged.get("assignee") else None
+                    ),
+                    "parents": merged.get("parents") or (),
+                    "tenant": merged.get("tenant") or tenant_default,
+                    "priority": int(merged.get("priority") or 0),
+                    "workspace_kind": str(workspace_kind),
+                    "workspace_path": workspace_path,
+                    "project_id": project_id,
+                    "project_source_task_id": project_source_task_id,
+                    "triage": bool(merged.get("triage", False)),
+                    "idempotency_key": item_idempotency,
+                    "max_runtime_seconds": (
+                        int(merged["max_runtime_seconds"])
+                        if merged.get("max_runtime_seconds") is not None else None
+                    ),
+                    "skills": skills,
+                    "model_override": model,
+                    "provider_override": provider,
+                    "goal_mode": bool(merged.get("goal_mode", False)),
+                    "goal_max_turns": (
+                        int(merged["goal_max_turns"])
+                        if merged.get("goal_max_turns") is not None else None
+                    ),
+                    "initial_status": str(merged.get("initial_status") or "running"),
+                    "created_by": created_by,
+                    "session_id": session_id,
+                    "routing_tier": merged.get("routing_tier"),
+                    "mission_key": mission_key or (batch_key or None),
+                    "mission_request": (
+                        mission_request or args.get("mission_request")
+                        or merged.get("body") or title
+                    ),
+                    "mission_origin": {
+                        "platform": origin_platform or None,
+                        "chat_id": origin_chat or None,
+                        "thread_id": origin_thread or None,
+                        "message_id": origin_message or None,
+                        "user_id": origin_user or None,
+                    },
+                    "acceptance": (
+                        merged.get("acceptance")
+                        if isinstance(merged.get("acceptance"), dict) else None
+                    ),
+                    "queue_class": str(merged.get("queue_class") or "active"),
+                    "board": board,
+                })
+
+            created = kb.create_tasks_batch(conn, specs)
+            rows = []
+            for key, task_id in created:
+                task = kb.get_task(conn, task_id)
+                rows.append({
+                    "key": key,
+                    "task_id": task_id,
+                    "status": task.status if task else None,
+                    "mission_id": task.mission_id if task else None,
+                    "subscribed": _maybe_auto_subscribe(conn, task_id),
+                })
+            return _ok(
+                tasks=rows,
+                count=len(rows),
+                atomic=True,
+                idempotency_key=batch_key or None,
+            )
+        finally:
+            conn.close()
+    except (TypeError, ValueError) as e:
+        return tool_error(f"kanban_create_many: {e}")
+    except Exception as e:
+        logger.exception("kanban_create_many failed")
+        return tool_error(f"kanban_create_many: {e}")
+
+
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
@@ -1836,12 +2182,10 @@ def _board_schema_prop() -> dict[str, str]:
 KANBAN_SHOW_SCHEMA = {
     "name": "kanban_show",
     "description": (
-        "Read a task's full state — title, body, assignee, parent task "
-        "handoffs, your prior attempts on this task if any, comments, "
-        "and recent events. Use this to (re)orient yourself before "
-        "starting work, especially on retries. The response includes a "
-        "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "Read a task's state with compact, cursor-based defaults. Repeating "
+        "the same unchanged read in one session returns only an unchanged "
+        "marker. Pass detail='full' only when the bounded compact history is "
+        "insufficient; use returned event/comment cursors for later deltas."
     ),
     "parameters": {
         "type": "object",
@@ -1849,6 +2193,19 @@ KANBAN_SHOW_SCHEMA = {
             "task_id": {
                 "type": "string",
                 "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "detail": {
+                "type": "string",
+                "enum": ["compact", "full"],
+                "description": "Compact by default; full adds bounded history and worker_context.",
+            },
+            "since_event_id": {
+                "type": "integer",
+                "description": "Return only events after this cursor id.",
+            },
+            "since_comment_id": {
+                "type": "integer",
+                "description": "Return only comments after this cursor id.",
             },
             "board": _board_schema_prop(),
         },
@@ -1990,6 +2347,29 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task in-flight so you can fix the path and retry."
                 ),
             },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
+KANBAN_COMPLETION_READY_SCHEMA = {
+    "name": "kanban_completion_ready",
+    "description": (
+        "Check whether a proposed kanban_complete call has the required "
+        "structured evidence before attempting the terminal write. Returns "
+        "ready plus the exact missing fields, avoiding repeated rejected "
+        "completion calls. Pass the same summary, metadata and artifacts you "
+        "intend to send to kanban_complete."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "summary": {"type": "string"},
+            "result": {"type": "string"},
+            "metadata": {"type": "object"},
+            "artifacts": {"type": "array", "items": {"type": "string"}},
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -2480,6 +2860,65 @@ KANBAN_CREATE_SCHEMA = {
     },
 }
 
+KANBAN_CREATE_MANY_SCHEMA = {
+    "name": "kanban_create_many",
+    "description": (
+        "Atomically create 1-50 tasks for one mission. Every item has a "
+        "stable key; a parent written as '$key' depends on an earlier item "
+        "in this batch. The gateway message (or explicit idempotency_key) is "
+        "used to make retries return the same cards instead of duplicating "
+        "them. If any item is invalid the whole batch rolls back."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "assignee": {"type": "string"},
+                        "parents": {"type": "array", "items": {"type": "string"}},
+                        "routing_tier": {"type": "string", "enum": ["simple", "complex"]},
+                        "priority": {"type": "integer"},
+                        "queue_class": {
+                            "type": "string",
+                            "enum": ["active", "backlog", "recurring", "idea"],
+                        },
+                        "acceptance": {"type": "object"},
+                        "skills": {"type": "array", "items": {"type": "string"}},
+                        "workspace_kind": {
+                            "type": "string", "enum": ["scratch", "dir", "worktree"],
+                        },
+                        "workspace_path": {"type": "string"},
+                        "project": {"type": "string"},
+                        "max_runtime_seconds": {"type": "integer"},
+                        "model": {"type": "string"},
+                        "provider": {"type": "string"},
+                    },
+                    "required": ["key", "title"],
+                },
+            },
+            "defaults": {
+                "type": "object",
+                "description": "Fields inherited by every item; item values override them.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Stable batch key when no gateway message id is available.",
+            },
+            "mission_request": {"type": "string"},
+            "board": _board_schema_prop(),
+        },
+        "required": ["tasks"],
+    },
+}
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -2596,6 +3035,15 @@ registry.register(
 )
 
 registry.register(
+    name="kanban_completion_ready",
+    toolset="kanban",
+    schema=KANBAN_COMPLETION_READY_SCHEMA,
+    handler=_handle_completion_ready,
+    check_fn=_check_kanban_mode,
+    emoji="✓",
+)
+
+registry.register(
     name="kanban_block",
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
@@ -2672,6 +3120,15 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
+    check_fn=_check_kanban_mode,
+    emoji="➕",
+)
+
+registry.register(
+    name="kanban_create_many",
+    toolset="kanban",
+    schema=KANBAN_CREATE_MANY_SCHEMA,
+    handler=_handle_create_many,
     check_fn=_check_kanban_mode,
     emoji="➕",
 )

@@ -453,6 +453,16 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         return None
 
 
+def _is_lean_cron_agent(job: dict) -> bool:
+    """True for reporter-only jobs that need inference but no ambient context.
+
+    ``lean_agent`` is deliberately opt-in.  It removes tools, SOUL/project
+    context and memory from the prompt while preserving the job prompt,
+    script output, chained context and delivery behavior.
+    """
+    return bool(job.get("lean_agent")) and not bool(job.get("no_agent"))
+
+
 def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
     """Resolve the effective reasoning config for a cron run.
 
@@ -6037,6 +6047,8 @@ def run_job(
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
+        _lean_agent = _is_lean_cron_agent(job)
+
         # Initialize MCP servers so configured mcp_servers are available to
         # the agent's tool registry before AIAgent is constructed. Without
         # this, cron jobs never saw any MCP tools — only the gateway / CLI
@@ -6044,19 +6056,20 @@ def run_job(
         # ticks short-circuit on already-connected servers inside
         # register_mcp_servers(). Non-fatal on failure: a broken MCP server
         # shouldn't kill an otherwise-working cron job. See #4219.
-        try:
-            from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
-            if _mcp_tools:
-                logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+        if not _lean_agent:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                _mcp_tools = discover_mcp_tools()
+                if _mcp_tools:
+                    logger.info(
+                        "Job '%s': %d MCP tool(s) available",
+                        job_id, len(_mcp_tools),
+                    )
+            except Exception as _mcp_exc:
+                logger.warning(
+                    "Job '%s': MCP initialization failed (non-fatal): %s",
+                    job_id, _mcp_exc,
                 )
-        except Exception as _mcp_exc:
-            logger.warning(
-                "Job '%s': MCP initialization failed (non-fatal): %s",
-                job_id, _mcp_exc,
-            )
 
         agent = AIAgent(
             model=model,
@@ -6077,20 +6090,22 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=(
+                [] if _lean_agent else _resolve_cron_enabled_toolsets(job, _cfg)
+            ),
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
             # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
             # Without a workdir, keep cwd context discovery disabled.
-            skip_context_files=not bool(_job_workdir),
-            load_soul_identity=True,
+            skip_context_files=_lean_agent or not bool(_job_workdir),
+            load_soul_identity=not _lean_agent,
             # Memory is enabled for cron agents like any other agent run:
             # MEMORY.md / USER.md load into the system prompt and the memory
             # tool follows normal toolset resolution, so jobs benefit from
             # (and can update) the user's persistent memory.
-            skip_memory=False,
+            skip_memory=_lean_agent,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,

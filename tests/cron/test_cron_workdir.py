@@ -215,6 +215,8 @@ class TestRunJobTerminalCwd:
             def __init__(self, **kwargs):
                 observed["skip_context_files"] = kwargs.get("skip_context_files")
                 observed["load_soul_identity"] = kwargs.get("load_soul_identity")
+                observed["skip_memory"] = kwargs.get("skip_memory")
+                observed["enabled_toolsets"] = kwargs.get("enabled_toolsets")
                 observed["terminal_cwd_during_init"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
                 )
@@ -298,3 +300,23 @@ class TestRunJobTerminalCwd:
         # And after run_job completes, it's still the sentinel (nothing
         # overwrote or cleared it).
         assert os.environ["TERMINAL_CWD"] == before
+
+    def test_lean_reporter_loads_no_tools_identity_project_or_memory(self, monkeypatch):
+        import cron.scheduler as sched
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+        job = {
+            "id": "lean",
+            "name": "lean-reporter",
+            "workdir": "/tmp",
+            "schedule_display": "manual",
+            "lean_agent": True,
+        }
+
+        success, *_ = sched.run_job(job)
+        assert success is True
+        assert observed["enabled_toolsets"] == []
+        assert observed["skip_context_files"] is True
+        assert observed["load_soul_identity"] is False
+        assert observed["skip_memory"] is True

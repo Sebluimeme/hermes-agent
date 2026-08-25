@@ -3890,6 +3890,72 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
+def create_tasks_batch(
+    conn: sqlite3.Connection,
+    task_specs: Iterable[Mapping[str, Any]],
+) -> list[tuple[str, str]]:
+    """Atomically create an ordered task graph.
+
+    Each spec may carry a short ``key``. Parent entries written as ``$key``
+    resolve to an earlier item from the same batch; ordinary task ids pass
+    through unchanged. The outer transaction means a validation or creation
+    failure rolls the entire graph back, so a fifteen-card request cannot land
+    as an unnoticed partial mission.
+
+    Returns ``[(key, task_id), ...]`` in input order. Keys are mandatory and
+    unique because they are also the stable dependency handles surfaced to the
+    caller.
+    """
+    specs = [dict(spec) for spec in task_specs]
+    if not specs:
+        raise ValueError("task_specs must contain at least one task")
+    if len(specs) > 50:
+        raise ValueError("a task batch is limited to 50 items")
+
+    declared: set[str] = set()
+    for index, spec in enumerate(specs, 1):
+        key = str(spec.get("key") or "").strip()
+        if not key:
+            raise ValueError(f"task_specs[{index - 1}].key is required")
+        if key in declared:
+            raise ValueError(f"duplicate batch key: {key}")
+        declared.add(key)
+
+    created: dict[str, str] = {}
+    ordered: list[tuple[str, str]] = []
+    with write_txn(conn):
+        for index, raw in enumerate(specs):
+            spec = dict(raw)
+            key = str(spec.pop("key")).strip()
+            parents = spec.pop("parents", ()) or ()
+            if isinstance(parents, str):
+                parents = [parents]
+            resolved_parents: list[str] = []
+            for parent in parents:
+                value = str(parent).strip()
+                if not value:
+                    continue
+                if value.startswith("$"):
+                    dependency_key = value[1:]
+                    if dependency_key not in declared:
+                        raise ValueError(
+                            f"task_specs[{index}].parents references unknown batch key "
+                            f"{dependency_key!r}"
+                        )
+                    if dependency_key not in created:
+                        raise ValueError(
+                            f"task_specs[{index}].parents references future batch key "
+                            f"{dependency_key!r}; order dependencies before dependents"
+                        )
+                    value = created[dependency_key]
+                resolved_parents.append(value)
+            spec["parents"] = tuple(resolved_parents)
+            task_id = create_task(conn, **spec)
+            created[key] = task_id
+            ordered.append((key, task_id))
+    return ordered
+
+
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
     parents = list(parents)
     if not parents:
@@ -12458,6 +12524,62 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 _retagged_workspace_roots: set[str] = set()
 
 
+def _run_verified_progress_marker(run: Run) -> Optional[str]:
+    """Return a durable progress marker that justifies more model turns."""
+    if run.summary and run.summary.strip():
+        return f"summary:{run.summary.strip()[:160]}"
+    metadata = run.metadata if isinstance(run.metadata, dict) else {}
+    checkpoint = metadata.get("checkpoint")
+    if isinstance(checkpoint, dict):
+        note = checkpoint.get("note")
+        if isinstance(note, str) and note.strip():
+            return f"checkpoint:{note.strip()[:160]}"
+    evidence = metadata.get("evidence")
+    if isinstance(evidence, dict) and evidence.get("detail"):
+        return f"evidence:{str(evidence['detail'])[:160]}"
+    for key in ("commit", "commit_sha", "changed_files", "artifacts", "findings"):
+        if metadata.get(key):
+            return f"{key}:{str(metadata[key])[:160]}"
+    return None
+
+
+def adaptive_worker_turn_budget(task: Task, runs: Iterable[Run]) -> int:
+    """Bound a worker attempt by complexity, extending only after progress.
+
+    Simple cards start at 12 API/tool-loop iterations and complex cards at 30.
+    Each prior non-terminal run with a distinct durable progress marker grants
+    ten more turns. The absolute ceiling remains 90.
+    """
+    base = 12 if normalize_routing_tier(task.routing_tier) == "simple" else 30
+    markers: set[str] = set()
+    for run in runs:
+        if run.outcome == "completed":
+            continue
+        marker = _run_verified_progress_marker(run)
+        if marker:
+            markers.add(marker)
+    return min(90, base + 10 * len(markers))
+
+
+def _worker_retry_strategy_hint(runs: Iterable[Run]) -> str:
+    """Require a changed approach after the same failure repeats three times."""
+    failures = [
+        run for run in runs
+        if run.ended_at is not None and run.outcome not in {"completed", "rate_limited"}
+        and run.error
+    ][-3:]
+    if len(failures) < 3:
+        return ""
+    fingerprints = {_error_fingerprint(str(run.error)) for run in failures}
+    if len(fingerprints) != 1:
+        return ""
+    return (
+        " Three consecutive attempts ended with the same failure. Treat the "
+        "durable checkpoint as authoritative, do not repeat that failing call, "
+        "and resume with a materially different strategy."
+    )
+
+
 def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optional[str]:
     """Return the immediately preceding resumable worker session.
 
@@ -12545,11 +12667,19 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     resume_session_id = _transient_resume_session_id(task.id, board=board)
+    try:
+        with contextlib.closing(connect(board=board)) as budget_conn:
+            prior_runs = list_runs(budget_conn, task.id)
+    except Exception:
+        prior_runs = []
+    turn_budget = adaptive_worker_turn_budget(task, prior_runs)
+    strategy_hint = _worker_retry_strategy_hint(prior_runs)
     prompt = (
         f"continue kanban task {task.id} from the existing session; first verify "
         "the current board state and do not repeat already completed reads"
+        f"{strategy_hint}"
         if resume_session_id
-        else f"work kanban task {task.id}"
+        else f"work kanban task {task.id}{strategy_hint}"
     )
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
@@ -12580,6 +12710,7 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    env["HERMES_KANBAN_TURN_BUDGET"] = str(turn_budget)
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     if resume_session_id:
         env["HERMES_KANBAN_RESUME_SESSION_ID"] = resume_session_id
@@ -12697,6 +12828,7 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        "--max-turns", str(turn_budget),
         "-q", prompt,
     ])
     if task.goal_mode:

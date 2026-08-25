@@ -146,13 +146,80 @@ def worker_env(monkeypatch, tmp_path):
 
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
+    kt._SHOW_CURSORS.clear()
     out = kt._handle_show({})
     d = json.loads(out)
-    assert "task" in d
+    assert d["ok"] is True
     assert d["task"]["id"] == worker_env
-    assert d["task"]["status"] == "running"
-    assert "worker_context" in d
-    assert "runs" in d
+    assert "cursor" in d
+
+    repeated = json.loads(kt._handle_show({}))
+    assert repeated["unchanged"] is True
+    assert "task" not in repeated
+
+    full = json.loads(kt._handle_show({"detail": "full"}))
+    assert full["task"]["status"] == "running"
+    assert "worker_context" in full
+
+
+def test_completion_ready_lists_missing_evidence_before_terminal_write(worker_env):
+    from tools import kanban_tools as kt
+
+    missing = json.loads(kt._handle_completion_ready({
+        "summary": "implemented",
+    }))
+    assert missing["ready"] is False
+    assert any("structured evidence" in item for item in missing["missing"])
+
+    ready = json.loads(kt._handle_completion_ready({
+        "summary": "implemented",
+        "metadata": {
+            "evidence": {"kind": "test", "detail": "pytest: 4 passed"},
+        },
+    }))
+    assert ready["ready"] is True
+    assert ready["evidence"]["kind"] == "test"
+
+
+def test_create_many_is_atomic_dependency_aware_and_idempotent(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    args = {
+        "idempotency_key": "batch-request-1",
+        "tasks": [
+            {"key": "inspect", "title": "Inspect source", "routing_tier": "simple"},
+            {"key": "fix", "title": "Apply fix", "parents": ["$inspect"]},
+        ],
+    }
+    first = json.loads(kt._handle_create_many(args))
+    assert first["ok"] is True
+    assert first["count"] == 2
+    ids = [row["task_id"] for row in first["tasks"]]
+
+    second = json.loads(kt._handle_create_many(args))
+    assert [row["task_id"] for row in second["tasks"]] == ids
+
+    conn = kb.connect()
+    try:
+        assert kb.parent_ids(conn, ids[1]) == [ids[0]]
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    failed = json.loads(kt._handle_create_many({
+        "idempotency_key": "batch-request-bad",
+        "tasks": [
+            {"key": "later", "title": "Later", "parents": ["$future"]},
+            {"key": "future", "title": "Future"},
+        ],
+    }))
+    assert "error" in failed
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
+    finally:
+        conn.close()
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
