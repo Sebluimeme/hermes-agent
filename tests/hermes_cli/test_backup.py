@@ -178,6 +178,32 @@ class TestShouldExclude:
 
 class TestBackup:
 
+    def test_file_disappearing_after_scan_is_non_fatal(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        volatile = hermes_home / "cron" / "vanishing.txt"
+        volatile.write_text("old output", encoding="utf-8")
+        out_zip = tmp_path / "backup.zip"
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = backup_mod.zipfile.ZipFile.write
+
+        def disappearing_write(archive, filename, *args, **kwargs):
+            if Path(filename) == volatile:
+                volatile.unlink(missing_ok=True)
+                raise FileNotFoundError(filename)
+            return real_write(archive, filename, *args, **kwargs)
+
+        monkeypatch.setattr(backup_mod.zipfile.ZipFile, "write", disappearing_write)
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+        assert out_zip.is_file()
+        with zipfile.ZipFile(out_zip) as archive:
+            assert "cron/vanishing.txt" not in archive.namelist()
+
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
         """SQLite staging temp files must be created on the output zip's
@@ -1843,4 +1869,3 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-

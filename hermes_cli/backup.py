@@ -783,6 +783,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
 
     total_bytes = 0
     errors = []
+    disappeared_during_copy: list[str] = []
     t0 = time.monotonic()
 
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
@@ -811,6 +812,16 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                 else:
                     zf.write(abs_path, arcname=str(rel_path))
                     total_bytes += abs_path.stat().st_size
+            except FileNotFoundError as exc:
+                # Volatile stores (cron retention, rotating logs) can remove a
+                # file after the scan but before its turn in a long backup.
+                # If it is genuinely gone, no source byte remains to preserve
+                # and the archive still matches the surviving tree.
+                if not abs_path.exists():
+                    disappeared_during_copy.append(str(rel_path))
+                else:
+                    errors.append(f"  {rel_path}: {exc}")
+                continue
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {rel_path}: {exc}")
                 continue
@@ -831,6 +842,12 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             try:
                 zf.write(abs_path, arcname=arcname)
                 total_bytes += abs_path.stat().st_size
+            except FileNotFoundError as exc:
+                if not abs_path.exists():
+                    disappeared_during_copy.append(str(arcname))
+                else:
+                    errors.append(f"  {arcname}: {exc}")
+                continue
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {arcname}: {exc}")
                 continue
@@ -874,6 +891,16 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         print("\n  Excluded directories:")
         for d in sorted(skipped_dirs):
             print(f"    {d}/")
+
+    if disappeared_during_copy:
+        print(
+            f"\n  Volatile changes ({len(disappeared_during_copy)} files "
+            "disappeared after scan; snapshot remains complete):"
+        )
+        for path in disappeared_during_copy[:10]:
+            print(f"    {path}")
+        if len(disappeared_during_copy) > 10:
+            print(f"    ... and {len(disappeared_during_copy) - 10} more")
 
     if errors:
         print(f"\n  Warnings ({len(errors)} files skipped):")
