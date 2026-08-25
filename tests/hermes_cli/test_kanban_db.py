@@ -137,6 +137,10 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
         "INSERT INTO tasks (id, title, status, created_at) "
         "VALUES ('legacy', 'old board task', 'ready', 1)"
     )
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy-done', 'already delivered task', 'done', 1)"
+    )
     conn.commit()
     conn.close()
 
@@ -154,6 +158,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        legacy_done = kb.get_task(migrated, "legacy-done")
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
@@ -165,6 +170,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+    assert legacy_done.delivery_status == "delivered"
 
 
 # ---------------------------------------------------------------------------

@@ -2804,9 +2804,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         ("next_retry_at", "next_retry_at INTEGER"),
         ("action_required", "action_required TEXT"),
     )
+    _delivery_column_added = "delivery_status" not in cols
     for _column_name, _column_ddl in _mission_columns:
         if _column_name not in cols:
             _add_column_if_missing(conn, "tasks", _column_name, _column_ddl)
+    if _delivery_column_added and "status" in cols:
+        # Rows completed before missions/delivery tracking existed were
+        # already handed off under the legacy contract. Do not manufacture a
+        # permanent undelivered backlog for them when adding the new column.
+        conn.execute(
+            "UPDATE tasks SET delivery_status='delivered' "
+            "WHERE status IN ('done','archived')"
+        )
 
     # Never backfill historical PIDs: without a captured process start
     # identity, a PID is not sufficient authority to stop a process safely.
