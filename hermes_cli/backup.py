@@ -326,6 +326,13 @@ def _should_exclude(rel_path: Path) -> bool:
     """Return True if *rel_path* (relative to hermes root) should be skipped."""
     parts = rel_path.parts
 
+    # Local Telegram Bot API queue/cache state is owned by the messagebus
+    # service, changes while a backup is running, and is regenerated from the
+    # canonical Hermes configuration and delivery cursors. It can also be
+    # unreadable to the Hermes user by design.
+    if len(parts) >= 2 and parts[0] == "telegram-bot-api" and parts[1] in {"data", "tmp"}:
+        return True
+
     for part in parts:
         if part not in _EXCLUDED_DIRS:
             continue
@@ -357,9 +364,23 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
     if abs_path.is_symlink():
         return True
 
+    # Sockets, FIFOs and device nodes cannot be archived as regular files and
+    # are process-local runtime state, never restorable user data.
+    if not abs_path.is_file():
+        return True
+
     try:
         return abs_path.resolve() == out_path.resolve()
     except (OSError, ValueError):
+        return False
+
+
+def _is_sqlite_file(path: Path) -> bool:
+    """Use SQLite's magic header, not the ambiguous ``.db`` suffix."""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(16) == b"SQLite format 3\x00"
+    except OSError:
         return False
 
 
@@ -770,7 +791,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
                 # Safe copy for SQLite databases (handles WAL mode)
-                if abs_path.suffix == ".db":
+                if abs_path.suffix == ".db" and _is_sqlite_file(abs_path):
                     # Stage the snapshot alongside the output zip so that the
                     # temp file lives on the same filesystem.  The system
                     # default (/tmp) may be a small tmpfs that cannot hold
@@ -860,6 +881,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             print(e)
         if len(errors) > 10:
             print(f"  ... and {len(errors) - 10} more")
+        raise SystemExit(1)
 
     if not errors:
         print(f"\nRestore with: hermes import {out_path.name}")
@@ -1998,7 +2020,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         ) as zf:
             for index, (abs_path, rel_path) in enumerate(files_to_add, 1):
                 try:
-                    if abs_path.suffix == ".db":
+                    if abs_path.suffix == ".db" and _is_sqlite_file(abs_path):
                         # Stage the snapshot alongside the output zip so that the
                         # temp file lives on the same filesystem.  The system
                         # default (/tmp) may be a small tmpfs that cannot hold

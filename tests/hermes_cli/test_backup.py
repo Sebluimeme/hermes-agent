@@ -140,6 +140,12 @@ class TestShouldExclude:
         assert _should_exclude(Path("workspace/site/.next/cache/webpack/0.pack"))
         assert not _should_exclude(Path("workspace/site/src/app.py"))
 
+    def test_excludes_local_telegram_api_runtime_state(self):
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("telegram-bot-api/data/tqueue.binlog"))
+        assert _should_exclude(Path("telegram-bot-api/tmp/download.part"))
+        assert not _should_exclude(Path("telegram-bot-api/docker-compose.yaml"))
+
     def test_excludes_state_snapshots_dir(self):
         """state-snapshots/ is excluded for the same reason as backups/: every
         quick / pre-update snapshot holds its own copy of state.db, so zipping
@@ -640,7 +646,9 @@ class TestBackupEdgeCases:
         args = Namespace(output=str(out_zip))
 
         from hermes_cli.backup import run_backup
-        run_backup(args)
+        with pytest.raises(SystemExit) as exc:
+            run_backup(args)
+        assert exc.value.code == 1
 
         # Zip should still be created with the valid files
         assert out_zip.exists()
@@ -649,6 +657,19 @@ class TestBackupEdgeCases:
             assert "config.yaml" in names
             # The pre-1980 file should be skipped, not crash the backup
             assert "ancient.txt" not in names
+
+    def test_non_sqlite_db_suffix_is_backed_up_as_regular_file(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        (hermes_home / "Thumbs.db").write_bytes(b"not a sqlite database")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        out_zip = tmp_path / "out.zip"
+        from hermes_cli.backup import run_backup
+        run_backup(Namespace(output=str(out_zip)))
+        with zipfile.ZipFile(out_zip) as archive:
+            assert archive.read("Thumbs.db") == b"not a sqlite database"
 
 
 
@@ -1822,6 +1843,4 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
-
 
