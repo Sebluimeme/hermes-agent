@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import time
+from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -118,6 +119,27 @@ def _kanban_dispatch_allowed() -> bool:
     except ImportError:
         return True
     return not check_paused("kanban", logger)
+
+
+def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
+    """Run *func* in an empty ``Context`` so request-local ContextVars stay behind.
+
+    ``asyncio.to_thread`` copies the calling task's context onto the worker
+    thread. Supervised Kanban ticks are process-owned writers; if that copy
+    still carries a ``delegate_task`` child marker, ``write_txn``
+    false-trips. Since watchers spawn from a fresh ``Context``
+    (``_spawn_supervised``), this offload-boundary scrub is defense in
+    depth: it covers non-supervised spawn paths and any task context frozen
+    before spawn isolation shipped. An empty Context keeps the DB guard
+    intact for real children without exempting dispatcher writes.
+    """
+    return Context().run(func, *args)
+
+
+async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) -> Any:
+    """Offload blocking process-service work (dispatcher + notifier writers)
+    without inheriting request-local ContextVars."""
+    return await asyncio.to_thread(_run_in_fresh_context, func, *args)
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -679,7 +701,7 @@ class GatewayKanbanWatchersMixin:
                     except ValueError:
                         # Unknown platform string; skip and advance cursor so
                         # we don't replay forever.
-                        await asyncio.to_thread(
+                        await _to_thread_process_service(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         continue
@@ -699,7 +721,7 @@ class GatewayKanbanWatchersMixin:
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",
                             platform_str, sub["task_id"],
                         )
-                        await asyncio.to_thread(
+                        await _to_thread_process_service(
                             self._kanban_rewind,
                             sub,
                             d["cursor"],
@@ -1055,7 +1077,7 @@ class GatewayKanbanWatchersMixin:
                                     "subscription and retrying until delivery",
                                     sub["task_id"], platform_str, fails,
                                 )
-                            await asyncio.to_thread(
+                            await _to_thread_process_service(
                                 self._kanban_rewind,
                                 sub,
                                 d["cursor"],
@@ -1182,7 +1204,7 @@ class GatewayKanbanWatchersMixin:
                                     )
                                 # Rewind the pre-send claim so the next tick
                                 # retries; the event and route are never lost.
-                                await asyncio.to_thread(
+                                await _to_thread_process_service(
                                     self._kanban_rewind,
                                     sub,
                                     d["cursor"],
@@ -1279,7 +1301,7 @@ class GatewayKanbanWatchersMixin:
                                     )
                                 # Rewind the pre-send claim so the next tick
                                 # retries; the event and route are never lost.
-                                await asyncio.to_thread(
+                                await _to_thread_process_service(
                                     self._kanban_rewind,
                                     sub,
                                     d["cursor"],
@@ -1293,7 +1315,7 @@ class GatewayKanbanWatchersMixin:
                         # push subs): advance cursor. The cursor is the dedup
                         # mechanism — it prevents re-delivery of the same
                         # event on subsequent ticks.
-                        await asyncio.to_thread(
+                        await _to_thread_process_service(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         if not _is_push_adapter:
@@ -1323,7 +1345,7 @@ class GatewayKanbanWatchersMixin:
                                     sub["task_id"], _wk_err, exc_info=True,
                                 )
                         if task_terminal:
-                            await asyncio.to_thread(
+                            await _to_thread_process_service(
                                 self._kanban_unsub, sub, board_slug,
                             )
             except Exception as exc:
@@ -2206,7 +2228,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
-                pids = await asyncio.to_thread(_kb.reap_worker_zombies)
+                pids = await _to_thread_process_service(_kb.reap_worker_zombies)
                 if pids:
                     logger.info(
                         "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
@@ -2229,8 +2251,8 @@ class GatewayKanbanWatchersMixin:
                     # takes effect on the next tick, not on gateway restart (#49638).
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
-                        await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
-                    results = await asyncio.to_thread(_tick_once)
+                        await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
+                    results = await _to_thread_process_service(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
@@ -2249,7 +2271,7 @@ class GatewayKanbanWatchersMixin:
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
                     # Health telemetry (aggregate across boards)
-                    ready_pending = await asyncio.to_thread(_ready_nonempty)
+                    ready_pending = await _to_thread_process_service(_ready_nonempty)
                     if ready_pending and not any_spawned:
                         bad_ticks += 1
                     else:

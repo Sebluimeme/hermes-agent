@@ -203,6 +203,9 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
                 return "modal"
             if "daytona" in name:
                 return "daytona"
+            stamped = getattr(env, "_hermes_backend_name", None)
+            if isinstance(stamped, str) and stamped:
+                return stamped
         cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
@@ -210,12 +213,13 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
 
 
 def _uses_container_paths(task_id: str = "default") -> bool:
+    env_type = _terminal_env_type_for_task(task_id)
     try:
-        from tools.terminal_tool import _CONTAINER_BACKENDS
-        container_backends = _CONTAINER_BACKENDS
+        from tools.terminal_tool import _is_container_backend
+
+        return _is_container_backend(env_type)
     except Exception:
-        container_backends = _CONTAINER_PATH_BACKENDS_FALLBACK
-    return _terminal_env_type_for_task(task_id) in container_backends
+        return env_type in _CONTAINER_PATH_BACKENDS_FALLBACK
 
 
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
@@ -944,7 +948,10 @@ def _present_protected_instruction_approval(
         callback = None
     if callback is not None:
         choice = _approval.prompt_dangerous_approval(
-            display, description, allow_permanent=False, approval_callback=callback,
+            display, description,
+            allow_permanent=False,
+            allow_session=False,
+            approval_callback=callback,
         )
         if choice in {"once", "session", "always"}:
             return None
@@ -1136,6 +1143,11 @@ def _check_approval_required_write(paths: list[str],
         display_target=f"<write to {display_targets}>",
         cron_deny_message=blocked.format(
             why="requires approval but this cron session denies it."),
+        single_query_deny_message=blocked.format(
+            why="requires approval but single-query (-q) sessions run "
+                "without a user present to approve it. To allow flagged "
+                "actions in single-query mode, set approvals.single_query_mode: "
+                "approve in config.yaml."),
         autoapprove_log_prefix="ssh_config_write",
         fail_closed_when_no_human=True,
         no_human_block_message=blocked.format(
@@ -1652,7 +1664,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+            from tools.terminal_tool import _is_container_backend as _is_container
+
+            if _is_container(env_type):
                 container_config = {
                     "container_cpu": config.get("container_cpu", 1),
                     "container_memory": config.get("container_memory", 5120),
