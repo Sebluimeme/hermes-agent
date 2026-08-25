@@ -2,8 +2,8 @@
 
 The contract under test: data lives under ``<hermes home>/plugin-data/<name>/``
 (NOT the ``plugins/<name>/`` install tree), names that could escape the root
-are rejected, and the sqlite helper opens a WAL-mode connection inside the
-data dir.
+are rejected, and the sqlite helper uses Hermes' guarded journal mode inside
+the data dir.
 """
 
 from __future__ import annotations
@@ -43,7 +43,9 @@ def test_hostile_names_are_rejected(hermes_home, bad):
         plugin_data_dir(bad)
 
 
-def test_plugin_db_opens_wal_sqlite_in_the_data_dir(hermes_home):
+def test_plugin_db_uses_guarded_sqlite_mode_in_the_data_dir(hermes_home):
+    from hermes_state import is_sqlite_wal_reset_vulnerable
+
     conn = plugin_db("board")
     try:
         conn.execute("CREATE TABLE t (x)")
@@ -51,7 +53,7 @@ def test_plugin_db_opens_wal_sqlite_in_the_data_dir(hermes_home):
         conn.commit()
 
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-        assert mode == "wal"
+        assert mode == ("delete" if is_sqlite_wal_reset_vulnerable() else "wal")
     finally:
         conn.close()
 

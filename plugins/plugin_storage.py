@@ -66,15 +66,16 @@ def plugin_data_dir(name: str) -> Path:
 def plugin_db(name: str, filename: str = "data.db") -> sqlite3.Connection:
     """Open this plugin's SQLite database (created on first use).
 
-    Lives at ``<data dir>/<filename>``. WAL mode so a dashboard reader and an
-    agent-tool writer can coexist; ``check_same_thread=False`` matches the
-    multi-threaded FastAPI/tool environment plugins actually run in — the
+    Lives at ``<data dir>/<filename>``. The shared SQLite safety gate chooses
+    WAL or DELETE for the embedded runtime; ``check_same_thread=False`` matches
+    the multi-threaded FastAPI/tool environment plugins actually run in — the
     caller still owns transaction discipline.
     """
     if Path(filename).name != filename or not filename:
         raise ValueError(f"invalid plugin db filename: {filename!r}")
 
     conn = sqlite3.connect(plugin_data_dir(name) / filename, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
+    from hermes_state import apply_wal_with_fallback
+    apply_wal_with_fallback(conn, db_label=f"plugin:{name}/{filename}")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
