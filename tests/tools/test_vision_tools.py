@@ -30,6 +30,61 @@ from tools.vision_tools import (
 _RESOLVES = [(2, 1, 6, "", ("93.184.216.34", 0))]
 
 
+def test_native_vision_result_is_attested_on_active_kanban_review(
+    tmp_path, monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import vision_tools as vt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="native bridge", assignee="coder")
+        assert kb.claim_task(conn, task_id) is not None
+        implementation_run = kb.latest_run(conn, task_id)
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            reviewer="coder",
+            expected_run_id=implementation_run.id,
+        )
+        assert kb.claim_review_task(conn, task_id) is not None
+        review_run = kb.latest_run(conn, task_id)
+        assert review_run is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run.id))
+    digest = "a" * 64
+    vt._record_kanban_native_visual_check(
+        {
+            "meta": {
+                "native_vision": True,
+                "sha256": digest,
+                "size_bytes": 123,
+            }
+        }
+    )
+
+    conn = kb.connect()
+    try:
+        events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "visual_checked"
+        ]
+        assert len(events) == 1
+        assert events[0].run_id == review_run.id
+        assert events[0].payload["sha256"] == digest
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # _validate_image_url — urlparse-based validation
 # ---------------------------------------------------------------------------

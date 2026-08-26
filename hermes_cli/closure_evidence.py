@@ -16,6 +16,8 @@ attempt routed through the CLI (`hermes kanban complete`) or the
                   naming the concrete test command/run and its outcome.
 - ``canary``   — ``metadata["evidence"] == {"kind": "canary", "detail": ...}``,
                   naming a live probe result (e.g. the LOT 2 OAuth canary).
+- ``visual``   — ``metadata["evidence"] == {"kind": "visual", "detail": ...}``,
+                  naming the hash-bound Coder + Gemini visual gate result.
 
 Deliberately NOT accepted as evidence: free-form ``summary``/``result``
 prose. Sniffing prose for words like "tests passed" is exactly the silent,
@@ -34,15 +36,15 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 # Ordered for messages only; every kind here is equally sufficient.
-STRUCTURED_EVIDENCE_KINDS = ("review", "artifact", "test", "canary")
+STRUCTURED_EVIDENCE_KINDS = ("review", "artifact", "test", "canary", "visual")
 
 # metadata["evidence"]["kind"] values accepted in addition to the
 # artifact/review shortcuts above.
-_FREEFORM_EVIDENCE_KINDS = ("test", "canary")
+_FREEFORM_EVIDENCE_KINDS = ("test", "canary", "visual")
 
 REJECTION_MESSAGE = (
     "no structured closure evidence found — a card can only become 'done' "
-    "with one of: metadata.evidence={{'kind': 'test'|'canary', 'detail': "
+    "with one of: metadata.evidence={{'kind': 'test'|'canary'|'visual', 'detail': "
     "'<concrete proof>'}}, a non-empty metadata.artifacts=[...], or by being "
     "approved from the review lane (kanban_request_review, then "
     "kanban_complete). Provide one, or call kanban_request_review / "

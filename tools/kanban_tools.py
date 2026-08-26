@@ -882,6 +882,15 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and keep this task alive."
                 )
 
+            visual_rejection, metadata = kb.visual_completion_projection(
+                conn, tid, metadata,
+            )
+            if visual_rejection is not None:
+                return tool_error(
+                    "kanban_complete: visual review gate not ready — "
+                    f"{visual_rejection}"
+                )
+
             # LOT 4 — a card cannot become 'done' on bare assertion. See
             # hermes_cli/closure_evidence.py for the accepted evidence kinds.
             closure_rejection = closure_evidence.closure_gate(
@@ -904,6 +913,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"{artifact_err}. Your task is still in-flight and its "
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
+                )
+            except kb.VisualReviewGateError as visual_err:
+                return tool_error(
+                    f"kanban_complete: visual review gate not ready — {visual_err}"
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -968,6 +981,9 @@ def _handle_completion_ready(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
+            visual_rejection, metadata = kb.visual_completion_projection(
+                conn, tid, metadata,
+            )
             evidence = closure_evidence.classify_closure_evidence(
                 prior_status=task.status,
                 metadata=metadata,
@@ -979,9 +995,11 @@ def _handle_completion_ready(args: dict, **kw) -> str:
                 )
             if not evidence.satisfied:
                 missing.append(
-                    "structured evidence: metadata.evidence test/canary, "
+                    "structured evidence: metadata.evidence test/canary/visual, "
                     "a real artifact, or approval from review"
                 )
+            if visual_rejection is not None:
+                missing.append(f"visual review: {visual_rejection}")
             if task.status != "review" and not (args.get("summary") or args.get("result")):
                 missing.append("summary or result")
             return json.dumps({
@@ -1231,6 +1249,53 @@ def _handle_request_changes(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_request_changes failed")
         return tool_error(f"kanban_request_changes: {e}")
+
+
+def _handle_defer_review(args: dict, **kw) -> str:
+    """Defer a visual final review without creating a human blocker."""
+    delegated_err = _reject_delegated_child_mutation("kanban_defer_review")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        return tool_error("reason is required")
+    retry_at = args.get("retry_at")
+    if retry_at is None:
+        return tool_error("retry_at is required (Unix timestamp returned by the visual review script)")
+    metadata = _stamp_worker_session_metadata(
+        tid,
+        {"visual_review_deferred": True, "retry_at": retry_at},
+    )
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok, detail = kb.defer_review_task(
+                conn,
+                tid,
+                reason=redact_sensitive_text(reason, force=True),
+                retry_at=int(retry_at),
+                expected_run_id=_worker_run_id(tid),
+                metadata=metadata,
+            )
+            if not ok:
+                return tool_error(f"could not defer visual review for {tid}: {detail}")
+            return _ok(task_id=tid, status="review", retry_at=int(retry_at))
+        finally:
+            conn.close()
+    except (TypeError, ValueError) as e:
+        return tool_error(f"kanban_defer_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_defer_review failed")
+        return tool_error(f"kanban_defer_review: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -2497,6 +2562,33 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
     },
 }
 
+KANBAN_DEFER_REVIEW_SCHEMA = {
+    "name": "kanban_defer_review",
+    "description": (
+        "Temporarily defer an active review run until a precise retry time. "
+        "Use when final visual validation is temporarily unavailable (quota, "
+        "rate limit, or transient network failure). The task remains in the "
+        "review phase, resumes automatically in the same reviewer session, "
+        "and does not ask the human for action."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "reason": {
+                "type": "string",
+                "description": "Short factual reason the final visual check could not run.",
+            },
+            "retry_at": {
+                "type": "integer",
+                "description": "Future Unix timestamp supplied by the visual-review script.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["reason", "retry_at"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -3068,6 +3160,15 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
+)
+
+registry.register(
+    name="kanban_defer_review",
+    toolset="kanban",
+    schema=KANBAN_DEFER_REVIEW_SCHEMA,
+    handler=_handle_defer_review,
+    check_fn=_check_kanban_mode,
+    emoji="⏳",
 )
 
 registry.register(

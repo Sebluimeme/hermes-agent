@@ -78,7 +78,7 @@ _HERMES_CORE_TOOLS = [
     # tools/kanban_tools.py.
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_request_review",
-    "kanban_request_changes",
+    "kanban_request_changes", "kanban_defer_review",
     "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock", "kanban_authorize_instruction_edit",
@@ -303,7 +303,7 @@ TOOLSETS = {
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
-            "kanban_request_review", "kanban_request_changes",
+            "kanban_request_review", "kanban_request_changes", "kanban_defer_review",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock", "kanban_authorize_instruction_edit",

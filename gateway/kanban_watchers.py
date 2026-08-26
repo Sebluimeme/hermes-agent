@@ -337,7 +337,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "archived", "unblocked", "block_loop_detected", "review_requested", "relayed_to_coder")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "archived", "unblocked", "block_loop_detected", "review_requested", "visual_review_deferred", "relayed_to_coder")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -915,6 +915,20 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
+                            )
+                        elif kind == "visual_review_deferred":
+                            retry_at = 0
+                            if ev.payload and ev.payload.get("retry_at"):
+                                retry_at = int(ev.payload["retry_at"])
+                            resume = (
+                                time.strftime("%d/%m à %H:%M", time.localtime(retry_at))
+                                if retry_at else "dès que Gemini redevient disponible"
+                            )
+                            msg = (
+                                f"⏳ {title}\n"
+                                "Le travail est prêt, mais la validation visuelle finale "
+                                "Gemini est temporairement indisponible.\n"
+                                f"Reprise automatique {resume}. Aucune action requise."
                             )
                         elif kind == "relayed_to_coder":
                             # A route relay is deliberately the one direct,

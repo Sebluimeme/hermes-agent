@@ -31,7 +31,7 @@ Do not use it for a separate downstream review card. A downstream card is ordina
 ## Prerequisites
 
 - A Kanban worker context with the current task and run identifiers.
-- Native Kanban tools: `kanban_show`, `kanban_comment`, `kanban_complete`, `kanban_request_changes`, and `kanban_block`.
+- Native Kanban tools: `kanban_show`, `kanban_comment`, `kanban_completion_ready`, `kanban_complete`, `kanban_request_changes`, `kanban_defer_review`, and `kanban_block`.
 - Workspace access through `read_file`, `search_files`, and `terminal` when the deliverable is code.
 - The task's original specification, acceptance criteria, handoff summary, and prior run history must be available through `kanban_show`.
 
@@ -85,6 +85,51 @@ Call `kanban_show` and identify:
 - findings from prior review rounds.
 
 Treat the handoff as a claim to verify, not as proof that the work is correct.
+
+### Web visual candidates
+
+When the latest handoff contains `metadata.visual_review.required=true`, the
+review is a two-stage visual gate in addition to the ordinary code checks:
+
+1. Stay in the reviewer role; never edit the candidate.
+2. Load every handoff screenshot with `vision_analyze`. The active Coder model
+   sees the pixels natively; do not call Gemini for this intermediate review.
+   Check the expected behavior, visible defects, desktop/mobile consistency,
+   overflow, truncation, contrast, empty states and the key interaction state.
+3. If a correctable defect remains, use `kanban_request_changes` immediately.
+4. Only after Coder's native verdict is PASS, run exactly one final independent
+   Gemini call over the whole desktop/mobile set:
+
+   ```text
+   python3 ~/.hermes/scripts/gemini_review_image.py \
+     <desktop.png> <mobile.png> --task-id <current-task-id> \
+     --attendu "<observable acceptance result>"
+   ```
+
+   The command prints the evidence path. It reuses a prior PASS when the exact
+   screenshot hashes and expectation are unchanged, so retries do not spend a
+   second Gemini request.
+5. `VERDICT: PROBLEME` means `kanban_request_changes`; never reinterpret it as
+   approval. A temporary failure prints `NEXT_RETRY_AT`. Call
+   `kanban_defer_review(reason=..., retry_at=...)`: the dispatcher keeps the
+   task in review and resumes this same reviewer session automatically. Use a
+   human block only for a non-transient prerequisite that actually needs a
+   decision.
+6. On `VERDICT: OK`, call `kanban_completion_ready`, then `kanban_complete`
+   with:
+
+   ```text
+   metadata={
+     "visual_review": {
+       "coder_verdict": "PASS",
+       "gemini_evidence": "<printed evidence path>"
+     }
+   }
+   ```
+
+The completion gate verifies that this run belongs to Coder, that native vision
+loaded both exact screenshot hashes, and that the Gemini PASS was produced for
+the same files. A prose-only visual claim cannot complete the card.
 
 ### 2. Compare requested behavior with delivered behavior
 

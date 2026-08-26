@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import time
 from pathlib import Path
 
 
@@ -804,6 +805,37 @@ def test_notifier_delivers_one_clean_final_coder_relay(tmp_path, monkeypatch):
     assert adapter.sent[0]["text"] == "Relais automatique vers Coder.\nRetour estimé Claude 2 : 09:30"
     assert tid not in adapter.sent[0]["text"]
     assert "@default" not in adapter.sent[0]["text"]
+
+
+def test_notifier_explains_visual_retry_requires_no_human_action(tmp_path, monkeypatch):
+    db_path = tmp_path / "visual-review-deferred.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    retry_at = int(time.time()) + 900
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="Finaliser la page mobile", assignee="coder")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn,
+            tid,
+            "visual_review_deferred",
+            {"reason": "quota Gemini", "retry_at": retry_at},
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "validation visuelle finale Gemini" in message
+    assert "Reprise automatique" in message
+    assert "Aucune action requise" in message
+    assert tid not in message
 
 
 def test_notifier_suppresses_block_loop_ping_when_already_auto_resolved(

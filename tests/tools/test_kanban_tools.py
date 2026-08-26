@@ -79,7 +79,7 @@ def test_kanban_tools_visible_for_dispatcher_owned_worker(monkeypatch, tmp_path)
 
     worker_lifecycle_tools = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
-        "kanban_comment", "kanban_create",
+        "kanban_comment", "kanban_create", "kanban_defer_review",
     }
     missing = worker_lifecycle_tools - names
     assert not missing, (
@@ -179,6 +179,47 @@ def test_completion_ready_lists_missing_evidence_before_terminal_write(worker_en
     }))
     assert ready["ready"] is True
     assert ready["evidence"]["kind"] == "test"
+
+
+def test_defer_review_tool_keeps_review_retryable(worker_env):
+    import time
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert kb.request_review(
+            conn,
+            worker_env,
+            summary="ready for independent review",
+            reviewer="test-worker",
+            expected_run_id=run.id,
+        )
+        assert kb.claim_review_task(conn, worker_env) is not None
+    finally:
+        conn.close()
+
+    retry_at = int(time.time()) + 900
+    result = json.loads(
+        kt._handle_defer_review(
+            {"reason": "temporary final-check quota", "retry_at": retry_at}
+        )
+    )
+    assert result["ok"] is True
+    assert result["status"] == "review"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "review"
+        assert task.next_retry_at == retry_at
+        assert kb.latest_run(conn, worker_env).outcome == "review_deferred"
+    finally:
+        conn.close()
 
 
 def test_create_many_is_atomic_dependency_aware_and_idempotent(worker_env):

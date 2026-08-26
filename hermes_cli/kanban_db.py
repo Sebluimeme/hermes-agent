@@ -1162,6 +1162,9 @@ class Task:
     last_checkpoint_at: Optional[int] = None
     failure_class: Optional[str] = None
     action_required: Optional[str] = None
+    # Earliest Unix timestamp at which a transiently deferred task may be
+    # claimed again (including visual-review retries).
+    next_retry_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1269,6 +1272,7 @@ class Task:
             last_checkpoint_at=(row["last_checkpoint_at"] if "last_checkpoint_at" in keys else None),
             failure_class=(row["failure_class"] if "failure_class" in keys else None),
             action_required=(row["action_required"] if "action_required" in keys else None),
+            next_retry_at=(row["next_retry_at"] if "next_retry_at" in keys else None),
         )
 
 
@@ -5371,6 +5375,7 @@ def claim_review_task(
                    preflight_status = 'passed',
                    execution_status = 'reviewing',
                    next_retry_at = NULL,
+                   failure_class = NULL,
                    action_required = NULL
              WHERE id = ?
                AND status = 'review'
@@ -5944,6 +5949,162 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class VisualReviewGateError(ValueError):
+    """Raised when a web/UI card lacks its two-stage visual proof."""
+
+
+def _latest_review_handoff_metadata(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT metadata FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        metadata = json.loads(row["metadata"] or "{}") if row else {}
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    return metadata if isinstance(metadata, dict) else None
+
+
+def _active_review_run_facts(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[Optional[int], Optional[str], set[str]]:
+    """Return active review run id/profile and native screenshot hashes."""
+    task_row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not task_row or task_row["current_run_id"] is None:
+        return None, None, set()
+    run_id = int(task_row["current_run_id"])
+    run = conn.execute(
+        "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    claimed = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        claimed_payload = json.loads(claimed["payload"] or "{}") if claimed else {}
+    except (TypeError, json.JSONDecodeError):
+        claimed_payload = {}
+    if not isinstance(claimed_payload, dict) or claimed_payload.get("source_status") != "review":
+        return run_id, run["profile"] if run else None, set()
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'visual_checked' "
+        "ORDER BY id ASC",
+        (task_id, run_id),
+    ).fetchall()
+    hashes: set[str] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("engine") == "native"
+            and isinstance(payload.get("sha256"), str)
+        ):
+            hashes.add(payload["sha256"].lower())
+    return run_id, run["profile"] if run else None, hashes
+
+
+def visual_completion_projection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict[str, Any]],
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Project the visual completion gate without mutating Kanban state."""
+    task = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if task is None:
+        return "task not found", metadata
+    handoff = _latest_review_handoff_metadata(conn, task_id)
+    try:
+        from hermes_cli.visual_review import (
+            VisualReviewError,
+            is_visual_web_task,
+            validate_final_review,
+        )
+
+        required = is_visual_web_task(
+            task["title"] or "",
+            task["body"] or "",
+            handoff or metadata,
+        ) or is_visual_web_task(
+            task["title"] or "",
+            task["body"] or "",
+            metadata,
+        )
+        if not required:
+            return None, metadata
+        if not handoff:
+            return (
+                "web visual task must use kanban_request_review with desktop/mobile screenshots before completion",
+                metadata,
+            )
+        _run_id, reviewer_profile, native_hashes = _active_review_run_facts(conn, task_id)
+        normalized = validate_final_review(
+            task_id=task_id,
+            handoff_metadata=handoff,
+            completion_metadata=metadata,
+            reviewer_profile=reviewer_profile,
+            native_checked_hashes=native_hashes,
+        )
+        projected = dict(metadata or {})
+        projected["visual_review"] = normalized
+        projected.setdefault(
+            "evidence",
+            {
+                "kind": "visual",
+                "detail": "Coder native PASS + Gemini final OK on matching desktop/mobile captures",
+            },
+        )
+        return None, projected
+    except VisualReviewError as exc:
+        return str(exc), metadata
+
+
+def record_visual_check(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    engine: str,
+    sha256: str,
+    size: Optional[int] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Durably attest that the active worker loaded one exact image."""
+    digest = str(sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        return False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] is None:
+            return False
+        run_id = int(row["current_run_id"])
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "visual_checked",
+            {"engine": str(engine), "sha256": digest, "size": size},
+            run_id=run_id,
+        )
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6023,6 +6184,9 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    visual_error, metadata = visual_completion_projection(conn, task_id, metadata)
+    if visual_error is not None:
+        raise VisualReviewGateError(visual_error)
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -7193,16 +7357,32 @@ def request_review(
         return (ok, reason) if with_reason else ok
 
     summary = redact_review_value(summary)
-    metadata = redact_review_value(metadata)
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT title, body, assignee, status, claim_lock, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        # Web/UI candidates always enter the independent Coder review lane.
+        # The handoff is normalised here (the domain boundary shared by CLI,
+        # dashboard and model tools), so a caller cannot bypass desktop/mobile
+        # screenshot hashing by choosing another control surface.
+        try:
+            from hermes_cli.visual_review import prepare_review_handoff
+
+            metadata, reviewer = prepare_review_handoff(
+                task_id=task_id,
+                title=trow["title"] or "",
+                body=trow["body"] or "",
+                metadata=metadata if isinstance(metadata, dict) else None,
+                reviewer=reviewer,
+            )
+        except ValueError as exc:
+            return _ret(False, f"visual review handoff rejected: {exc}")
+        metadata = redact_review_value(metadata)
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -7437,6 +7617,77 @@ def request_changes(
             run_id=run_id,
         )
     return True, implementer
+
+
+def defer_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    retry_at: int,
+    expected_run_id: Optional[int] = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> tuple[bool, Optional[str]]:
+    """Return an active reviewer to ``review`` with an automatic retry time.
+
+    This is intentionally distinct from ``block_task``: a temporary Gemini
+    quota/network condition needs no human action and must preserve the review
+    phase plus the exact reviewer session.  The dispatcher already honours
+    ``next_retry_at`` for review rows and will resume the task when due.
+    """
+    reason = str(redact_review_value(reason or "")).strip()
+    if not reason:
+        return False, "reason is required"
+    now = int(time.time())
+    try:
+        retry_at = int(retry_at)
+    except (TypeError, ValueError):
+        return False, "retry_at must be a Unix timestamp"
+    if retry_at <= now:
+        return False, "retry_at must be in the future"
+    if retry_at > now + 7 * 24 * 3600:
+        return False, "retry_at cannot be more than seven days away"
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, mission_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, "task not found"
+        current_run_id = row["current_run_id"]
+        if row["status"] != "running" or current_run_id is None:
+            return False, "task is not in an active review run"
+        if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
+            return False, "run_id mismatch"
+        if _retry_status_for_run(conn, task_id, int(current_run_id)) != "review":
+            return False, "active run was not claimed from review"
+        cur = conn.execute(
+            "UPDATE tasks SET status='review', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, next_retry_at=?, "
+            "execution_status='waiting_visual_review', "
+            "failure_class='visual_review_unavailable', action_required=NULL "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (retry_at, task_id, int(current_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during review deferral"
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="review_deferred",
+            status="retry_wait",
+            summary=reason,
+            metadata=metadata,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "visual_review_deferred",
+            {"reason": reason, "retry_at": retry_at, "source_status": "review"},
+            run_id=run_id,
+        )
+        _refresh_mission_status(conn, row["mission_id"])
+    return True, None
 
 
 def promote_task(
@@ -12684,6 +12935,7 @@ def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optio
             )
             if previous is None or previous.outcome not in {
                 "blocked", "rate_limited", "crashed", "timed_out", "stale",
+                "review_deferred",
             }:
                 return None
             if previous.profile and task.assignee and previous.profile != task.assignee:

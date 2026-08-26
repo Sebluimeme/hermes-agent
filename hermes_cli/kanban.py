@@ -725,6 +725,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "reason", nargs="+", help="Concrete changes required before re-review",
     )
 
+    p_defer_review = sub.add_parser(
+        "defer-review",
+        help="Defer an active visual review until an automatic retry time",
+    )
+    p_defer_review.add_argument("task_id")
+    p_defer_review.add_argument(
+        "--retry-at", required=True, type=int,
+        help="Future Unix timestamp returned by the final visual-review command.",
+    )
+    p_defer_review.add_argument(
+        "--reason", required=True,
+        help="Short factual reason the final visual check is temporarily unavailable.",
+    )
+
     p_reopen_review = sub.add_parser(
         "reopen-review",
         help="Send one or more review tasks back for changes (review -> ready/todo)",
@@ -1214,6 +1228,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "recover-instruction-edit": _cmd_recover_instruction_edit,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
+            "defer-review": _cmd_defer_review,
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
@@ -2377,26 +2392,48 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
+            visual_rejection, projected_metadata = kb.visual_completion_projection(
+                conn, tid, metadata,
+            )
+            if visual_rejection is not None:
+                print(
+                    f"kanban: {tid}: visual review gate not ready — {visual_rejection}",
+                    file=sys.stderr,
+                )
+                failed.append(tid)
+                continue
+
             # LOT 4 — a card cannot become 'done' on bare assertion. See
             # hermes_cli/closure_evidence.py for the accepted evidence kinds.
             closure_rejection = closure_evidence.closure_gate(
                 prior_status=getattr(task, "status", None),
-                metadata=metadata,
+                metadata=projected_metadata,
             )
             if closure_rejection is not None:
                 print(f"kanban: {tid}: {closure_rejection}", file=sys.stderr)
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            visual_gate_failed = False
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=projected_metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.VisualReviewGateError as exc:
+                completed = False
+                visual_gate_failed = True
+                print(
+                    f"kanban: {tid}: visual review gate not ready — {exc}",
+                    file=sys.stderr,
+                )
+            if not completed:
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                if not visual_gate_failed:
+                    print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
@@ -2627,6 +2664,25 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             f"Requested changes for {tid}"
             + (f"; routed to {detail}" if detail else "")
         )
+    return 0
+
+
+def _cmd_defer_review(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        ok, detail = kb.defer_review_task(
+            conn,
+            args.task_id,
+            reason=args.reason,
+            retry_at=args.retry_at,
+            expected_run_id=_worker_run_id_for(args.task_id),
+        )
+        if not ok:
+            print(
+                f"cannot defer visual review for {args.task_id}: {detail}",
+                file=sys.stderr,
+            )
+            return 1
+    print(f"Deferred visual review for {args.task_id} until {args.retry_at}")
     return 0
 
 

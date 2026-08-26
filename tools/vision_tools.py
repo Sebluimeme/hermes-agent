@@ -31,6 +31,7 @@ Usage:
 import base64
 import contextlib
 import asyncio
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 import logging
@@ -1084,6 +1085,7 @@ def _build_native_vision_tool_result(
     question: str,
     image_data_url: str,
     image_size_bytes: int,
+    image_sha256: Optional[str] = None,
     scale_note: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the multimodal tool-result envelope returned by the fast path.
@@ -1133,8 +1135,45 @@ def _build_native_vision_tool_result(
             "image_url": image_url[:200],
             "size_bytes": image_size_bytes,
             "native_vision": True,
+            "sha256": image_sha256,
         },
     }
+
+
+def _record_kanban_native_visual_check(result: Any) -> None:
+    """Best-effort audit bridge from native vision to the active Kanban run."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id or not isinstance(result, dict):
+        return
+    meta = result.get("meta")
+    if not isinstance(meta, dict) or not meta.get("native_vision"):
+        return
+    digest = str(meta.get("sha256") or "").strip().lower()
+    if not digest:
+        return
+    expected_run_id = None
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if raw_run_id:
+        try:
+            expected_run_id = int(raw_run_id)
+        except ValueError:
+            return
+    try:
+        from hermes_cli import kanban_db
+
+        with contextlib.closing(kanban_db.connect()) as conn:
+            kanban_db.record_visual_check(
+                conn,
+                task_id,
+                engine="native",
+                sha256=digest,
+                size=int(meta.get("size_bytes") or 0),
+                expected_run_id=expected_run_id,
+            )
+    except Exception as exc:
+        # Seeing the image must not fail because the audit DB is briefly busy;
+        # the completion gate will simply report the missing durable proof.
+        logger.debug("Kanban native visual-check audit skipped: %s", exc)
 
 
 @contextlib.asynccontextmanager
@@ -1197,6 +1236,7 @@ async def _vision_analyze_native(
 
         detected_mime_type = resolved.mime
         image_size_bytes = len(resolved.data)
+        source_sha256 = hashlib.sha256(resolved.data).hexdigest()
         temp_dir = get_hermes_dir("cache/vision", "temp_vision_images")
         temp_dir.mkdir(parents=True, exist_ok=True)
         temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.img"
@@ -1286,15 +1326,18 @@ async def _vision_analyze_native(
                     success=False,
                 )
 
-        return _build_native_vision_tool_result(
+        result = _build_native_vision_tool_result(
             image_url=image_url,
             question=question,
             image_data_url=image_data_url,
             image_size_bytes=image_size_bytes,
+            image_sha256=source_sha256,
             scale_note=_build_scale_note(
                 _scale_info or None, _crop_offset or None,
             ),
         )
+        await asyncio.to_thread(_record_kanban_native_visual_check, result)
+        return result
 
     except Exception as exc:
         logger.warning("Native vision fast path failed: %s", exc)
