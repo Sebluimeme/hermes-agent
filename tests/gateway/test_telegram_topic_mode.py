@@ -327,6 +327,123 @@ async def test_managed_topic_binding_reuses_restored_session_over_static_lane_se
 
 
 @pytest.mark.asyncio
+async def test_output_validation_retry_is_internal_and_bounded(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+    from hermes_cli.output_validation import SAFE_UNVERIFIED_RESPONSE
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=session_db)
+    repaired = "C’est terminé, preuve vérifiée : 7/7 OK, commit d47423d."
+    runner._run_agent = AsyncMock(
+        side_effect=[
+            {
+                "final_response": SAFE_UNVERIFIED_RESPONSE,
+                "pre_transform_response": "C’est terminé.",
+                "output_validation_retry": True,
+                "messages": [{"role": "assistant", "content": "C’est terminé."}],
+                "session_id": "proof-session",
+            },
+            {
+                "final_response": repaired,
+                "output_validation_retry": False,
+                "messages": [],
+                "session_id": "proof-session",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("corrige et vérifie"))
+
+    assert result == repaired
+    assert runner._run_agent.await_count == 2
+    recovery = runner._run_agent.await_args_list[1].kwargs
+    assert recovery["message"].startswith("[HERMES_RECOVERY_OUTPUT_VALIDATION]")
+    assert recovery["persist_user_display_kind"] == "automatic_recovery"
+    assert "output-proof-guard" not in result
+
+
+@pytest.mark.asyncio
+async def test_output_validation_second_rejection_returns_clean_safe_status(
+    tmp_path, monkeypatch
+):
+    import gateway.run as gateway_run
+    from hermes_cli.output_validation import SAFE_UNVERIFIED_RESPONSE
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=session_db)
+    rejected = {
+        "final_response": SAFE_UNVERIFIED_RESPONSE,
+        "pre_transform_response": "C’est terminé.",
+        "output_validation_retry": True,
+        "messages": [],
+        "session_id": "proof-session",
+    }
+    runner._run_agent = AsyncMock(side_effect=[dict(rejected), dict(rejected)])
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("corrige et vérifie"))
+
+    assert result == SAFE_UNVERIFIED_RESPONSE
+    assert runner._run_agent.await_count == 2
+    assert "output-proof-guard" not in result
+    assert "HERMES_OUTPUT_VALIDATION_RETRY" not in result
+
+
+@pytest.mark.asyncio
+async def test_output_validation_kanban_delivery_uses_deterministic_proof(
+    tmp_path, monkeypatch
+):
+    import gateway.run as gateway_run
+    import hermes_cli.output_validation as output_validation
+    from hermes_cli.output_validation import SAFE_UNVERIFIED_RESPONSE
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=session_db)
+    runner._run_agent = AsyncMock(
+        side_effect=[
+            {
+                "final_response": SAFE_UNVERIFIED_RESPONSE,
+                "pre_transform_response": "C’est terminé.",
+                "output_validation_retry": True,
+                "messages": [],
+                "session_id": "proof-session",
+            },
+            {
+                "final_response": "Une reformulation libre qui passerait le garde.",
+                "output_validation_retry": False,
+                "messages": [],
+                "session_id": "proof-session",
+            },
+        ]
+    )
+    deterministic = (
+        "Mission livrée et vérifiée : correctif — 2/2 cartes terminées "
+        "et livrées — preuves durables : 7/7 OK, commit d47423d."
+    )
+    monkeypatch.setattr(
+        output_validation,
+        "verified_kanban_completion_message",
+        lambda _text: deterministic,
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("[kanban] Task t_6c46280b completed.")
+    )
+
+    assert result == deterministic
+    assert runner._run_agent.await_count == 2
+    assert "output-proof-guard" not in result
+
+
+@pytest.mark.asyncio
 async def test_telegram_group_prompt_is_not_topic_lobby_even_when_dm_topic_mode_enabled(
     tmp_path, monkeypatch
 ):
@@ -829,4 +946,3 @@ def test_get_telegram_topic_binding_by_session_returns_binding(tmp_path):
 # ---------------------------------------------------------------------------
 # Test for session-split thread_id recovery (issue #27166)
 # ---------------------------------------------------------------------------
-

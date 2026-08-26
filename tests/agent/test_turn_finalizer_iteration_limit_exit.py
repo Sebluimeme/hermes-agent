@@ -114,6 +114,33 @@ def _finalize(
     )
 
 
+def test_output_validation_signal_becomes_private_retry_flag(monkeypatch):
+    from hermes_cli.output_validation import (
+        OUTPUT_VALIDATION_RETRY_SIGNAL,
+        SAFE_UNVERIFIED_RESPONSE,
+    )
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **_kwargs: (
+            [OUTPUT_VALIDATION_RETRY_SIGNAL]
+            if name == "transform_llm_output"
+            else []
+        ),
+    )
+    result = _finalize(
+        _LimitAgent(),
+        final_response="C’est terminé.",
+        exit_reason="text_response(14 chars)",
+        api_call_count=1,
+    )
+
+    assert result["output_validation_retry"] is True
+    assert result["pre_transform_response"] == "C’est terminé."
+    assert result["final_response"] == SAFE_UNVERIFIED_RESPONSE
+    assert "HERMES_OUTPUT_VALIDATION_RETRY" not in result["final_response"]
+
+
 
 
 
@@ -371,5 +398,4 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     )
 
     record.assert_not_called()
-
 

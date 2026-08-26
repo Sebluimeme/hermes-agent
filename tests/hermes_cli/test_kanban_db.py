@@ -827,6 +827,63 @@ def test_mission_tracks_action_completion_and_delivery(kanban_home):
         ).fetchone()["status"] == "delivered"
 
 
+def test_new_active_child_reopens_delivered_mission_and_clears_terminal_times(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        mission_id = kb.ensure_mission(
+            conn,
+            title="mission",
+            request_text="fix then tidy",
+            idempotency_key="mission-reopen-child",
+        )
+        parent = kb.create_task(conn, title="fix", mission_id=mission_id)
+        assert kb.complete_task(
+            conn,
+            parent,
+            summary="fixed",
+            metadata={"evidence": {"kind": "test", "detail": "7/7 OK"}},
+        )
+        assert kb.mark_task_delivered(conn, parent)
+        delivered = conn.execute(
+            "SELECT status, completed_at, delivered_at FROM missions WHERE id = ?",
+            (mission_id,),
+        ).fetchone()
+        assert delivered["status"] == "delivered"
+        assert delivered["completed_at"] is not None
+        assert delivered["delivered_at"] is not None
+
+        child = kb.create_task(conn, title="tidy", parents=[parent])
+        reopened = conn.execute(
+            "SELECT status, completed_at, delivered_at FROM missions WHERE id = ?",
+            (mission_id,),
+        ).fetchone()
+        assert reopened["status"] == "active"
+        assert reopened["completed_at"] is None
+        assert reopened["delivered_at"] is None
+        event = conn.execute(
+            "SELECT kind, payload FROM mission_events WHERE mission_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (mission_id,),
+        ).fetchone()
+        assert event["kind"] == "reopened"
+        assert json.loads(event["payload"]) == {
+            "from": "delivered",
+            "to": "active",
+        }
+
+        assert kb.complete_task(
+            conn,
+            child,
+            summary="tidied",
+            metadata={"evidence": {"kind": "test", "detail": "7/7 OK"}},
+        )
+        assert kb.mark_task_delivered(conn, child)
+        assert conn.execute(
+            "SELECT status FROM missions WHERE id = ?", (mission_id,)
+        ).fetchone()["status"] == "delivered"
+
+
 def test_mission_origin_repairs_missing_notification_subscription(kanban_home):
     with kb.connect() as conn:
         mission_id = kb.ensure_mission(

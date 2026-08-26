@@ -3375,6 +3375,12 @@ def _refresh_mission_status(conn: sqlite3.Connection, mission_id: Optional[str])
     """Derive mission state from its cards inside the caller's transaction."""
     if not mission_id:
         return
+    mission = conn.execute(
+        "SELECT status, completed_at, delivered_at FROM missions WHERE id = ?",
+        (mission_id,),
+    ).fetchone()
+    if mission is None:
+        return
     rows = conn.execute(
         "SELECT status, delivery_status FROM tasks WHERE mission_id = ? "
         "AND queue_class = 'active'",
@@ -3393,12 +3399,31 @@ def _refresh_mission_status(conn: sqlite3.Connection, mission_id: Optional[str])
         delivered_at = now if delivered else None
     else:
         status, completed_at, delivered_at = "active", None, None
+    previous_status = str(mission["status"])
+    if completed_at is not None and previous_status in {"completed", "delivered"}:
+        completed_at = mission["completed_at"] or completed_at
+    if delivered_at is not None and previous_status == "delivered":
+        delivered_at = mission["delivered_at"] or delivered_at
     conn.execute(
-        "UPDATE missions SET status = ?, updated_at = ?, "
-        "completed_at = COALESCE(completed_at, ?), "
-        "delivered_at = COALESCE(delivered_at, ?) WHERE id = ?",
+        "UPDATE missions SET status = ?, updated_at = ?, completed_at = ?, "
+        "delivered_at = ? WHERE id = ?",
         (status, now, completed_at, delivered_at, mission_id),
     )
+    if (
+        previous_status in {"completed", "delivered"}
+        and status in {"active", "action_required"}
+    ):
+        conn.execute(
+            "INSERT INTO mission_events (mission_id, kind, payload, created_at) "
+            "VALUES (?, 'reopened', ?, ?)",
+            (
+                mission_id,
+                json.dumps(
+                    {"from": previous_status, "to": status}, ensure_ascii=False
+                ),
+                now,
+            ),
+        )
 
 
 def mark_task_delivered(conn: sqlite3.Connection, task_id: str) -> bool:

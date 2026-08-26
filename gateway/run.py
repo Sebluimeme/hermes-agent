@@ -6719,6 +6719,10 @@ class TurnRunner:
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
+            "pre_transform_response": result.get("pre_transform_response"),
+            "output_validation_retry": result.get(
+                "output_validation_retry", False
+            ),
             # Pass through the agent_persisted flag so the persistence block
             # above can correctly determine whether the codex app-server path
             # self-persisted (it didn't — see codex_runtime.py).  Default
@@ -20445,6 +20449,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
             )
+            # An output-proof failure is a private delivery-gate signal, not
+            # text for the user. Give the same session one bounded repair turn
+            # before the existing incomplete-response recovery and before any
+            # normal final delivery.
+            from hermes_cli.output_validation import (
+                SAFE_UNVERIFIED_RESPONSE,
+                output_validation_recovery_prompt,
+                requests_output_validation_retry,
+                verified_kanban_completion_message,
+            )
+            if requests_output_validation_retry(agent_result):
+                _original_inbound = (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else message_text
+                )
+                _verified_fallback = await asyncio.to_thread(
+                    verified_kanban_completion_message,
+                    _original_inbound,
+                )
+                _recovery_prompt = output_validation_recovery_prompt(
+                    rejected_response=agent_result.get("pre_transform_response"),
+                    verified_fallback=_verified_fallback,
+                )
+                _recovery_history = agent_result.get("messages") or history
+                agent_result = await self._run_agent(
+                    message=_recovery_prompt,
+                    context_prompt=context_prompt,
+                    history=_recovery_history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=None,
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=_recovery_prompt,
+                    persist_user_timestamp=time.time(),
+                    persist_user_display_kind="automatic_recovery",
+                    message_type=MessageType.TEXT,
+                )
+                agent_result["output_validation_recovery_attempted"] = True
+                # Re-read durable state after the recovery. When this is a
+                # delivered Kanban fan-in, code owns the final wording: the
+                # model cannot weaken, embellish or ambiguate its proof.
+                _verified_fallback = await asyncio.to_thread(
+                    verified_kanban_completion_message,
+                    _original_inbound,
+                )
+                if _verified_fallback:
+                    agent_result["final_response"] = _verified_fallback
+                    agent_result["output_validation_retry"] = False
+                    agent_result["response_transformed"] = True
+                    agent_result["output_validation_structured_fallback"] = True
+                elif requests_output_validation_retry(agent_result):
+                    # Never loop or leak an internal refusal when no durable
+                    # completion proof exists after the single repair turn.
+                    agent_result["final_response"] = (
+                        SAFE_UNVERIFIED_RESPONSE
+                    )
+                    agent_result["output_validation_retry"] = False
+                    agent_result["response_transformed"] = True
             # One code-driven recovery turn for hidden-reasoning exhaustion.
             # Run it synchronously in the SAME session before finalisation;
             # queuing here is too late for _run_agent's pending-message drain
@@ -30030,6 +30096,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _sc = stream_consumer_holder[0]
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
+            _validation_retry = bool(response.get("output_validation_retry"))
             _is_empty_sentinel = not _final or _final == "(empty)"
             # response_previewed means the interim_assistant_callback already
             # saw the final text, but only suppress the normal send if that
@@ -30135,7 +30202,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
                         session_key or "?",
                     )
-            elif not _is_empty_sentinel and _transformed and _sc is not None:
+            elif (
+                not _is_empty_sentinel
+                and _transformed
+                and not _validation_retry
+                and _sc is not None
+            ):
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id

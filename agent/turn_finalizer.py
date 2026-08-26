@@ -597,6 +597,7 @@ def finalize_turn(
 
     _response_transformed = False
     _pre_transform_response = None
+    _output_validation_retry = False
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
@@ -615,7 +616,25 @@ def finalize_turn(
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
                     _pre_transform_response = final_response
-                    final_response = _hook_result
+                    try:
+                        from hermes_cli.output_validation import (
+                            OUTPUT_VALIDATION_RETRY_SIGNAL,
+                            SAFE_UNVERIFIED_RESPONSE,
+                        )
+                    except Exception:
+                        OUTPUT_VALIDATION_RETRY_SIGNAL = ""
+                        SAFE_UNVERIFIED_RESPONSE = ""
+                    if (
+                        OUTPUT_VALIDATION_RETRY_SIGNAL
+                        and _hook_result == OUTPUT_VALIDATION_RETRY_SIGNAL
+                    ):
+                        # Never expose the plugin/runtime protocol token. The
+                        # gateway performs one same-session repair; non-gateway
+                        # callers receive an honest, user-safe fallback.
+                        _output_validation_retry = True
+                        final_response = SAFE_UNVERIFIED_RESPONSE
+                    else:
+                        final_response = _hook_result
                     _response_transformed = True
                     break  # First non-empty string wins
         except Exception as exc:
@@ -712,6 +731,7 @@ def finalize_turn(
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "pre_transform_response": _pre_transform_response,
+        "output_validation_retry": _output_validation_retry,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,
