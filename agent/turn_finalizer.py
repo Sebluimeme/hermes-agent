@@ -75,23 +75,29 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
         try:
-            _kb._record_task_failure(
-                _conn,
-                kanban_task,
-                error=(
+            _expected_run_id = None
+            try:
+                _expected_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+            except (TypeError, ValueError):
+                pass
+            _failure_kwargs = {
+                "error": (
                     f"Iteration budget exhausted "
                     f"({api_call_count}/{max_iterations}) — "
                     "task could not complete within the allowed "
                     "iterations"
                 ),
-                outcome="timed_out",
-                release_claim=True,
-                end_run=True,
-                event_payload_extra={
+                "outcome": "timed_out",
+                "release_claim": True,
+                "end_run": True,
+                "event_payload_extra": {
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
                 },
-            )
+            }
+            if _expected_run_id is not None:
+                _failure_kwargs["expected_run_id"] = _expected_run_id
+            _kb._record_task_failure(_conn, kanban_task, **_failure_kwargs)
         finally:
             try:
                 _conn.close()

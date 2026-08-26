@@ -2817,6 +2817,51 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "WHERE status IN ('done','archived')"
         )
 
+    # A successful retry used to retain ``next_retry_at``; a worker completing
+    # on its final allowed model turn could also receive a late timeout a few
+    # seconds later.  Keep the historical events as audit evidence, but restore
+    # the task row to the state implied by its authoritative terminal status.
+    # This migration is idempotent and repairs boards affected before the race
+    # guard was added to ``_record_task_failure``.
+    repair_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    repair_required = {
+        "id", "status", "execution_status", "failure_class",
+        "next_retry_at", "action_required", "consecutive_failures",
+        "last_failure_error",
+    }
+    drifted_done = (
+        conn.execute(
+            "SELECT id,execution_status,failure_class,next_retry_at,action_required "
+            "FROM tasks WHERE status='done' AND ("
+            "execution_status IN ('retrying','failed','blocked') "
+            "OR failure_class IS NOT NULL OR next_retry_at IS NOT NULL "
+            "OR action_required IS NOT NULL)"
+        ).fetchall()
+        if repair_required <= repair_columns
+        else []
+    )
+    for row in drifted_done:
+        conn.execute(
+            "UPDATE tasks SET execution_status='done',failure_class=NULL,"
+            "next_retry_at=NULL,action_required=NULL,consecutive_failures=0,"
+            "last_failure_error=NULL WHERE id=? AND status='done'",
+            (row["id"],),
+        )
+        _append_event(
+            conn,
+            row["id"],
+            "terminal_state_reconciled",
+            {
+                "reason": "stale_failure_state_after_completion",
+                "previous_execution_status": row["execution_status"],
+                "previous_failure_class": row["failure_class"],
+                "previous_next_retry_at": row["next_retry_at"],
+                "previous_action_required": row["action_required"],
+            },
+        )
+
     # Never backfill historical PIDs: without a captured process start
     # identity, a PID is not sufficient authority to stop a process safely.
     from hermes_cli import worker_contracts as _worker_contracts
@@ -6004,6 +6049,7 @@ def complete_task(
                        execution_status = 'done',
                        delivery_status = 'awaiting_delivery',
                        failure_class = NULL,
+                       next_retry_at = NULL,
                        action_required = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
@@ -6025,6 +6071,7 @@ def complete_task(
                        execution_status = 'done',
                        delivery_status = 'awaiting_delivery',
                        failure_class = NULL,
+                       next_retry_at = NULL,
                        action_required = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
@@ -10749,6 +10796,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -10802,6 +10850,18 @@ def _record_task_failure(
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        # A late process-finalizer must never downgrade a task that has already
+        # completed, nor may a stale worker close the newer retry that replaced
+        # it.  Both races are possible because ``kanban_complete`` is a tool
+        # call inside the last model iteration while process finalization runs
+        # afterwards.  Treat the task status + run id as the CAS authority.
+        if row["status"] in {"done", "archived", "failed", "cancelled"}:
+            return False
+        if (
+            expected_run_id is not None
+            and row["current_run_id"] != int(expected_run_id)
+        ):
             return False
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
