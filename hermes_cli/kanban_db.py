@@ -9456,6 +9456,12 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_workspace_busy: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks held because another live card owns the exact same workspace.
+
+    Entries are ``(task_id, workspace_path, owner_task_id)``. This is a normal
+    serialization wait, not a provider failure or human blocker.
+    """
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -11568,6 +11574,52 @@ def check_respawn_guard(
     return None
 
 
+def _has_spawnable_unoccupied(conn: sqlite3.Connection, status: str) -> bool:
+    """Return whether ``status`` contains work that can run *now*.
+
+    An assigned card sharing the exact workspace of a running card is healthy
+    queued work, not evidence that the dispatcher is stuck.  Keep the health
+    probe aligned with the dispatcher's single-writer workspace guard.
+    """
+    rows = conn.execute(
+        "SELECT id, assignee, workspace_kind, workspace_path FROM tasks "
+        "WHERE status = ? AND assignee IS NOT NULL "
+        "    AND claim_lock IS NULL AND queue_class = 'active' "
+        "    AND (next_retry_at IS NULL "
+        "         OR next_retry_at <= CAST(strftime('%s','now') AS INTEGER))",
+        (status,),
+    ).fetchall()
+    if not rows:
+        return False
+
+    occupied: set[str] = set()
+    for running in conn.execute(
+        "SELECT workspace_kind, workspace_path FROM tasks "
+        "WHERE status = 'running' AND workspace_path IS NOT NULL"
+    ):
+        key = _workspace_occupancy_key(
+            running["workspace_kind"], running["workspace_path"],
+        )
+        if key:
+            occupied.add(key)
+
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        profile_exists = None
+
+    for row in rows:
+        if profile_exists is not None and not profile_exists(row["assignee"]):
+            continue
+        key = _workspace_occupancy_key(
+            row["workspace_kind"], row["workspace_path"],
+        )
+        if key and key in occupied:
+            continue
+        return True
+    return False
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -11582,22 +11634,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return _has_spawnable_unoccupied(conn, "ready")
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
@@ -11608,21 +11645,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     used by the health telemetry to decide whether the dispatcher
     should have spawned a review agent.
     """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return _has_spawnable_unoccupied(conn, "review")
 
 
 def review_dispatch_enabled() -> bool:
@@ -11834,6 +11857,27 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         )
     except Exception:
         return "unknown"
+
+
+def _workspace_occupancy_key(
+    workspace_kind: Optional[str], workspace_path: Optional[str],
+) -> Optional[str]:
+    """Return a collision key only when ``workspace_path`` is already exact.
+
+    A new ``worktree`` card initially stores its repository anchor; different
+    task ids must still be allowed to materialize distinct linked worktrees
+    from that shared anchor. Once the path points inside ``.worktrees`` it is
+    exact and must be serialized like ``dir`` and ``scratch`` workspaces.
+    """
+    if not workspace_path:
+        return None
+    try:
+        path = Path(workspace_path).expanduser().resolve()
+    except OSError:
+        path = Path(workspace_path).expanduser().absolute()
+    if workspace_kind == "worktree" and ".worktrees" not in path.parts:
+        return None
+    return str(path)
 
 
 def dispatch_once(
@@ -12119,8 +12163,19 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
+    _occupied_workspaces: dict[str, str] = {}
+    for _workspace_row in conn.execute(
+        "SELECT id, workspace_kind, workspace_path FROM tasks "
+        "WHERE status = 'running' AND workspace_path IS NOT NULL"
+    ):
+        _key = _workspace_occupancy_key(
+            _workspace_row["workspace_kind"], _workspace_row["workspace_path"],
+        )
+        if _key:
+            _occupied_workspaces.setdefault(_key, _workspace_row["id"])
+
     ready_rows = conn.execute(
-        "SELECT id, assignee, routing_tier FROM tasks "
+        "SELECT id, assignee, routing_tier, workspace_kind, workspace_path FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "AND queue_class = 'active' "
         "AND (next_retry_at IS NULL OR next_retry_at <= CAST(strftime('%s','now') AS INTEGER)) "
@@ -12131,7 +12186,7 @@ def _dispatch_once_locked(
     review_rows = []
     if review_dispatch_enabled():
         review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
+            "SELECT id, assignee, workspace_kind, workspace_path FROM tasks "
             "WHERE status = 'review' AND claim_lock IS NULL "
             "AND queue_class = 'active' "
             "AND (next_retry_at IS NULL OR next_retry_at <= CAST(strftime('%s','now') AS INTEGER)) "
@@ -12250,6 +12305,15 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        row_workspace_key = _workspace_occupancy_key(
+            row["workspace_kind"], row["workspace_path"],
+        )
+        if row_workspace_key and row_workspace_key in _occupied_workspaces:
+            result.skipped_workspace_busy.append((
+                row["id"], row_workspace_key,
+                _occupied_workspaces[row_workspace_key],
+            ))
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -12429,6 +12493,8 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
+            if row_workspace_key:
+                _occupied_workspaces[row_workspace_key] = row["id"]
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -12492,6 +12558,11 @@ def _dispatch_once_locked(
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            resolved_workspace_key = _workspace_occupancy_key(
+                claimed.workspace_kind, str(workspace),
+            )
+            if resolved_workspace_key:
+                _occupied_workspaces[resolved_workspace_key] = claimed.id
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
@@ -12530,6 +12601,15 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        row_workspace_key = _workspace_occupancy_key(
+            row["workspace_kind"], row["workspace_path"],
+        )
+        if row_workspace_key and row_workspace_key in _occupied_workspaces:
+            result.skipped_workspace_busy.append((
+                row["id"], row_workspace_key,
+                _occupied_workspaces[row_workspace_key],
+            ))
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -12578,6 +12658,8 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
+            if row_workspace_key:
+                _occupied_workspaces[row_workspace_key] = row["id"]
             if _per_profile_cap is not None:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
@@ -12643,6 +12725,11 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            resolved_workspace_key = _workspace_occupancy_key(
+                claimed.workspace_kind, str(workspace),
+            )
+            if resolved_workspace_key:
+                _occupied_workspaces[resolved_workspace_key] = claimed.id
             if _per_profile_cap is not None and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1

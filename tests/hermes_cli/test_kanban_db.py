@@ -738,6 +738,48 @@ def test_dispatches_three_independent_workspaces_to_distinct_executors(
     assert len({workspace for _, workspace in spawned}) == 3
 
 
+def test_dispatch_serializes_two_tasks_sharing_the_same_workspace(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Two cards must never write concurrently in one exact checkout."""
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    routing.write_text(json.dumps({"agent_cooldowns": {
+        "claude1": {"dispatch_allowed": True, "preflight_required": False},
+    }}))
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    workspace = kanban_home / "shared-worktree"
+    workspace.mkdir()
+    spawned = []
+
+    def fake_spawn(task, resolved_workspace, **_kwargs):
+        spawned.append((task.id, resolved_workspace))
+        return 91_000 + len(spawned)
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn, title="first", assignee="claude1",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        second = kb.create_task(
+            conn, title="second", assignee="coder",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+        first_task = kb.get_task(conn, first)
+        second_task = kb.get_task(conn, second)
+        spawnable_while_first_runs = kb.has_spawnable_ready(conn)
+
+    assert result.spawned == [(first, "claude1", str(workspace.resolve()))]
+    assert result.skipped_workspace_busy == [
+        (second, str(workspace.resolve()), first),
+    ]
+    assert first_task is not None and first_task.status == "running"
+    assert second_task is not None and second_task.status == "ready"
+    assert spawnable_while_first_runs is False
+    assert spawned == [(first, str(workspace.resolve()))]
+
+
 def test_local_claude2_failure_does_not_fallback_to_another_executor(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="repair proxy", assignee="claude2")
