@@ -7118,6 +7118,13 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # A claimed review run is itself the active reviewer.  It cannot
+            # depend on another reviewer of the same card; approval,
+            # requested changes, or kanban_defer_review are the supported
+            # outcomes.  Refuse the self-wait that otherwise closes the run
+            # and makes the dispatcher spawn an identical reviewer forever.
+            if source_status == "review":
+                return False
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -7366,6 +7373,20 @@ def request_review(
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        if (
+            trow["status"] == "running"
+            and trow["current_run_id"] is not None
+            and _retry_status_for_run(
+                conn, task_id, int(trow["current_run_id"]),
+            ) == "review"
+        ):
+            return _ret(
+                False,
+                "the current run is already the active reviewer; approve with "
+                "kanban_complete, return defects with kanban_request_changes, "
+                "or defer a transient visual dependency with "
+                "kanban_defer_review instead of requesting another review",
+            )
         # Web/UI candidates always enter the independent Coder review lane.
         # The handoff is normalised here (the domain boundary shared by CLI,
         # dashboard and model tools), so a caller cannot bypass desktop/mobile
@@ -13153,20 +13174,36 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     resume_session_id = _transient_resume_session_id(task.id, board=board)
+    review_run = False
     try:
         with contextlib.closing(connect(board=board)) as budget_conn:
             prior_runs = list_runs(budget_conn, task.id)
+            review_run = (
+                task.current_run_id is not None
+                and _retry_status_for_run(
+                    budget_conn, task.id, task.current_run_id,
+                ) == "review"
+            )
     except Exception:
         prior_runs = []
     turn_budget = adaptive_worker_turn_budget(task, prior_runs)
     strategy_hint = _worker_retry_strategy_hint(prior_runs)
-    prompt = (
-        f"continue kanban task {task.id} from the existing session; first verify "
-        "the current board state and do not repeat already completed reads"
-        f"{strategy_hint}"
-        if resume_session_id
-        else f"work kanban task {task.id}{strategy_hint}"
-    )
+    if review_run:
+        prompt = (
+            f"review kanban task {task.id} as its currently active independent "
+            "reviewer. The active reviewer run shown by kanban_show is this "
+            "process, not another worker: inspect the handoff and finish with "
+            "kanban_complete, kanban_request_changes, or kanban_defer_review; "
+            f"never request another same-card review or wait for yourself{strategy_hint}"
+        )
+    else:
+        prompt = (
+            f"continue kanban task {task.id} from the existing session; first verify "
+            "the current board state and do not repeat already completed reads"
+            f"{strategy_hint}"
+            if resume_session_id
+            else f"work kanban task {task.id}{strategy_hint}"
+        )
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
@@ -13198,6 +13235,8 @@ def _default_spawn(
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_TURN_BUDGET"] = str(turn_budget)
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    if review_run:
+        env["HERMES_KANBAN_REVIEW_RUN"] = "1"
     if resume_session_id:
         env["HERMES_KANBAN_RESUME_SESSION_ID"] = resume_session_id
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
@@ -13502,6 +13541,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    if (
+        task.current_run_id is not None
+        and _retry_status_for_run(conn, task.id, task.current_run_id) == "review"
+    ):
+        lines.append("## Current assignment — independent reviewer")
+        lines.append(
+            f"You are the active reviewer in run #{task.current_run_id}; any "
+            "active reviewer shown for this card is this process, not a "
+            "dependency to wait for. Inspect the latest review_requested "
+            "handoff and choose exactly one terminal verdict: approve with "
+            "kanban_complete, return defects with kanban_request_changes, or "
+            "use kanban_defer_review for a transient visual-provider delay. "
+            "Never call kanban_request_review and never dependency-block "
+            "waiting for yourself."
+        )
+        lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")

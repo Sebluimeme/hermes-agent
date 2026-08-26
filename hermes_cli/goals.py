@@ -2164,6 +2164,27 @@ KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "blocks completion, call kanban_block with the reason instead."
 )
 
+KANBAN_REVIEW_CONTINUATION_TEMPLATE = (
+    "[Continuing the active independent Kanban review — the reviewer shown "
+    "on the card is YOU, not another worker]\n"
+    "Reason: {reason}\n\n"
+    "Inspect the implementation handoff and choose the reviewer verdict. "
+    "Approve with kanban_complete, return actionable defects with "
+    "kanban_request_changes, or use kanban_defer_review for a transient "
+    "visual-provider delay. Never call kanban_request_review and never block "
+    "as a dependency waiting for yourself."
+)
+
+KANBAN_REVIEW_FINALIZE_TEMPLATE = (
+    "[The independent review looks complete — the reviewer shown on the card "
+    "is YOU]\n"
+    "Reason: {reason}\n\n"
+    "Submit exactly one reviewer verdict now: kanban_complete to approve, "
+    "kanban_request_changes for correctable defects, or kanban_defer_review "
+    "for a transient visual-provider delay. Do not request another review or "
+    "wait for this same active run."
+)
+
 
 def run_kanban_goal_loop(
     *,
@@ -2175,6 +2196,7 @@ def run_kanban_goal_loop(
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
     log=None,
+    review_mode: bool = False,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
 
@@ -2271,10 +2293,18 @@ def run_kanban_goal_loop(
                 except Exception as exc:
                     _log(f"kanban goal loop: block_fn failed ({exc})")
                 return {"outcome": "blocked_budget", "turns_used": turns_used, "reason": "judged done, never finalized"}
-            prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
+            template = (
+                KANBAN_REVIEW_FINALIZE_TEMPLATE
+                if review_mode else KANBAN_GOAL_FINALIZE_TEMPLATE
+            )
+            prompt = template.format(reason=_truncate(reason, 400))
             nudged_to_finalize = True
         else:
-            prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
+            template = (
+                KANBAN_REVIEW_CONTINUATION_TEMPLATE
+                if review_mode else KANBAN_GOAL_CONTINUATION_TEMPLATE
+            )
+            prompt = template.format(reason=_truncate(reason, 400))
 
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:

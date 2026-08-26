@@ -114,13 +114,56 @@ def test_request_review_transitions_running_to_review(kanban_home: Path) -> None
         assert _events(conn, tid, kind="block_loop_detected") == []
 
 
+def test_active_reviewer_cannot_wait_for_or_request_itself(
+    kanban_home: Path,
+) -> None:
+    """A reviewer run must produce a verdict, not recursively respawn itself."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review once", assignee="implementer")
+        claimed = kb.claim_task(conn, tid, claimer="implementer:1")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="candidate ready",
+            reviewer="coder",
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer = kb.claim_review_task(conn, tid, claimer="coder:1")
+        assert reviewer is not None and reviewer.current_run_id is not None
+
+        context = kb.build_worker_context(conn, tid)
+        ok, reason = kb.request_review(
+            conn,
+            tid,
+            summary="ask another reviewer",
+            expected_run_id=reviewer.current_run_id,
+            with_reason=True,
+        )
+        dependency_wait = kb.block_task(
+            conn,
+            tid,
+            reason="wait for the active reviewer",
+            kind="dependency",
+            expected_run_id=reviewer.current_run_id,
+        )
+        current = kb.get_task(conn, tid)
+
+    assert "You are the active reviewer" in context
+    assert ok is False
+    assert reason is not None and "already the active reviewer" in reason
+    assert dependency_wait is False
+    assert current is not None and current.status == "running"
+    assert current.current_run_id == reviewer.current_run_id
+
+
 # ---------------------------------------------------------------------------
 # Core regression: repeated review requests never escalate to triage
 # ---------------------------------------------------------------------------
 
 
 def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
-    """A task that goes review -> rerun -> review again (the executor
+    """A task that goes review -> changes -> implementation -> review
     follow-up cycle) must stay in ``review`` every time. Under the old
     ``kanban_block(review-required:)`` approach the second pass hit
     ``block_recurrences >= 2`` and was wrongly routed to ``triage`` with a
@@ -128,27 +171,34 @@ def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="cycle me", assignee="worker")
 
-        for _ in range(4):
-            # Executor claims (ready->running or review->running) and finishes
-            # with a review request. claim_review_task handles review->running.
-            task = kb.get_task(conn, tid)
-            if task.status == "ready":
-                kb.claim_task(conn, tid)
-            else:
-                assert task.status == "review"
-                claimed = kb.claim_review_task(conn, tid)
-                assert claimed is not None
-
-            run_id = kb.get_task(conn, tid).current_run_id
+        for round_index in range(4):
+            # Each correction run is implementation work from ready. A review
+            # worker may request changes, but never request another reviewer.
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            run_id = claimed.current_run_id
             ok = kb.request_review(
                 conn, tid,
                 summary="pass complete",
+                reviewer="reviewer",
                 expected_run_id=run_id,
             )
             assert ok is True
             row = _row(conn, tid)
             assert row["status"] == "review", "must never leave the review lane"
             assert (row["block_recurrences"] or 0) == 0
+
+            if round_index < 3:
+                review_claim = kb.claim_review_task(conn, tid)
+                assert review_claim is not None
+                changed, implementer = kb.request_changes(
+                    conn,
+                    tid,
+                    reason="one more correction",
+                    expected_run_id=review_claim.current_run_id,
+                )
+                assert changed is True
+                assert implementer == "worker"
 
         # After several cycles: never triaged, never a false loop.
         assert _row(conn, tid)["status"] == "review"

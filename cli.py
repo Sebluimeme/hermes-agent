@@ -21050,6 +21050,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        review_mode=_os.environ.get("HERMES_KANBAN_REVIEW_RUN") == "1",
     )
 
 

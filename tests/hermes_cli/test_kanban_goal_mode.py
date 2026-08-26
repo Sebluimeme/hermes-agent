@@ -140,6 +140,27 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_review_loop_names_the_worker_as_active_reviewer(monkeypatch):
+    _patch_judge(monkeypatch, ["continue"])
+    prompts = []
+    statuses = iter(["running", "done"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t_review",
+        goal_text="review the candidate",
+        run_turn=lambda prompt: prompts.append(prompt) or "approved",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda reason: pytest.fail(f"should not block: {reason}"),
+        first_response="checking",
+        review_mode=True,
+    )
+
+    assert res["outcome"] == "completed_by_worker"
+    assert len(prompts) == 1
+    assert "reviewer shown on the card is YOU" in prompts[0]
+    assert "Never call kanban_request_review" in prompts[0]
+
+
 
 
 
