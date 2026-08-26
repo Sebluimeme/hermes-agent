@@ -121,7 +121,10 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
         lambda fake_cli: calls.append(("finalize", fake_cli.session_id)),
     )
 
-    cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+    with pytest.raises(SystemExit) as exc_info:
+        cli_mod.main(query="hello", quiet=False, toolsets="terminal")
+
+    assert exc_info.value.code == 0
 
     assert calls == [
         ("claim", "cli", False),
