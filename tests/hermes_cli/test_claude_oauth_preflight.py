@@ -86,6 +86,50 @@ def test_dispatch_blocks_claude2_before_worker_spawn_on_expired_oauth(
     )
 
 
+def test_noncredential_canary_failure_reroutes_without_human_block(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    routing.write_text(json.dumps({
+        "agent_cooldowns": {
+            "claude2": {"dispatch_allowed": True, "preflight_required": False},
+            "claude1": {"dispatch_allowed": True, "preflight_required": False},
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    monkeypatch.setattr(
+        "hermes_cli.claude_oauth_preflight.probe_claude2_oauth",
+        lambda: oauth.ProbeResult(False, False, "canari OAuth Claude 2 échoué (code 1)"),
+    )
+    spawned = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="provider fallback", assignee="claude2", routing_tier="complex",
+        )
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("provider rate-limited (quota wall)", task_id),
+        )
+        conn.commit()
+        outcome = kb.dispatch_once(
+            conn, spawn_fn=lambda *args, **kwargs: spawned.append((args, kwargs)),
+        )
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute(
+            "SELECT COUNT(*) AS count FROM task_runs WHERE task_id = ?", (task_id,),
+        ).fetchone()["count"]
+
+    assert outcome.oauth_rerouted == [task_id]
+    assert outcome.oauth_blocked == []
+    assert spawned == []
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "claude1"
+    assert runs == 0
+
+
 # --- Transition-gated canary (t_b0bc4445 LOT 2) ----------------------------
 # Table tests for the pure decision function, then integration tests proving
 # the paid canary is skipped on steady-state dispatch and re-fires on each

@@ -333,6 +333,50 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_rate_limit_exit_immediately_falls_back_with_same_worktree(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A proven quota wall advances a routed card without human input."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        workspace = kanban_home / "project"
+        workspace.mkdir()
+        tid = kb.create_task(
+            conn,
+            title="quota fallback",
+            assignee="claude2",
+            routing_tier="complex",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        original_workspace = kb.get_task(conn, tid).workspace_path
+        pid = 71001
+        kb.claim_task(conn, tid, claimer=f"{host}:quota")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+
+        assert tid not in kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        fallback_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'simple_route_fallback' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "claude1"
+    assert task.workspace_path == original_workspace
+    assert task.consecutive_failures == 0
+    assert fallback_event is not None
+
+
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(

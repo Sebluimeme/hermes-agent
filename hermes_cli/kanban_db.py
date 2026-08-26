@@ -9306,8 +9306,10 @@ def oauth_canary_transition_required(
     return False, "steady_state"
 
 
-def claude2_oauth_dispatch_guard(conn: sqlite3.Connection, task_id: str, assignee: Optional[str]) -> bool:
-    """Block a Claude 2 card before spawning when its isolated OAuth is unusable.
+def claude2_oauth_dispatch_guard(
+    conn: sqlite3.Connection, task_id: str, assignee: Optional[str],
+) -> Optional[str]:
+    """Gate Claude 2 before spawn and return ``blocked``/``fallback``/``None``.
 
     The native Hermes profile reaches Claude through a local proxy, but that
     proxy's real credential source is ``/home/seb/.claude2``.  Probe that exact
@@ -9322,7 +9324,7 @@ def claude2_oauth_dispatch_guard(conn: sqlite3.Connection, task_id: str, assigne
     returns immediately without spending anything.
     """
     if assignee != "claude2":
-        return False
+        return None
     from hermes_cli.claude_oauth_preflight import (
         credentials_fingerprint,
         dispatch_block_reason,
@@ -9344,7 +9346,7 @@ def claude2_oauth_dispatch_guard(conn: sqlite3.Connection, task_id: str, assigne
         task_failure_error=task_failure_error,
     )
     if not required:
-        return False
+        return None
 
     probe = probe_claude2_oauth()
     persist_oauth_transition_state(assignee, {
@@ -9357,19 +9359,56 @@ def claude2_oauth_dispatch_guard(conn: sqlite3.Connection, task_id: str, assigne
         "last_reason": probe.reason,
     })
     if probe.ok:
-        return False
-    # Failure blocks the card (existing mechanism) instead of looping: a
-    # blocked task is not re-picked by the ready/review loops until a human
-    # retries it, so the paid canary cannot fire on every tick while OAuth
-    # stays broken -- it fires once per transition, persists "error", and
-    # the card sits blocked until someone acts.
+        return None
+    if probe.reconnect_required:
+        # Only a confirmed credential failure needs a human. A generic code-1
+        # canary failure may be a quota/provider outage and must not strand the
+        # card in Action requise when another writer is available.
+        block_task(
+            conn,
+            task_id,
+            reason=dispatch_block_reason(probe),
+            kind="capability",
+        )
+        return "blocked"
+
+    provider_failure_proven = bool(
+        task_failure_error and _RESPAWN_BLOCKER_RE.search(task_failure_error)
+    )
+    if not provider_failure_proven:
+        block_task(
+            conn,
+            task_id,
+            reason=dispatch_block_reason(probe),
+            kind="capability",
+        )
+        return "blocked"
+
+    with write_txn(conn):
+        moved = fallback_simple_route(
+            conn,
+            task_id,
+            f"Claude 2 preflight unavailable: {probe.reason}",
+            provider_proven=True,
+        )
+    if moved:
+        task_after = get_task(conn, task_id)
+        return "blocked" if task_after is not None and task_after.status == "blocked" else "fallback"
+
+    # Defensive terminal case: the normal complex/simple chains always have a
+    # route after Claude 2. If configuration removed every real fallback,
+    # expose that actual capability gap instead of retrying a paid canary on
+    # every dispatcher tick.
     block_task(
         conn,
         task_id,
-        reason=dispatch_block_reason(probe),
+        reason=(
+            f"Claude 2 indisponible ({probe.reason}) et aucune voie de repli "
+            "configurée n'est exécutable."
+        ),
         kind="capability",
     )
-    return True
+    return "blocked"
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
@@ -9423,6 +9462,8 @@ class DispatchResult:
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     oauth_blocked: list[str] = field(default_factory=list)
     """Claude 2 tasks blocked before spawn because the isolated OAuth failed."""
+    oauth_rerouted: list[str] = field(default_factory=list)
+    """Claude 2 tasks moved to their next writer after a non-credential canary failure."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -10726,8 +10767,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
     provider quota wall, NOT a task failure. Such tasks are released back
     to its source phase WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
-    ``check_respawn_guard`` defers their respawn until the window clears.
+    trip the breaker) and stamped with a quota-blocker error. A recognized
+    routed worker advances immediately to its next writer because provider
+    unavailability is proven; an unrecognized/manual lane stays assigned and
+    ``check_respawn_guard`` spaces its retries until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
     """
@@ -10897,6 +10940,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     conn.execute(
                         "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                         (error_text[:500], row["id"]),
+                    )
+                    # The quota-wall sentinel is direct provider evidence.
+                    # Preserve the same workspace/checkpoint and advance a
+                    # routed task immediately instead of waiting on the same
+                    # unavailable lane or spending an OAuth canary. A manual
+                    # assignee is not on the route chain and remains on the
+                    # existing cooldown path.
+                    fallback_simple_route(
+                        conn, row["id"], error_text, provider_proven=True,
                     )
                     rate_limited.append(row["id"])
                 else:
@@ -12332,8 +12384,13 @@ def _dispatch_once_locked(
                     # one confirmed hop per tick rather than all at once.
                     fallback_simple_route(conn, row["id"], quota_reason, provider_proven=True)
             continue
-        if not dry_run and claude2_oauth_dispatch_guard(conn, row["id"], row_assignee):
-            result.oauth_blocked.append(row["id"])
+        oauth_disposition = (
+            claude2_oauth_dispatch_guard(conn, row["id"], row_assignee)
+            if not dry_run else None
+        )
+        if oauth_disposition:
+            target = result.oauth_rerouted if oauth_disposition == "fallback" else result.oauth_blocked
+            target.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -12493,8 +12550,13 @@ def _dispatch_once_locked(
                 with write_txn(conn):
                     _append_event(conn, row["id"], "provider_cooldown", {"reason": quota_reason})
             continue
-        if not dry_run and claude2_oauth_dispatch_guard(conn, row["id"], row["assignee"]):
-            result.oauth_blocked.append(row["id"])
+        oauth_disposition = (
+            claude2_oauth_dispatch_guard(conn, row["id"], row["assignee"])
+            if not dry_run else None
+        )
+        if oauth_disposition:
+            target = result.oauth_rerouted if oauth_disposition == "fallback" else result.oauth_blocked
+            target.append(row["id"])
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
