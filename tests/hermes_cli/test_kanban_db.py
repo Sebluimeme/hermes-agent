@@ -1033,6 +1033,25 @@ def test_checkpoint_preserves_exact_session_for_transient_resume(kanban_home):
     ) == "worker-session-42"
 
 
+def test_operator_reclaim_resumes_the_exact_checkpointed_session(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="manual recovery", assignee="coder")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.heartbeat_worker(
+            conn,
+            task_id,
+            note="build complete, visual correction pending",
+            expected_run_id=claimed.current_run_id,
+            worker_session_id="worker-session-reclaimed",
+        )
+        assert kb.reclaim_task(conn, task_id, reason="operator recovery")
+
+    assert kb._transient_resume_session_id(
+        task_id, board=kb.get_current_board(),
+    ) == "worker-session-reclaimed"
+
+
 def test_failed_simple_routes_advance_spark_then_claude_then_coder(kanban_home, all_assignees_spawnable):
     """Bounded ('simple') cards still get Spark first, then Claude 2, then
     Claude 1, resolved to the real current profile name (t_47dc2bf0 defect

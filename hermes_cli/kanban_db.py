@@ -13267,7 +13267,7 @@ def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optio
             )
             if previous is None or previous.outcome not in {
                 "blocked", "rate_limited", "crashed", "timed_out", "stale",
-                "review_deferred",
+                "review_deferred", "reclaimed",
             }:
                 return None
             if previous.profile and task.assignee and previous.profile != task.assignee:
