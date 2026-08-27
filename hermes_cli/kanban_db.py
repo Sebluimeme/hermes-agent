@@ -2906,6 +2906,42 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             },
         )
 
+    # The former Gemini policy parked otherwise-accepted visual candidates
+    # until a distant retry time. The hash-bound Coder/GPT fallback makes that
+    # wait obsolete. Requeue only the provable legacy shape once: a review row
+    # with a timed deferral, the latest run ending as review_deferred, and a
+    # matching visual_review_deferred event that explicitly names Gemini.
+    legacy_gemini_deferred = (
+        conn.execute(
+            "SELECT t.id,t.next_retry_at FROM tasks t "
+            "WHERE t.status='review' AND t.next_retry_at IS NOT NULL "
+            "AND t.failure_class='visual_review_unavailable' "
+            "AND (SELECT r.outcome FROM task_runs r WHERE r.task_id=t.id "
+            "ORDER BY r.id DESC LIMIT 1)='review_deferred' "
+            "AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=t.id "
+            "AND e.kind='visual_review_deferred' "
+            "AND lower(e.payload) LIKE '%gemini%')"
+        ).fetchall()
+        if repair_required <= repair_columns
+        else []
+    )
+    for row in legacy_gemini_deferred:
+        conn.execute(
+            "UPDATE tasks SET execution_status='pending',failure_class=NULL,"
+            "next_retry_at=NULL,action_required=NULL,last_failure_error=NULL "
+            "WHERE id=? AND status='review' AND next_retry_at IS NOT NULL",
+            (row["id"],),
+        )
+        _append_event(
+            conn,
+            row["id"],
+            "visual_review_fallback_requeued",
+            {
+                "reason": "gemini_transient_now_uses_coder_gpt_fallback",
+                "previous_next_retry_at": row["next_retry_at"],
+            },
+        )
+
     # Never backfill historical PIDs: without a captured process start
     # identity, a PID is not sufficient authority to stop a process safely.
     from hermes_cli import worker_contracts as _worker_contracts

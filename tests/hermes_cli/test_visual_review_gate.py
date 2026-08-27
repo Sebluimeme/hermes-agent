@@ -307,3 +307,45 @@ def test_transient_final_review_deferral_auto_resumes_review_session(
         assert task.next_retry_at == retry_at
         assert kb.list_runs(conn, task_id)[-1].outcome == "review_deferred"
     assert kb._transient_resume_session_id(task_id, board=None) == "review-session-1"
+
+
+def test_init_requeues_legacy_gemini_deferral_for_gpt_fallback(
+    kanban_home, tmp_path: Path,
+) -> None:
+    desktop = png(tmp_path / "desktop-legacy.png", 1200, 800, (1, 1, 1))
+    mobile = png(tmp_path / "mobile-legacy.png", 390, 844, (2, 2, 2))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="Vérifier la page web mobile", assignee="claude2")
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="candidate ready",
+            metadata=visual_metadata(desktop, mobile),
+        )
+        assert kb.claim_review_task(conn, task_id) is not None
+        retry_at = int(time.time()) + 8 * 3600
+        ok, reason = kb.defer_review_task(
+            conn,
+            task_id,
+            reason="quota Gemini temporairement atteint",
+            retry_at=retry_at,
+            metadata={"worker_session_id": "review-session-legacy"},
+        )
+        assert ok, reason
+
+    kb.init_db()
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='visual_review_fallback_requeued'",
+            (task_id,),
+        ).fetchone()
+    assert task.status == "review"
+    assert task.next_retry_at is None
+    assert task.execution_status == "pending"
+    assert task.failure_class is None
+    assert event is not None
+    assert json.loads(event["payload"])["previous_next_retry_at"] == retry_at
+    assert kb._transient_resume_session_id(task_id, board=None) == "review-session-legacy"
