@@ -6023,7 +6023,7 @@ def visual_completion_projection(
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Project the visual completion gate without mutating Kanban state."""
     task = conn.execute(
-        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+        "SELECT title, body, created_by FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if task is None:
         return "task not found", metadata
@@ -6092,8 +6092,10 @@ def visual_completion_projection(
         # Sébastien's explicit [NO-PROD-PROOF] exemption.
         if requires_production_proof(
             task["title"] or "", task["body"] or "", handoff or metadata,
+            created_by=task["created_by"],
         ) or requires_production_proof(
             task["title"] or "", task["body"] or "", metadata,
+            created_by=task["created_by"],
         ):
             projected["production_proof"] = validate_production_proof(
                 task_id=task_id, metadata=metadata,

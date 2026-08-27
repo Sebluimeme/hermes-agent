@@ -53,6 +53,16 @@ _OPT_OUT_MARKERS = ("[no-visual]", "[sans-visuel]")
 # durable trace of his explicit authorization (same convention as
 # [NO-VISUAL]) — see incident t_9fbb7396.
 _PRODUCTION_PROOF_EXEMPT_MARKERS = ("[no-prod-proof]", "[sans-preuve-prod]")
+# Task title/body are immutable after creation (hermes_cli.kanban_db has no
+# update-title/body path), so the marker's presence necessarily reflects what
+# the card's *creator* wrote. That is only a real trace of Sébastien's
+# authorization if the creator was not the very worker profile that would
+# benefit from skipping the check — otherwise an execution worker could
+# create its own card (or a follow-up) with the marker pre-baked and exempt
+# itself. Restricting honoured exemptions to non-worker creators (dashboard,
+# default/telegram, direct CLI, or unset) makes the "autorisé par Sébastien"
+# requirement structurally enforced rather than a bare string convention.
+_UNTRUSTED_EXEMPTION_CREATORS = {"claude1", "claude2", "coder", "spark"}
 _LOCAL_HOST_RE = re.compile(
     r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(/|$)",
     re.IGNORECASE,
@@ -160,6 +170,8 @@ def requires_production_proof(
     title: str,
     body: str = "",
     metadata: Optional[dict[str, Any]] = None,
+    *,
+    created_by: Optional[str] = None,
 ) -> bool:
     """Return whether a card must prove a live production check before closing.
 
@@ -169,10 +181,21 @@ def requires_production_proof(
     surface) so the two gates classify the same candidates the same way; the
     exemption marker is deliberately separate from ``[NO-VISUAL]`` so
     Sébastien can authorize skipping one without the other.
+
+    ``created_by`` gates the marker itself: a card's title/body are fixed at
+    creation (there is no update path), so the marker's presence traces back
+    to whoever created the card. It only counts as "authorized by Sébastien"
+    when the creator is not one of the worker profiles that execute cards
+    (``claude1``/``claude2``/``coder``/``spark``) — otherwise a worker could
+    hand itself the exemption by creating its own marked card. Pass
+    ``created_by=None`` (unknown/legacy caller) to keep the marker honoured,
+    since the untrusted set is an explicit denylist, not an allowlist.
     """
     text = f"{title or ''}\n{body or ''}".lower()
     if any(marker in text for marker in _PRODUCTION_PROOF_EXEMPT_MARKERS):
-        return False
+        creator = str(created_by or "").strip().lower()
+        if creator not in _UNTRUSTED_EXEMPTION_CREATORS:
+            return False
     return is_visual_web_task(title, body, metadata)
 
 

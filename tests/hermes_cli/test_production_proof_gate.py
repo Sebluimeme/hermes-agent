@@ -91,7 +91,10 @@ def _iso_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def _complete_visual_task(conn, tmp_path: Path, evidence_root: Path, monkeypatch, title: str, body: str = ""):
+def _complete_visual_task(
+    conn, tmp_path: Path, evidence_root: Path, monkeypatch, title: str, body: str = "",
+    created_by: str | None = None,
+):
     """Drive one card through request_review + Coder native check + Gemini
     final evidence, exactly as the two-stage visual gate expects, and return
     its task_id with the completion metadata still pending production proof.
@@ -100,7 +103,7 @@ def _complete_visual_task(conn, tmp_path: Path, evidence_root: Path, monkeypatch
     desktop = png(tmp_path / f"desktop-{title[:8]}.png", 1200, 800, (10, 20, 30))
     mobile = png(tmp_path / f"mobile-{title[:8]}.png", 390, 844, (40, 50, 60))
     monkeypatch.setattr(vr, "FINAL_EVIDENCE_ROOT", evidence_root)
-    task_id = kb.create_task(conn, title=title, body=body, assignee="claude2")
+    task_id = kb.create_task(conn, title=title, body=body, assignee="claude2", created_by=created_by)
     assert kb.request_review(
         conn, task_id, summary="candidate ready", metadata=visual_metadata(desktop, mobile),
     )
@@ -142,6 +145,19 @@ def test_requires_production_proof_matches_visual_scope_with_its_own_exemption()
     # But the two markers are independent: [NO-VISUAL] alone does not grant
     # a [NO-PROD-PROOF] exemption once a render change is otherwise detected.
     assert vr.requires_production_proof("Refactor", metadata={"changed_files": ["src/Landing.tsx"]})
+
+
+def test_marker_authorization_is_denied_when_the_creator_is_an_execution_worker() -> None:
+    """Title/body are immutable after creation, so the marker's presence
+    traces back to the card's creator. A worker cannot hand itself the
+    exemption by creating its own marked card — only a non-worker creator
+    (dashboard, default/telegram, direct CLI, or unknown) counts as
+    Sébastien's explicit authorization."""
+    title = "Publier la landing page interne [NO-PROD-PROOF]"
+    for worker in ("claude1", "claude2", "coder", "spark", "CLAUDE2"):
+        assert vr.requires_production_proof(title, created_by=worker), worker
+    for trusted in ("dashboard", "default", "telegram", None, ""):
+        assert not vr.requires_production_proof(title, created_by=trusted), trusted
 
 
 def test_render_change_cannot_complete_on_visual_review_alone(
@@ -190,17 +206,41 @@ def test_valid_production_proof_unlocks_completion(
 def test_explicit_no_prod_proof_marker_exempts_the_gate(
     kanban_home, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The card is created by ``dashboard`` (Sébastien's request path, never a
+    worker profile), so the pre-baked [NO-PROD-PROOF] marker counts as his
+    explicit authorization."""
     evidence_root = tmp_path / "visual-evidence"
     with kb.connect() as conn:
         task_id, completion_metadata = _complete_visual_task(
             conn, tmp_path, evidence_root, monkeypatch,
             title="Publier la landing page interne [NO-PROD-PROOF]",
             body="Autorisation explicite de Sébastien: outil interne sans domaine public.",
+            created_by="dashboard",
         )
         assert kb.complete_task(
             conn, task_id, summary="visuel validé, prod exemptée", metadata=completion_metadata,
         )
         assert kb.get_task(conn, task_id).status == "done"
+
+
+def test_marker_is_ignored_when_the_card_was_created_by_the_executing_worker(
+    kanban_home, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card whose creator is the worker profile itself (e.g. a follow-up it
+    made for itself) cannot use [NO-PROD-PROOF] to self-exempt: that would let
+    a worker skip the gate without any trace of Sébastien's authorization."""
+    evidence_root = tmp_path / "visual-evidence"
+    with kb.connect() as conn:
+        task_id, completion_metadata = _complete_visual_task(
+            conn, tmp_path, evidence_root, monkeypatch,
+            title="Publier la landing page interne [NO-PROD-PROOF]",
+            body="Carte créée par le worker lui-même.",
+            created_by="claude2",
+        )
+        with pytest.raises(kb.VisualReviewGateError, match="preuve de production"):
+            kb.complete_task(
+                conn, task_id, summary="visuel validé", metadata=completion_metadata,
+            )
 
 
 def test_production_proof_for_a_different_task_is_rejected(
