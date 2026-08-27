@@ -14,9 +14,9 @@ a worker was previously delivered to nobody and simply expired (observed:
 This module is the missing cross-process transport: a small durable JSON
 file per request under ``~/.hermes/state/worker-approvals/``.
 
-* The worker (``tools/file_tools.py::_present_protected_instruction_approval``)
-  calls :func:`request_decision`, which writes (or reattaches to) a request
-  file and blocks polling it.
+* The worker (protected instruction writes *and* the generic command/tool
+  approval gate) calls :func:`request_decision`, which writes (or reattaches
+  to) a request file and blocks polling it.
 * The gateway (``gateway/kanban_watchers.py``'s
   ``_kanban_worker_approval_bridge``) polls :func:`list_pending_requests`,
   claims one with :func:`claim_for_dispatch`, turns it into a REAL Telegram/
@@ -66,20 +66,27 @@ _STALE_PENDING_SECONDS = 24 * 3600
 
 
 def _state_dir() -> Path:
-    base = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    # Approval transport is a control-plane mailbox shared by the gateway and
+    # every worker profile.  A worker runs with
+    # HERMES_HOME=<root>/profiles/<spark|coder|...>; using that path here made
+    # it write into a mailbox the default-profile gateway never polled.  Resolve
+    # the installation root explicitly, the same way the shared Kanban DB does.
+    from hermes_constants import get_default_hermes_root
+
+    base = get_default_hermes_root()
     d = base / "state" / "worker-approvals"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _request_id(task_id: str, paths: list[str]) -> str:
-    """Stable id: same task + same target file set == same demand.
+def _request_id(task_id: str, targets: list[str]) -> str:
+    """Stable id: same task + same approval target set == same demand.
 
     Deliberately NOT a uuid — a fresh random id per call is exactly what
     would let a worker retry produce a second Telegram prompt for a demand
     that already has one in flight.
     """
-    key = task_id.strip() + "|" + "|".join(sorted({p.strip() for p in paths}))
+    key = task_id.strip() + "|" + "|".join(sorted({p.strip() for p in targets}))
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:24]
 
 
@@ -141,10 +148,15 @@ def request_decision(
     task_id: str,
     title: str,
     description: str,
-    paths: list[str],
+    paths: Optional[list[str]] = None,
+    request_key: Optional[str] = None,
+    command: Optional[str] = None,
+    pattern_keys: Optional[list[str]] = None,
+    allow_session: bool = False,
+    allow_permanent: bool = False,
     timeout_seconds: Optional[int] = None,
 ) -> dict:
-    """Ask a human for a decision on a protected write and block for it.
+    """Ask a human for a worker action and block for the decision.
 
     Returns ``{"resolved": bool, "choice": str|None, "reason": str|None}``.
     ``resolved`` is True only when a real decision (human or explicit
@@ -154,11 +166,22 @@ def request_decision(
     by the caller as a refusal; this function never returns an implicit
     approval.
     """
-    if not task_id or not paths:
-        return {"resolved": False, "choice": None, "reason": "missing task_id/paths"}
+    clean_paths = sorted({str(path).strip() for path in (paths or []) if str(path).strip()})
+    clean_key = str(request_key or "").strip()
+    if not task_id or (not clean_paths and not clean_key):
+        return {
+            "resolved": False,
+            "choice": None,
+            "reason": (
+                "missing task_id/paths"
+                if clean_paths or paths is not None
+                else "missing task_id/approval target"
+            ),
+        }
 
     timeout = timeout_seconds if timeout_seconds is not None else _configured_timeout()
-    request_id = _request_id(task_id, paths)
+    targets = clean_paths or [clean_key]
+    request_id = _request_id(task_id, targets)
     path = _request_path(request_id)
     now = time.time()
 
@@ -188,7 +211,16 @@ def request_decision(
             "board": os.environ.get("HERMES_KANBAN_BOARD") or "default",
             "title": (title or "")[:200],
             "description": description,
-            "paths": sorted(set(paths)),
+            "paths": clean_paths,
+            "request_key": clean_key or None,
+            "command": str(command or "").strip() or None,
+            "pattern_keys": sorted({
+                str(value).strip()
+                for value in (pattern_keys or [])
+                if str(value).strip()
+            }),
+            "allow_session": bool(allow_session),
+            "allow_permanent": bool(allow_permanent),
             "created_at": now,
             "expires_at": expires_at,
             "worker_pid": os.getpid(),

@@ -42,6 +42,16 @@ _VISUAL_TEXT_RE = re.compile(
     r"\bfooter\b|\bformulaire\b|\banimation\b)",
     re.IGNORECASE,
 )
+_CAPTURE_ONLY_RE = re.compile(
+    r"(?:\bcaptur(?:e|er|es)\b|\bscreenshot(?:s)?\b|\bphotos?\s+de\s+(?:la\s+)?page\b)",
+    re.IGNORECASE,
+)
+_NO_RENDER_CHANGE_RE = re.compile(
+    r"(?:\bne\s+modifi(?:er|e|é)\s+aucun\s+fichier\b|"
+    r"\bsans\s+(?:aucune\s+)?modification\b|\baucune\s+modification\b|"
+    r"\bcapture\s+seule\b|\bread[ -]?only\b|\blecture\s+seule\b)",
+    re.IGNORECASE,
+)
 _VISUAL_EXTENSIONS = {
     ".css", ".scss", ".sass", ".less", ".styl", ".html", ".htm",
     ".jsx", ".tsx", ".vue", ".svelte", ".astro",
@@ -61,6 +71,20 @@ def _metadata_changed_files(metadata: Optional[dict[str, Any]]) -> list[str]:
     if not isinstance(values, (list, tuple)):
         return []
     return [str(value).strip() for value in values if str(value).strip()]
+
+
+def is_capture_only_delivery(
+    title: str,
+    body: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Return whether the card only delivers views of unchanged rendering."""
+    text = f"{title or ''}\n{body or ''}".lower()
+    return bool(
+        _CAPTURE_ONLY_RE.search(text)
+        and _NO_RENDER_CHANGE_RE.search(text)
+        and not _metadata_changed_files(metadata)
+    )
 
 
 def is_visual_web_task(
@@ -83,6 +107,15 @@ def is_visual_web_task(
     visual = metadata.get("visual_review") if isinstance(metadata, dict) else None
     if isinstance(visual, dict) and visual.get("required") is not None:
         return bool(visual.get("required"))
+    # The final Coder + Gemini gate protects a candidate that CHANGES the
+    # rendered interface.  A read-only delivery task whose sole output is to
+    # capture an already-existing page must not enter that implementation
+    # review lane: doing so spends two reviewers merely to send the requested
+    # files and can strand delivery behind Gemini quota.  Require both a
+    # capture intent and an explicit no-change statement, and refuse the
+    # shortcut when changed files were supplied.
+    if is_capture_only_delivery(title, body, metadata):
+        return False
     if _VISUAL_TEXT_RE.search(text):
         return True
     return any(Path(path).suffix.lower() in _VISUAL_EXTENSIONS for path in _metadata_changed_files(metadata))

@@ -224,6 +224,60 @@ class TestSingleQueryDenyModeAllGuards:
             result = check_all_command_guards("echo hello", "local")
             assert result["approved"]
 
+    def test_kanban_worker_routes_dangerous_command_to_button_bridge(self, monkeypatch):
+        """A dispatcher worker is not an unattended ``-q`` shell: its task
+        subscription gives the gateway a real human approval surface."""
+        from unittest.mock import patch as mock_patch
+
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker_button")
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        with (
+            mock_patch(
+                "tools.approval._get_single_query_approval_mode",
+                return_value="deny",
+            ),
+            mock_patch("tools.approval._get_approval_mode", return_value="manual"),
+            mock_patch(
+                "tools.tirith_security.check_command_security",
+                return_value={"action": "allow", "findings": [], "summary": ""},
+            ),
+            mock_patch(
+                "tools.worker_approval.request_decision",
+                return_value={"resolved": True, "choice": "once", "reason": None},
+            ) as request,
+        ):
+            result = check_all_command_guards("python3 -c 'print(1)'", "local")
+
+        assert result["approved"] is True
+        assert result["user_consent"] is True
+        assert request.call_args.kwargs["task_id"] == "t_worker_button"
+        assert request.call_args.kwargs["command"] == "python3 -c 'print(1)'"
+
+    def test_kanban_worker_execute_code_uses_the_same_button_bridge(self, monkeypatch):
+        from unittest.mock import patch as mock_patch
+
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker_code")
+        with (
+            mock_patch(
+                "tools.approval._get_single_query_approval_mode",
+                return_value="deny",
+            ),
+            mock_patch("tools.approval._get_approval_mode", return_value="manual"),
+            mock_patch(
+                "tools.worker_approval.request_decision",
+                return_value={"resolved": True, "choice": "once", "reason": None},
+            ) as request,
+        ):
+            result = approval_module.check_execute_code_guard("print(1)", "local")
+
+        assert result["approved"] is True
+        assert "execute_code" in request.call_args.kwargs["command"]
+
     def test_combined_guard_approve_mode(self, monkeypatch):
         monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")

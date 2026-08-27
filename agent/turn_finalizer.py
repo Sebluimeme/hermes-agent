@@ -56,6 +56,12 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_pre_verify_synthetic",
 )
 
+_KANBAN_AUTOMATIC_RETRY_MESSAGE = (
+    "Le budget d’exécution de cette tentative est atteint. "
+    "Le dispatcher reprend automatiquement la même tâche à partir de l’état "
+    "déjà produit ; aucune approbation ni relance manuelle n’est nécessaire."
+)
+
 
 def _record_kanban_budget_exhausted(
     kanban_task: str,
@@ -214,6 +220,12 @@ def finalize_turn(
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )
+            # The model's toolless budget summary can say “laisse-moi
+            # relancer” even though the dispatcher has already durably queued
+            # that retry.  Never expose a fake human gate: the worker log ends
+            # with the lifecycle truth, while the original tool history stays
+            # available to the resumed session as its checkpoint.
+            final_response = _KANBAN_AUTOMATIC_RETRY_MESSAGE
     elif budget_exhausted:
         # Bounded fallback (#87096): budget was exhausted but none of the
         # normal fallback paths were eligible (interrupted / failed /
@@ -228,6 +240,7 @@ def finalize_turn(
             _record_kanban_budget_exhausted(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )
+            final_response = _KANBAN_AUTOMATIC_RETRY_MESSAGE
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")

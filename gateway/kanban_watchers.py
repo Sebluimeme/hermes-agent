@@ -1723,14 +1723,20 @@ class GatewayKanbanWatchersMixin:
 
         session_key = f"kanban-worker-approval:{request_id}"
         paths = req.get("paths") or []
+        command = req.get("command") or (
+            f"<write to {', '.join(paths)}>" if paths else "<worker action>"
+        )
+        pattern_keys = req.get("pattern_keys") or [
+            req.get("request_key") or "kanban_worker_approval"
+        ]
         approval_data = {
-            "command": f"<write to {', '.join(paths)}>",
-            "pattern_key": "protected_instruction_file",
-            "pattern_keys": ["protected_instruction_file"],
+            "command": command,
+            "pattern_key": pattern_keys[0],
+            "pattern_keys": pattern_keys,
             "description": req.get("description") or req.get("title") or "protected write",
             "protected_instruction_paths": paths,
-            "allow_permanent": False,
-            "allow_session": False,
+            "allow_permanent": bool(req.get("allow_permanent")),
+            "allow_session": bool(req.get("allow_session")),
             "request_id": request_id,
         }
         entry = enqueue_gateway_approval(session_key, approval_data)
@@ -1748,8 +1754,8 @@ class GatewayKanbanWatchersMixin:
                     f"{approval_data['description']}"
                 ),
                 metadata=metadata or None,
-                allow_permanent=False,
-                allow_session=False,
+                allow_permanent=approval_data["allow_permanent"],
+                allow_session=approval_data["allow_session"],
             )
             if not getattr(send_res, "success", True):
                 raise RuntimeError(getattr(send_res, "error", None) or "send_exec_approval failed")

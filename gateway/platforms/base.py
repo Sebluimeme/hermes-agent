@@ -4419,6 +4419,20 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+    async def send_resume_prompt(
+        self,
+        chat_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a one-tap retry after automatic recovery was exhausted.
+
+        Native adapters may override this with an interactive button that
+        dispatches a fresh turn into *session_key*.  Unsupported transports
+        return failure so the gateway keeps the explicit text fallback.
+        """
+        return SendResult(success=False, error="Not supported")
+
     async def send_private_notice(
         self,
         chat_id: str,

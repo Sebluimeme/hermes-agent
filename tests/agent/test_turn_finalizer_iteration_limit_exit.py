@@ -221,6 +221,9 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
+    assert "reprend automatiquement" in result["final_response"]
+    assert "aucune approbation" in result["final_response"]
+    assert "composed report" not in result["final_response"]
 
 
 def test_kanban_timeout_is_scoped_to_worker_run(monkeypatch):

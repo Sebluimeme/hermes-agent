@@ -842,6 +842,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Bounded-recovery retry buttons: short id → exact gateway session key.
+        # Deliberately in-memory: after a gateway restart an old button must
+        # expire rather than risk resuming a differently routed session.
+        self._resume_prompt_state: Dict[int, str] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -6510,6 +6514,55 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_resume_prompt(
+        self,
+        chat_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Offer one explicit tap when bounded automatic recovery is exhausted."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            import itertools
+            if not hasattr(self, "_resume_prompt_counter"):
+                self._resume_prompt_counter = itertools.count(1)
+            resume_id = next(self._resume_prompt_counter)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "▶️ Relancer maintenant",
+                    callback_data=f"hr:{resume_id}",
+                )
+            ]])
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": (
+                    "⚠️ La reprise automatique n’a pas pu produire la réponse "
+                    "finale. Le travail déjà réalisé est conservé."
+                ),
+                "reply_markup": keyboard,
+                "reply_to_message_id": reply_to_id,
+                **self._link_preview_kwargs(),
+            }
+            kwargs.update(self._thread_kwargs_for_send(
+                chat_id,
+                thread_id,
+                metadata,
+                reply_to_message_id=reply_to_id,
+            ))
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            self._resume_prompt_state[resume_id] = session_key
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as exc:
+            logger.warning(
+                "[%s] send_resume_prompt failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            return SendResult(success=False, error=_redact_telegram_error_text(exc))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -7219,6 +7272,89 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_chat_id=query_chat_id,
                 query_thread_id=query_thread_id,
             )
+            return
+
+        # --- Bounded automatic-recovery retry (hr:<id>) ---
+        if data.startswith("hr:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Vous n’êtes pas autorisé à relancer cette tâche.")
+                return
+            try:
+                resume_id = int(data.split(":", 1)[1])
+            except (TypeError, ValueError, IndexError):
+                await query.answer(text="Bouton de relance invalide.")
+                return
+            state = getattr(self, "_resume_prompt_state", {})
+            session_key = state.pop(resume_id, None)
+            if not session_key:
+                await query.answer(text="Cette relance a déjà été utilisée ou a expiré.")
+                return
+
+            await query.answer(text="Relance engagée")
+            try:
+                await query.edit_message_text(
+                    text=self.format_message("▶️ Relance engagée — reprise dans la même session."),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+
+            chat = query_chat
+            raw_chat_type = str(getattr(chat, "type", "private")).split(".")[-1].lower()
+            chat_type = (
+                "group" if raw_chat_type in {"group", "supergroup"}
+                else "channel" if raw_chat_type == "channel"
+                else "dm"
+            )
+            user = getattr(query, "from_user", None)
+            prompt_message_id = getattr(query_message, "message_id", None)
+            source = self.build_source(
+                chat_id=str(query_chat_id),
+                chat_name=(
+                    getattr(chat, "title", None)
+                    or getattr(chat, "full_name", None)
+                ),
+                chat_type=chat_type,
+                user_id=caller_id or None,
+                user_name=(
+                    getattr(user, "full_name", None)
+                    or getattr(user, "first_name", None)
+                ),
+                thread_id=(
+                    str(query_thread_id) if query_thread_id is not None else None
+                ),
+                message_id=(
+                    str(prompt_message_id) if prompt_message_id is not None else None
+                ),
+            )
+            event = MessageEvent(
+                text=(
+                    "[HERMES_RECOVERY_BUTTON] Reprends exactement la demande "
+                    "interrompue à partir de l’état déjà produit. Vérifie "
+                    "l’état durable, ne répète pas les effets de bord et "
+                    "livre le résultat final."
+                ),
+                message_type=MessageType.TEXT,
+                source=source,
+                user_id=caller_id or None,
+                user_name=getattr(user, "first_name", None),
+                raw_message=query_message,
+                message_id=(
+                    str(prompt_message_id) if prompt_message_id is not None else None
+                ),
+                internal=True,
+                allow_gateway_control=False,
+                metadata={"gateway_session_key": session_key},
+            )
+            await self.handle_message(event)
             return
 
         # --- Gmail-triage callbacks (gt:verb:arg) ---

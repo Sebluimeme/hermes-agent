@@ -20588,6 +20588,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            _resume_prompt_sent = False
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -20595,24 +20596,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # completed assistant turn (#51628). Blank it here so the normal
             # empty-response handling (and the suppression below) applies.
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
-                # The synchronous recovery above has also exhausted. Surface
-                # the blocker; never classify this as intentional silence.
-                response = (
-                    "🚨 Action requise : la reprise automatique s'est elle aussi "
-                    "interrompue avant la livraison. Répondez « reprends » ; "
-                    "l'état déjà produit est conservé."
-                )
+                # The synchronous recovery above has also exhausted. On a
+                # transport with a native action surface, make the remaining
+                # human step one tap instead of asking the user to type a magic
+                # word. Unsupported transports retain the explicit text
+                # fallback below.
+                _resume_adapter = self._adapter_for_source(source)
+                _resume_result = None
+                if _resume_adapter is not None and session_key:
+                    try:
+                        _resume_result = await _resume_adapter.send_resume_prompt(
+                            source.chat_id,
+                            session_key,
+                            metadata=self._thread_metadata_for_source(source),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "native resume prompt failed for %s",
+                            source.platform,
+                            exc_info=True,
+                        )
+                if getattr(_resume_result, "success", False):
+                    response = ""
+                    _resume_prompt_sent = True
+                else:
+                    response = (
+                        "🚨 Action requise : la reprise automatique s'est elle "
+                        "aussi interrompue avant la livraison. Répondez "
+                        "« reprends » ; l'état déjà produit est conservé."
+                    )
                 # Queued-follow-up delivery reads the finalized result rather
                 # than this local variable, so keep both representations in
                 # sync. The sentinel itself must never reach a peer channel.
                 agent_result["final_response"] = response
-            try:
-                from gateway.response_filters import is_intentional_silence_agent_result
-                _intentional_silence = is_intentional_silence_agent_result(
-                    agent_result, response,
-                )
-            except Exception:
-                _intentional_silence = False
+            if _resume_prompt_sent:
+                # The button prompt above is already the complete user-facing
+                # delivery for this turn. Suppress empty-response synthesis and
+                # the ordinary final-send path so Telegram receives one clean
+                # message, not a prompt followed by a generic error bubble.
+                _intentional_silence = True
+            else:
+                try:
+                    from gateway.response_filters import is_intentional_silence_agent_result
+                    _intentional_silence = is_intentional_silence_agent_result(
+                        agent_result, response,
+                    )
+                except Exception:
+                    _intentional_silence = False
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to

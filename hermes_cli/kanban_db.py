@@ -6031,10 +6031,26 @@ def visual_completion_projection(
     try:
         from hermes_cli.visual_review import (
             VisualReviewError,
+            is_capture_only_delivery,
             is_visual_web_task,
             validate_final_review,
         )
 
+        # A historical handoff may carry visual_review.required=True because
+        # an older classifier routed a read-only screenshot-delivery card into
+        # review.  Do not let that generated flag permanently strand the card:
+        # the card's explicit no-change contract plus the absence of changed
+        # files on BOTH handoff and completion is stronger evidence that no
+        # implementation candidate exists to review.
+        if (
+            is_capture_only_delivery(
+                task["title"] or "", task["body"] or "", handoff,
+            )
+            and is_capture_only_delivery(
+                task["title"] or "", task["body"] or "", metadata,
+            )
+        ):
+            return None, metadata
         required = is_visual_web_task(
             task["title"] or "",
             task["body"] or "",

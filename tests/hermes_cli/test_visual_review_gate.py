@@ -56,6 +56,57 @@ def test_visual_classifier_supports_heuristic_marker_and_opt_out() -> None:
     assert vr.is_visual_web_task("Refactor", metadata={"changed_files": ["src/Card.tsx"]})
 
 
+def test_capture_only_delivery_does_not_enter_implementation_review() -> None:
+    body = (
+        "Prendre une capture desktop et mobile de la vraie page Entreprise. "
+        "Ne modifier aucun fichier, ne rien committer ni pousser."
+    )
+    assert not vr.is_visual_web_task("Capturer la page Entreprise", body)
+    # A real changed-file receipt remains authoritative even if the prose says
+    # capture-only: the no-change shortcut cannot hide an implementation.
+    assert vr.is_visual_web_task(
+        "Capturer la page Entreprise",
+        body,
+        metadata={"changed_files": ["src/Page.tsx"]},
+    )
+    # Explicit review markers also remain authoritative.
+    assert vr.is_visual_web_task("[VISUAL] Capturer la page", body)
+
+
+def test_capture_only_card_can_escape_a_historical_false_positive_handoff(
+    kanban_home, tmp_path: Path,
+) -> None:
+    desktop = png(tmp_path / "desktop.png", 1200, 800, (1, 2, 3))
+    mobile = png(tmp_path / "mobile.png", 390, 844, (4, 5, 6))
+    body = (
+        "Prendre une capture desktop et mobile de la page existante. "
+        "Ne modifier aucun fichier."
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Capturer la page Entreprise",
+            body=body,
+            assignee="spark",
+        )
+        # Simulate the handoff produced by the former over-broad classifier.
+        forced_visual = visual_metadata(desktop, mobile)
+        forced_visual["visual_review"]["required"] = True
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="captures ready",
+            metadata=forced_visual,
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="captures delivered, no files changed",
+            metadata={"changed_files": []},
+        )
+        assert kb.get_task(conn, task_id).status == "done"
+
+
 def test_visual_request_review_requires_two_viewports_and_routes_to_coder(kanban_home, tmp_path: Path) -> None:
     desktop = png(tmp_path / "desktop.png", 1200, 800, (1, 2, 3))
     mobile = png(tmp_path / "mobile.png", 390, 844, (4, 5, 6))

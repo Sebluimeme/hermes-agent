@@ -158,3 +158,33 @@ async def test_incomplete_codex_turn_is_visible_and_queues_bounded_recovery(monk
         ("start", "m-1"),
         ("complete", "m-1", ProcessingOutcome.SUCCESS),
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_resume_button_replaces_typed_relaunch_instruction(monkeypatch, tmp_path):
+    adapter = CaptureSlackAdapter()
+    adapter.send_resume_prompt = AsyncMock(
+        return_value=SendResult(success=True, message_id="resume-1")
+    )
+    runner = _make_runner(adapter)
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+    monkeypatch.setenv("SLACK_HOME_CHANNEL", "C123")
+
+    adapter.set_message_handler(runner._handle_message)
+    adapter._keep_typing = lambda *_args, **_kwargs: asyncio.Event().wait()
+    event = _make_event()
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert runner._run_agent.await_count == 2
+    adapter.send_resume_prompt.assert_awaited_once()
+    # Only the automatic-retry notice is sent through the ordinary text path;
+    # the terminal action request is the native button prompt itself.
+    assert len(adapter.sent) == 1
+    assert "reprends automatiquement" in adapter.sent[0]["content"]
+    assert all("Répondez « reprends »" not in item["content"] for item in adapter.sent)

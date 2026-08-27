@@ -3587,6 +3587,82 @@ def _get_single_query_approval_mode() -> str:
         return "deny"
 
 
+def _kanban_worker_approval_bridge_active() -> bool:
+    """Return whether this single-query process can reach a real operator.
+
+    Dispatcher workers are single-query processes, but unlike cron jobs they
+    carry a durable task id and notification subscription.  The gateway can
+    therefore relay their approval request to Telegram/Discord buttons through
+    ``tools.worker_approval``.  Treating every ``-q`` process as unattended
+    used to deny these requests before that bridge ever had a chance to run.
+    """
+    return bool(
+        _is_single_query_approval_context()
+        and os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        and _get_single_query_approval_mode() == "deny"
+    )
+
+
+def _await_kanban_worker_approval(
+    *,
+    display_target: str,
+    description: str,
+    pattern_keys: list[str],
+    allow_session: bool,
+    allow_permanent: bool,
+) -> dict:
+    """Round-trip one worker approval through the durable gateway bridge."""
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    session_key = get_current_session_key()
+    from agent.redact import redact_sensitive_text
+    from tools import worker_approval
+
+    redacted_target = redact_sensitive_text(display_target)
+    redacted_description = redact_sensitive_text(description)
+    stable_keys = sorted({str(key).strip() for key in pattern_keys if str(key).strip()})
+    target_hash = hashlib.sha256(redacted_target.encode("utf-8")).hexdigest()[:16]
+    request_key = "command:" + ",".join(stable_keys) + ":" + target_hash
+    decision = worker_approval.request_decision(
+        task_id=task_id,
+        title="Approbation nécessaire pour reprendre la tâche",
+        description=redacted_description,
+        request_key=request_key,
+        command=redacted_target,
+        pattern_keys=stable_keys,
+        allow_session=allow_session,
+        allow_permanent=allow_permanent,
+    )
+    resolved = bool(decision.get("resolved"))
+    choice = decision.get("choice")
+    deny_reason = decision.get("reason")
+    if not resolved or choice in {None, "deny", "timeout"}:
+        outcome = "denied" if resolved and choice == "deny" else "timeout"
+        detail = "refusée par l’utilisateur" if outcome == "denied" else "expirée sans réponse"
+        reason_addendum = f' Motif : "{deny_reason}".' if deny_reason else ""
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: Approbation {detail}.{reason_addendum} "
+                "Aucun consentement n’a été donné. Ne pas retenter ni "
+                "contourner cette action."
+            ),
+            "pattern_key": stable_keys[0] if stable_keys else "kanban_worker",
+            "description": description,
+            "outcome": outcome,
+            "user_consent": False,
+        }
+
+    if choice == "session" and allow_session:
+        for key in stable_keys:
+            approve_session(session_key, key)
+    elif choice == "always" and allow_permanent:
+        for key in stable_keys:
+            approve_session(session_key, key)
+            approve_permanent(key)
+        save_permanent_allowlist(_permanent_approved)
+    return {"approved": True, "message": None, "user_consent": True}
+
+
 def _strip_shell_comments(command: str) -> str:
     """Strip shell-style comments from a command before LLM assessment.
 
@@ -3822,6 +3898,14 @@ def _run_approval_gate(
         # Single-query (-q) sessions: respect single_query_mode config
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
+                if _kanban_worker_approval_bridge_active():
+                    return _await_kanban_worker_approval(
+                        display_target=display_target,
+                        description=description,
+                        pattern_keys=[pattern_key],
+                        allow_session=True,
+                        allow_permanent=True,
+                    )
                 return {
                     "approved": False,
                     "message": single_query_deny_message,
@@ -4751,6 +4835,7 @@ def check_all_command_guards(command: str, env_type: str,
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    kanban_worker_bridge = _kanban_worker_approval_bridge_active()
 
     # Single-query (-q) sessions export HERMES_INTERACTIVE=1 but have no user
     # to answer approval prompts — an unanswered prompt just waits the full
@@ -4770,7 +4855,7 @@ def check_all_command_guards(command: str, env_type: str,
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
                 is_dangerous, _pk, description = detect_dangerous_command(command)
-                if is_dangerous:
+                if is_dangerous and not kanban_worker_bridge:
                     return {
                         "approved": False,
                         "message": (
@@ -4791,7 +4876,10 @@ def check_all_command_guards(command: str, env_type: str,
                 try:
                     from tools.tirith_security import check_command_security
                     _sq_tirith = check_command_security(command)
-                    if _sq_tirith.get("action") in ("block", "warn"):
+                    if (
+                        _sq_tirith.get("action") in ("block", "warn")
+                        and not kanban_worker_bridge
+                    ):
                         _sq_desc = _format_tirith_description(_sq_tirith)
                         return {
                             "approved": False,
@@ -4819,7 +4907,7 @@ def check_all_command_guards(command: str, env_type: str,
                             _sq_fail_open = _sec.get("tirith_fail_open", True)
                     except Exception:
                         pass
-                    if not _sq_fail_open:
+                    if not _sq_fail_open and not kanban_worker_bridge:
                         return {
                             "approved": False,
                             "message": (
@@ -4897,7 +4985,8 @@ def check_all_command_guards(command: str, env_type: str,
                             ),
                         }
                     # else: tirith_fail_open is True — allow as before
-        return {"approved": True, "message": None}
+        if not kanban_worker_bridge:
+            return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
 
@@ -4999,7 +5088,9 @@ def check_all_command_guards(command: str, env_type: str,
             return {"approved": True, "message": None,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
-        elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
+        elif verdict == "deny" and not (
+            is_cli or is_gateway or is_ask or kanban_worker_bridge
+        ):
             _record_denial(session_key)
             breaker_addendum = _denial_breaker_addendum(session_key)
             return {
@@ -5033,6 +5124,17 @@ def check_all_command_guards(command: str, env_type: str,
     # correctly persist the pattern key and downgrade the tirith key to
     # session — the UI was stricter than the persistence layer.
     has_permanent_capable = any(not is_t for _, _, is_t in warnings)
+
+    if kanban_worker_bridge:
+        return _await_kanban_worker_approval(
+            display_target=command,
+            description=combined_desc,
+            pattern_keys=all_keys,
+            allow_session=not smart_denied_for_owner,
+            allow_permanent=(
+                has_permanent_capable and not smart_denied_for_owner
+            ),
+        )
 
     # An explicitly selected plugin transport replaces every built-in prompt
     # surface (CLI/TUI/gateway/ACP). Detection, allowed scopes, persistence,
@@ -5387,8 +5489,18 @@ def check_execute_code_guard(code: str, env_type: str,
 
     # Single-query (-q): no user is present to approve arbitrary code. Mirrors
     # the cron branch below so the -q escape-hatch no longer auto-approves.
+    # Dispatcher workers are the exception: their task subscription gives the
+    # gateway a durable route to a real approval button.
     if _is_single_query_approval_context():
         if _get_single_query_approval_mode() == "deny":
+            if _kanban_worker_approval_bridge_active():
+                return _await_kanban_worker_approval(
+                    display_target=f"execute_code <<'PY'\n{code}\nPY",
+                    description=description,
+                    pattern_keys=[pattern_key],
+                    allow_session=True,
+                    allow_permanent=True,
+                )
             return {
                 "approved": False,
                 "message": (

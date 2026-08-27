@@ -41,6 +41,16 @@ def test_request_id_is_stable_for_the_same_demand():
     assert a != d
 
 
+def test_profile_worker_and_gateway_share_one_approval_mailbox(tmp_path, monkeypatch):
+    from tools import worker_approval as wa
+
+    profile_home = tmp_path / "profiles" / "spark"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    assert wa._state_dir() == tmp_path / "state" / "worker-approvals"
+
+
 def test_retry_reattaches_to_the_same_pending_request_without_a_second_solicitation():
     """A worker crash/respawn mid-wait must not double-prompt the operator."""
     from tools import worker_approval as wa
@@ -129,6 +139,47 @@ def test_missing_task_id_or_paths_is_never_a_solicitation():
         task_id="t_x", title="t", description="d", paths=[],
     ) == {"resolved": False, "choice": None, "reason": "missing task_id/paths"}
     assert list(wa._state_dir().glob("*.json")) == []
+
+
+def test_generic_worker_command_request_keeps_button_capabilities():
+    """Dangerous terminal/tool approvals use the same durable transport as
+    protected writes, without pretending the command is a file path."""
+    from tools import worker_approval as wa
+
+    task_id = "t_command001"
+    request_key = "command:script_execution:abc123"
+    result: dict[str, dict] = {}
+
+    def _request():
+        result["value"] = wa.request_decision(
+            task_id=task_id,
+            title="Approval",
+            description="script execution via -c flag",
+            request_key=request_key,
+            command="python3 -c 'print(1)'",
+            pattern_keys=["script_execution"],
+            allow_session=True,
+            allow_permanent=True,
+            timeout_seconds=10,
+        )
+
+    thread = threading.Thread(target=_request)
+    thread.start()
+    request_id = wa._request_id(task_id, [request_key])
+    for _ in range(200):
+        if wa._request_path(request_id).exists():
+            break
+        time.sleep(0.01)
+    payload = wa._read(wa._request_path(request_id))
+    assert payload["paths"] == []
+    assert payload["command"] == "python3 -c 'print(1)'"
+    assert payload["pattern_keys"] == ["script_execution"]
+    assert payload["allow_session"] is True
+    assert payload["allow_permanent"] is True
+
+    assert wa.write_decision(request_id, "once") is True
+    thread.join(timeout=5)
+    assert result["value"]["choice"] == "once"
 
 
 def test_claim_for_dispatch_is_atomic_and_single_use():
