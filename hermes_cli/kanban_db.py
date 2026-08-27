@@ -7626,6 +7626,37 @@ def request_review(
     return _ret(True)
 
 
+def _review_reason_is_internal_closure_failure(reason: str) -> bool:
+    """Return whether a positive verdict is being misrouted as rework.
+
+    Reviewers sometimes correctly accept the implementation, then encounter
+    an unrelated completion-guard failure (for example a legacy card pointing
+    at the wrong/global workspace).  That is an orchestration incident, not an
+    implementation defect, so it must never start another implementation run.
+    Deliberately require both a positive verdict and an explicit foreign or
+    incorrect-workspace marker: ordinary dirty files left by the implementer
+    still remain valid rework.
+    """
+    normalized = " ".join(str(reason or "").casefold().split())
+    accepted = bool(re.search(
+        r"\b(?:implementation|travail|correctif|preuves?)\b.{0,100}"
+        r"\b(?:accept|approv|valid)",
+        normalized,
+    ))
+    internal_workspace = any(
+        re.search(pattern, normalized)
+        for pattern in (
+            r"\bglobal workspace\b.{0,80}\bdirty\b",
+            r"\b(?:wrong|incorrect) workspace\b",
+            r"\bworkspace\b.{0,40}\berron",
+            r"\bunrelated\b.{0,80}\b(?:dirty|workspace)\b",
+            r"\bforeign\b.{0,80}\b(?:dirty|workspace|repository)\b",
+            r"\bhors depot assigne\b",
+        )
+    )
+    return accepted and internal_workspace
+
+
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7644,6 +7675,15 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    if _review_reason_is_internal_closure_failure(reason):
+        return (
+            False,
+            "the implementation was accepted and the reported failure is an "
+            "internal workspace/completion-guard incident, not an "
+            "implementation defect; preserve this review, repair the card "
+            "workspace/baseline and retry kanban_complete (or use "
+            "kanban_block kind=transient if that repair is outside this run)",
+        )
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -13676,6 +13716,12 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "handoff and choose exactly one terminal verdict: approve with "
             "kanban_complete, return defects with kanban_request_changes, or "
             "use kanban_defer_review for a transient visual-provider delay. "
+            "A completion guard rejecting an otherwise accepted implementation "
+            "because of a wrong, global, foreign, or unrelated dirty workspace "
+            "is an internal orchestration incident: never request implementation "
+            "changes for it. Repair the workspace/baseline when in scope, then "
+            "retry kanban_complete; otherwise use kanban_block with kind=transient "
+            "and state that no user action is required. "
             "Never call kanban_request_review and never dependency-block "
             "waiting for yourself."
         )

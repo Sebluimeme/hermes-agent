@@ -150,6 +150,32 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert completed.block_recurrences == 0
 
 
+def test_accepted_review_cannot_be_returned_for_a_foreign_workspace_guard(conn):
+    task_id, review = _claimed_review(conn, "Review from the assigned repository")
+    ok, diagnostic = kb.request_changes(
+        conn,
+        task_id,
+        reason=(
+            "Implementation accepted, but reviewer approval could not be written: "
+            "kanban_complete was refused because the global workspace is dirty "
+            "with unrelated repositories."
+        ),
+        expected_run_id=review.current_run_id,
+    )
+
+    assert not ok
+    assert "internal workspace/completion-guard incident" in str(diagnostic)
+    unchanged = kb.get_task(conn, task_id)
+    assert unchanged is not None
+    assert unchanged.status == "running"
+    assert unchanged.assignee == "reviewer"
+    assert unchanged.current_run_id == review.current_run_id
+    assert not [
+        event for event in kb.list_events(conn, task_id)
+        if event.kind == "changes_requested"
+    ]
+
+
 @pytest.mark.parametrize("bad_payload", [None, "{not-json", "{}"])
 def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
     conn,
