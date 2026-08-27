@@ -513,6 +513,49 @@ def test_dispatch_once_reroutes_already_assigned_card_off_dead_quota(
         assert payload["to_assignee"] == "claude1"
 
 
+@pytest.mark.parametrize(
+    "quota_reason, record",
+    [
+        (
+            "quota_measurement_unknown",
+            None,
+        ),
+        (
+            "quota_preflight_required",
+            {
+                "dispatch_allowed": False,
+                "preflight_required": True,
+                "cooldown_until": "1970-01-01T02:46:40+00:00",
+            },
+        ),
+    ],
+)
+def test_dispatch_unknown_claude_quota_never_opens_coder(
+    kanban_home, all_assignees_spawnable, monkeypatch, quota_reason, record,
+):
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    if record is not None:
+        routing.write_text(json.dumps({"agent_cooldowns": {"claude1": record}}))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="keep requested Claude", assignee="claude1")
+        monkeypatch.setattr(kb.time, "time", lambda: 10_000.0)
+        result = kb.dispatch_once(conn, dry_run=False)
+        row = conn.execute(
+            "SELECT assignee, last_failure_error FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        fallback = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'simple_route_fallback'",
+            (task_id,),
+        ).fetchone()
+
+    assert (task_id, quota_reason) in result.respawn_guarded
+    assert row["assignee"] == "claude1"
+    assert row["last_failure_error"] is None
+    assert fallback is None
+
+
 # ---------------------------------------------------------------------------
 # Spark-first bounded routing; complex cards retain Claude/Terra routing.
 # ---------------------------------------------------------------------------

@@ -6145,11 +6145,16 @@ def visual_completion_projection(
         )
         projected = dict(metadata or {})
         projected["visual_review"] = normalized
+        final_route = normalized.get("final_route")
+        final_label = "GPT fallback" if final_route == "gpt_fallback" else "Gemini"
         projected.setdefault(
             "evidence",
             {
                 "kind": "visual",
-                "detail": "Coder native PASS + Gemini final OK on matching desktop/mobile captures",
+                "detail": (
+                    f"Coder native PASS + {final_label} final OK on matching "
+                    "desktop/mobile captures"
+                ),
             },
         )
         # Root-cause guard for a landing-page card validated on screenshots
@@ -12616,10 +12621,13 @@ def _dispatch_once_locked(
                     _append_state_event_if_changed(
                         conn, row["id"], "provider_cooldown", {"reason": quota_reason}
                     )
-                    # The card's current assignee is not currently usable
-                    # (quota_dispatch_guard refused it) -- advance it one hop
-                    # in its ordered fallback chain instead of deferring on
-                    # this same unusable assignee every tick forever
+                    # Advance only on a provider cooldown that is actually
+                    # measured. Missing/stale telemetry and an expired
+                    # measurement that still requires a fresh preflight are
+                    # not proof that Claude is unavailable: those states keep
+                    # the requested Claude lane instead of silently opening GPT.
+                    # A proven cooldown advances one hop rather than deferring on
+                    # the same unusable assignee every tick forever
                     # (t_47dc2bf0: "aucun autre agent ne prend le relais,
                     # meme si Claude 1 et Spark sont libres"). No-op for a
                     # card not on a recognized chain role (e.g. a
@@ -12627,7 +12635,12 @@ def _dispatch_once_locked(
                     # last hop; the next tick re-evaluates the new assignee
                     # under this same guard, so a still-dead chain cascades
                     # one confirmed hop per tick rather than all at once.
-                    fallback_simple_route(conn, row["id"], quota_reason, provider_proven=True)
+                    fallback_simple_route(
+                        conn,
+                        row["id"],
+                        quota_reason,
+                        provider_proven=quota_reason == "provider_cooldown",
+                    )
             continue
         oauth_disposition = (
             claude2_oauth_dispatch_guard(conn, row["id"], row_assignee)

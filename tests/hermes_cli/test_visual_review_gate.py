@@ -222,6 +222,62 @@ def test_coder_native_and_matching_gemini_evidence_unlock_completion(
         assert kb.get_task(conn, task_id).status == "done"
 
 
+def test_matching_coder_gpt_fallback_evidence_unlocks_final_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    desktop = png(tmp_path / "desktop-fallback.png", 1200, 800, (10, 20, 30))
+    mobile = png(tmp_path / "mobile-fallback.png", 390, 844, (40, 50, 60))
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    monkeypatch.setattr(vr, "FINAL_EVIDENCE_ROOT", evidence_root)
+    task_id = "t_gpt_visual_fallback"
+    handoff, reviewer = vr.prepare_review_handoff(
+        task_id=task_id,
+        title="Finaliser le rendu visuel du site",
+        body="",
+        metadata=visual_metadata(desktop, mobile),
+        reviewer=None,
+    )
+    hashes = vr.screenshot_hashes(handoff)
+    evidence = evidence_root / "fallback.json"
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema": vr.SCHEMA,
+                "stage": "final",
+                "task_id": task_id,
+                "model": "coder-native-gpt-fallback",
+                "verdict": "OK",
+                "fallback": True,
+                "fallback_from": "gemini-3.5-flash",
+                "fallback_basis": "coder_native_pass_required_by_gate",
+                "screenshots": [
+                    {"path": item["path"], "sha256": item["sha256"]}
+                    for item in handoff["visual_review"]["screenshots"]
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = vr.validate_final_review(
+        task_id=task_id,
+        handoff_metadata=handoff,
+        completion_metadata={
+            "visual_review": {
+                "coder_verdict": "PASS",
+                "gemini_evidence": str(evidence),
+            }
+        },
+        reviewer_profile=reviewer,
+        native_checked_hashes=hashes,
+    )
+
+    assert result["final_route"] == "gpt_fallback"
+    assert result["gemini_verdict"] == "UNAVAILABLE"
+    assert result["gpt_fallback_verdict"] == "OK"
+
+
 def test_transient_final_review_deferral_auto_resumes_review_session(
     kanban_home, tmp_path: Path,
 ) -> None:

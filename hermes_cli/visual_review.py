@@ -6,7 +6,8 @@ It deliberately contains no LLM call.  The Kanban domain uses it to:
 
 * identify web/UI work that needs visual evidence;
 * normalise and hash desktop/mobile screenshots before review dispatch;
-* validate the final Gemini evidence against those same immutable hashes.
+* validate the final Gemini evidence, or its explicit Coder/GPT fallback,
+  against those same immutable hashes.
 
 The final evidence file is produced by ``~/.hermes/scripts/gemini_review_image.py``.
 Keeping hashes and routing policy here prevents a prose-only "looks good"
@@ -343,7 +344,7 @@ def load_final_evidence(path_value: Any) -> tuple[Path, dict[str, Any]]:
     raw = str(path_value or "").strip()
     if not raw:
         raise VisualReviewError(
-            "preuve Gemini finale absente; lancer gemini_review_image.py avec --task-id"
+            "preuve visuelle finale absente; lancer gemini_review_image.py avec --task-id"
         )
     path = Path(raw).expanduser().resolve()
     root = FINAL_EVIDENCE_ROOT.expanduser().resolve()
@@ -351,18 +352,18 @@ def load_final_evidence(path_value: Any) -> tuple[Path, dict[str, Any]]:
         path.relative_to(root)
     except ValueError as exc:
         raise VisualReviewError(
-            f"la preuve Gemini doit se trouver dans le dossier d'évidence Hermes: {root}"
+            f"la preuve visuelle doit se trouver dans le dossier d'évidence Hermes: {root}"
         ) from exc
     if not path.is_file() or path.stat().st_size <= 0:
-        raise VisualReviewError(f"preuve Gemini introuvable: {path}")
+        raise VisualReviewError(f"preuve visuelle introuvable: {path}")
     if path.stat().st_size > 1024 * 1024:
-        raise VisualReviewError("preuve Gemini anormalement volumineuse")
+        raise VisualReviewError("preuve visuelle anormalement volumineuse")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise VisualReviewError(f"preuve Gemini illisible: {exc}") from exc
+        raise VisualReviewError(f"preuve visuelle illisible: {exc}") from exc
     if not isinstance(data, dict):
-        raise VisualReviewError("preuve Gemini invalide")
+        raise VisualReviewError("preuve visuelle invalide")
     return path, data
 
 
@@ -374,7 +375,7 @@ def validate_final_review(
     reviewer_profile: Optional[str],
     native_checked_hashes: Iterable[str],
 ) -> dict[str, Any]:
-    """Validate Coder-native and Gemini-final evidence for one candidate."""
+    """Validate Coder-native plus Gemini/GPT-final evidence for one candidate."""
     expected = screenshot_hashes(handoff_metadata)
     if len(expected) < 2:
         raise VisualReviewError("handoff visuel sans captures desktop/mobile vérifiables")
@@ -392,39 +393,63 @@ def validate_final_review(
         raise VisualReviewError("verdict Coder PASS absent de metadata.visual_review")
     evidence_path, evidence = load_final_evidence(visual.get("gemini_evidence"))
     if evidence.get("schema") != SCHEMA or evidence.get("stage") != "final":
-        raise VisualReviewError("preuve Gemini d'un type ou d'une étape inattendue")
+        raise VisualReviewError("preuve visuelle d'un type ou d'une étape inattendue")
     if str(evidence.get("task_id") or "") != task_id:
-        raise VisualReviewError("preuve Gemini liée à une autre tâche")
+        raise VisualReviewError("preuve visuelle liée à une autre tâche")
     if str(evidence.get("verdict") or "").upper() != "OK":
         raise VisualReviewError(
-            "Gemini n'a pas validé le candidat final; demander les corrections avant clôture"
+            "le contrôleur visuel final n'a pas validé le candidat; "
+            "demander les corrections avant clôture"
         )
     model = str(evidence.get("model") or "").lower()
-    if "gemini" not in model:
-        raise VisualReviewError("la preuve finale ne provient pas de Gemini")
+    fallback_from = str(evidence.get("fallback_from") or "").lower()
+    fallback_basis = str(evidence.get("fallback_basis") or "")
+    gemini_final = "gemini" in model and evidence.get("fallback") is not True
+    gpt_fallback = (
+        evidence.get("fallback") is True
+        and model == "coder-native-gpt-fallback"
+        and "gemini" in fallback_from
+        and fallback_basis == "coder_native_pass_required_by_gate"
+    )
+    if not gemini_final and not gpt_fallback:
+        raise VisualReviewError(
+            "la preuve finale ne provient ni de Gemini ni du fallback GPT Coder autorisé"
+        )
     evidence_hashes = {
         str(item.get("sha256") or "").lower()
         for item in evidence.get("screenshots", [])
         if isinstance(item, dict)
     }
     if evidence_hashes != expected:
-        raise VisualReviewError("la preuve Gemini ne correspond pas aux captures relues par Coder")
+        raise VisualReviewError("la preuve finale ne correspond pas aux captures relues par Coder")
     # Recompute every hash now: neither evidence file can bless an image that
     # changed after the two reviews.
     for item in (handoff_metadata or {}).get("visual_review", {}).get("screenshots", []):
         path = Path(str(item.get("path") or ""))
         if not path.is_file() or sha256_file(path) != str(item.get("sha256") or ""):
             raise VisualReviewError(f"capture modifiée ou supprimée après revue: {path}")
-    return {
+    result = {
         "schema": SCHEMA,
         "required": True,
         "coder_verdict": "PASS",
         "reviewer": "coder",
-        "gemini_verdict": "OK",
-        "gemini_model": evidence.get("model"),
+        "final_route": "gpt_fallback" if gpt_fallback else "gemini",
+        "final_verdict": "OK",
+        "final_model": evidence.get("model"),
+        "final_evidence": str(evidence_path),
+        "gemini_verdict": "UNAVAILABLE" if gpt_fallback else "OK",
+        "gemini_model": evidence.get("fallback_from") if gpt_fallback else evidence.get("model"),
         "gemini_evidence": str(evidence_path),
         "screenshots": (handoff_metadata or {}).get("visual_review", {}).get("screenshots", []),
     }
+    if gpt_fallback:
+        result.update(
+            {
+                "gpt_fallback_verdict": "OK",
+                "gpt_fallback_model": evidence.get("model"),
+            }
+        )
+    return result
 
 
 def _parse_timestamp(value: Any) -> Optional[float]:
