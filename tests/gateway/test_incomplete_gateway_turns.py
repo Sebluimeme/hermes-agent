@@ -71,6 +71,22 @@ def _make_incomplete_result() -> dict:
     }
 
 
+def _make_inactivity_timeout_result() -> dict:
+    return {
+        "final_response": "Agent inactive; reply to retry.",
+        "messages": [],
+        "tools": [],
+        "history_offset": 0,
+        "api_calls": 3,
+        "failed": True,
+        "resume_prompt_requested": True,
+        "resume_prompt_content": (
+            "⚠️ La réponse est restée sans activité pendant 5 min. "
+            "Le contexte et le travail déjà réalisé sont conservés."
+        ),
+    }
+
+
 def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.config = GatewayConfig(
@@ -188,3 +204,54 @@ async def test_native_resume_button_replaces_typed_relaunch_instruction(monkeypa
     assert len(adapter.sent) == 1
     assert "reprends automatiquement" in adapter.sent[0]["content"]
     assert all("Répondez « reprends »" not in item["content"] for item in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_inactivity_timeout_uses_native_resume_button(monkeypatch, tmp_path):
+    adapter = CaptureSlackAdapter()
+    adapter.send_resume_prompt = AsyncMock(
+        return_value=SendResult(success=True, message_id="resume-timeout-1")
+    )
+    runner = _make_runner(adapter)
+    runner._run_agent = AsyncMock(return_value=_make_inactivity_timeout_result())
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+    monkeypatch.setenv("SLACK_HOME_CHANNEL", "C123")
+
+    adapter.set_message_handler(runner._handle_message)
+    adapter._keep_typing = lambda *_args, **_kwargs: asyncio.Event().wait()
+    event = _make_event()
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    adapter.send_resume_prompt.assert_awaited_once()
+    kwargs = adapter.send_resume_prompt.await_args.kwargs
+    assert "sans activité pendant 5 min" in kwargs["content"]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_inactivity_timeout_keeps_text_fallback_without_native_button(monkeypatch, tmp_path):
+    adapter = CaptureSlackAdapter()
+    runner = _make_runner(adapter)
+    runner._run_agent = AsyncMock(return_value=_make_inactivity_timeout_result())
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100,
+    )
+    monkeypatch.setenv("SLACK_HOME_CHANNEL", "C123")
+
+    adapter.set_message_handler(runner._handle_message)
+    adapter._keep_typing = lambda *_args, **_kwargs: asyncio.Event().wait()
+    event = _make_event()
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["content"] == "Agent inactive; reply to retry."

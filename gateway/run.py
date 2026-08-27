@@ -20589,13 +20589,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             response = agent_result.get("final_response") or ""
             _resume_prompt_sent = False
+            if agent_result.get("resume_prompt_requested"):
+                _resume_adapter = self._adapter_for_source(source)
+                _resume_result = None
+                if _resume_adapter is not None and session_key:
+                    try:
+                        _resume_result = await _resume_adapter.send_resume_prompt(
+                            source.chat_id,
+                            session_key,
+                            metadata=self._thread_metadata_for_source(source),
+                            content=agent_result.get("resume_prompt_content"),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "native inactivity resume prompt failed for %s",
+                            source.platform,
+                            exc_info=True,
+                        )
+                if getattr(_resume_result, "success", False):
+                    response = ""
+                    agent_result["final_response"] = ""
+                    _resume_prompt_sent = True
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
             # verbatim into the channel — where peer agents can ingest it as a
             # completed assistant turn (#51628). Blank it here so the normal
             # empty-response handling (and the suppression below) applies.
-            if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
+            if (not _resume_prompt_sent
+                    and _is_gateway_hidden_reasoning_incomplete_turn(agent_result)):
                 # The synchronous recovery above has also exhausted. On a
                 # transport with a native action surface, make the remaining
                 # human step one tap instead of asking the user to type a magic
@@ -29530,10 +29552,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             try:
                                 await _warn_adapter.send(
                                     source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
+                                    f"⚠️ Aucune activité depuis {_elapsed_warn} min. "
+                                    f"Sans nouvelle réponse, Hermes arrêtera cette "
+                                    f"tentative dans {_remaining_mins} min et affichera "
+                                    "un bouton « Relancer maintenant ». Le contexte "
+                                    "restera conservé.",
                                     metadata=_interim_metadata(_status_thread_metadata),
                                 )
                             except Exception as _warn_err:
@@ -29651,6 +29674,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "tools": tools_holder[0] or [],
                     "history_offset": 0,
                     "failed": True,
+                    # The run is already being abandoned and its durable
+                    # session history is preserved. Native platforms can turn
+                    # the remaining human step into a one-tap exact-session
+                    # retry; unsupported transports keep the diagnostic above.
+                    "resume_prompt_requested": True,
+                    "resume_prompt_content": (
+                        f"⚠️ La réponse est restée sans activité pendant "
+                        f"{_timeout_mins} min. Le contexte et le travail déjà "
+                        "réalisé sont conservés."
+                    ),
                 }
 
             # Track fallback model state: if the agent switched to a

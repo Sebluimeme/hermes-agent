@@ -4424,12 +4424,15 @@ class BasePlatformAdapter(ABC):
         chat_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        content: Optional[str] = None,
     ) -> SendResult:
         """Render a one-tap retry after automatic recovery was exhausted.
 
         Native adapters may override this with an interactive button that
-        dispatches a fresh turn into *session_key*.  Unsupported transports
-        return failure so the gateway keeps the explicit text fallback.
+        dispatches a fresh turn into *session_key*. *content* lets the gateway
+        explain the exact recovery reason while keeping the callback contract.
+        Unsupported transports return failure so the gateway keeps the
+        explicit text fallback.
         """
         return SendResult(success=False, error="Not supported")
 

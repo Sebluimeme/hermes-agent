@@ -51,6 +51,36 @@ async def test_resume_prompt_renders_one_button_and_pins_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_prompt_accepts_inactivity_explanation() -> None:
+    adapter = _adapter()
+    sent = MagicMock(message_id=303)
+    adapter._bot.send_message = AsyncMock(return_value=sent)
+
+    with (
+        patch(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            side_effect=lambda text, callback_data: SimpleNamespace(
+                text=text, callback_data=callback_data,
+            ),
+        ),
+        patch(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+            side_effect=lambda rows: SimpleNamespace(inline_keyboard=rows),
+        ),
+    ):
+        result = await adapter.send_resume_prompt(
+            chat_id="12345",
+            session_key="agent:main:telegram:dm:12345",
+            content="⚠️ Réponse inactive depuis 5 min. Le contexte est conservé.",
+        )
+
+    assert result.success is True
+    kwargs = adapter._bot.send_message.await_args.kwargs
+    assert kwargs["text"] == "⚠️ Réponse inactive depuis 5 min. Le contexte est conservé."
+    assert kwargs["reply_markup"].inline_keyboard[0][0].text == "▶️ Relancer maintenant"
+
+
+@pytest.mark.asyncio
 async def test_resume_button_dispatches_exact_session_once() -> None:
     adapter = _adapter()
     adapter._resume_prompt_state[9] = "agent:main:telegram:dm:12345"

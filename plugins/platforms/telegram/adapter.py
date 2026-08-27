@@ -6519,6 +6519,7 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
+        content: Optional[str] = None,
     ) -> SendResult:
         """Offer one explicit tap when bounded automatic recovery is exhausted."""
         if not self._bot:
@@ -6538,7 +6539,7 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_id = self._reply_to_message_id_for_send(None, metadata)
             kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id),
-                "text": (
+                "text": content or (
                     "⚠️ La reprise automatique n’a pas pu produire la réponse "
                     "finale. Le travail déjà réalisé est conservé."
                 ),
