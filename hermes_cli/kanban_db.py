@@ -6033,7 +6033,9 @@ def visual_completion_projection(
             VisualReviewError,
             is_capture_only_delivery,
             is_visual_web_task,
+            requires_production_proof,
             validate_final_review,
+            validate_production_proof,
         )
 
         # A historical handoff may carry visual_review.required=True because
@@ -6084,6 +6086,18 @@ def visual_completion_projection(
                 "detail": "Coder native PASS + Gemini final OK on matching desktop/mobile captures",
             },
         )
+        # Root-cause guard for a landing-page card validated on screenshots
+        # that were never actually deployed (incident t_9fbb7396): a render
+        # change cannot close on visual review alone unless the card carries
+        # Sébastien's explicit [NO-PROD-PROOF] exemption.
+        if requires_production_proof(
+            task["title"] or "", task["body"] or "", handoff or metadata,
+        ) or requires_production_proof(
+            task["title"] or "", task["body"] or "", metadata,
+        ):
+            projected["production_proof"] = validate_production_proof(
+                task_id=task_id, metadata=metadata,
+            )
         return None, projected
     except VisualReviewError as exc:
         return str(exc), metadata

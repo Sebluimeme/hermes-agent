@@ -149,6 +149,8 @@ def test_coder_native_and_matching_gemini_evidence_unlock_completion(
     evidence_root = tmp_path / "evidence"
     evidence_root.mkdir()
     monkeypatch.setattr(vr, "FINAL_EVIDENCE_ROOT", evidence_root)
+    production_root = tmp_path / "production-evidence"
+    monkeypatch.setattr(vr, "PRODUCTION_PROOF_EVIDENCE_ROOT", production_root)
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="Finaliser le rendu visuel du site", assignee="claude2")
         assert kb.request_review(
@@ -185,6 +187,26 @@ def test_coder_native_and_matching_gemini_evidence_unlock_completion(
             ),
             encoding="utf-8",
         )
+        # The render change must also prove it actually reached production
+        # (incident t_9fbb7396): visual review passing is necessary but not
+        # sufficient on its own. See test_production_proof_gate.py for the
+        # dedicated coverage of that gate.
+        production_root.mkdir()
+        production_evidence = production_root / "production.json"
+        production_evidence.write_text(
+            json.dumps(
+                {
+                    "schema": vr.PRODUCTION_PROOF_SCHEMA,
+                    "task_id": task_id,
+                    "url": "https://example.test/",
+                    "status_code": 200,
+                    "matched": True,
+                    "verdict": "OK",
+                    "fetched_at": time.time(),
+                }
+            ),
+            encoding="utf-8",
+        )
         assert kb.complete_task(
             conn,
             task_id,
@@ -193,7 +215,8 @@ def test_coder_native_and_matching_gemini_evidence_unlock_completion(
                 "visual_review": {
                     "coder_verdict": "PASS",
                     "gemini_evidence": str(evidence),
-                }
+                },
+                "production_proof": {"evidence_path": str(production_evidence)},
             },
         )
         assert kb.get_task(conn, task_id).status == "done"

@@ -19,6 +19,8 @@ import json
 import os
 import re
 import struct
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -31,8 +33,30 @@ FINAL_EVIDENCE_ROOT = Path(
     )
 )
 
+PRODUCTION_PROOF_SCHEMA = "hermes.production-proof.v1"
+PRODUCTION_PROOF_EVIDENCE_ROOT = Path(
+    os.environ.get(
+        "HERMES_PRODUCTION_PROOF_EVIDENCE_DIR",
+        str(Path.home() / ".hermes" / "state" / "production-proof-evidence"),
+    )
+)
+# Default freshness window for a production check: a proof older than this
+# cannot be reused to close a later, different candidate. Overridable for
+# slower deploy pipelines.
+_PRODUCTION_PROOF_MAX_AGE_SECONDS = 24 * 60 * 60
+
 _EXPLICIT_MARKERS = ("[visual]", "[visual-web]", "[web-visual]")
 _OPT_OUT_MARKERS = ("[no-visual]", "[sans-visuel]")
+# Distinct from _OPT_OUT_MARKERS on purpose: Sébastien may want a live
+# production check without demanding visual review (e.g. a config-only
+# deploy) or vice versa. Presence of this marker in the card is itself the
+# durable trace of his explicit authorization (same convention as
+# [NO-VISUAL]) — see incident t_9fbb7396.
+_PRODUCTION_PROOF_EXEMPT_MARKERS = ("[no-prod-proof]", "[sans-preuve-prod]")
+_LOCAL_HOST_RE = re.compile(
+    r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(/|$)",
+    re.IGNORECASE,
+)
 _VISUAL_TEXT_RE = re.compile(
     r"(?:\bsite\s+web\b|\bwebsite\b|\blanding\s+page\b|\bpage\s+web\b|"
     r"\binterface\b|\bfront[ -]?end\b|\bresponsive\b|\bdesktop\b|"
@@ -60,6 +84,17 @@ _VISUAL_EXTENSIONS = {
 
 class VisualReviewError(ValueError):
     """Raised when visual-review evidence is missing, stale, or inconsistent."""
+
+
+class ProductionProofError(VisualReviewError):
+    """Raised when a render-changing card lacks a verified production check.
+
+    Subclasses ``VisualReviewError`` so every existing ``except
+    VisualReviewError`` boundary (notably
+    ``kanban_db.visual_completion_projection``) already surfaces it without
+    change, and it maps to the same ``VisualReviewGateError`` at
+    ``kanban_complete``.
+    """
 
 
 def _metadata_changed_files(metadata: Optional[dict[str, Any]]) -> list[str]:
@@ -119,6 +154,26 @@ def is_visual_web_task(
     if _VISUAL_TEXT_RE.search(text):
         return True
     return any(Path(path).suffix.lower() in _VISUAL_EXTENSIONS for path in _metadata_changed_files(metadata))
+
+
+def requires_production_proof(
+    title: str,
+    body: str = "",
+    metadata: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Return whether a card must prove a live production check before closing.
+
+    Root-cause guard for the incident where a landing-page card was validated
+    on screenshots that were never actually deployed. Scope matches
+    :func:`is_visual_web_task` (any Web/UI/code card that changes a rendered
+    surface) so the two gates classify the same candidates the same way; the
+    exemption marker is deliberately separate from ``[NO-VISUAL]`` so
+    Sébastien can authorize skipping one without the other.
+    """
+    text = f"{title or ''}\n{body or ''}".lower()
+    if any(marker in text for marker in _PRODUCTION_PROOF_EXEMPT_MARKERS):
+        return False
+    return is_visual_web_task(title, body, metadata)
 
 
 def sha256_file(path: Path) -> str:
@@ -332,4 +387,113 @@ def validate_final_review(
         "gemini_model": evidence.get("model"),
         "gemini_evidence": str(evidence_path),
         "screenshots": (handoff_metadata or {}).get("visual_review", {}).get("screenshots", []),
+    }
+
+
+def _parse_timestamp(value: Any) -> Optional[float]:
+    """Accept an epoch number or an ISO-8601 string (``Z`` or offset)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            normalised = text[:-1] + "+00:00" if text.endswith("Z") else text
+            return datetime.fromisoformat(normalised).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def load_production_proof(path_value: Any) -> tuple[Path, dict[str, Any]]:
+    raw = str(path_value or "").strip()
+    if not raw:
+        raise ProductionProofError(
+            "preuve de production absente; lancer "
+            "scripts/verify_production_proof.py --url <url-prod> --attendu <marqueur> --task-id <carte>"
+        )
+    path = Path(raw).expanduser().resolve()
+    root = PRODUCTION_PROOF_EVIDENCE_ROOT.expanduser().resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ProductionProofError(
+            f"la preuve de production doit se trouver dans le dossier d'évidence Hermes: {root}"
+        ) from exc
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise ProductionProofError(f"preuve de production introuvable: {path}")
+    if path.stat().st_size > 1024 * 1024:
+        raise ProductionProofError("preuve de production anormalement volumineuse")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ProductionProofError(f"preuve de production illisible: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ProductionProofError("preuve de production invalide")
+    return path, data
+
+
+def validate_production_proof(
+    *,
+    task_id: str,
+    metadata: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate a live production check before a render-changing card closes.
+
+    Reads ``metadata.production_proof.evidence_path`` — the JSON file written
+    by ``scripts/verify_production_proof.py`` — and refuses a prose-only
+    claim, a stale check from an earlier candidate, or one pointed at a
+    non-production/local URL.
+    """
+    meta = metadata if isinstance(metadata, dict) else {}
+    proof = meta.get("production_proof")
+    if not isinstance(proof, dict):
+        raise ProductionProofError(
+            "preuve de production absente; fournir metadata.production_proof.evidence_path "
+            "produit par scripts/verify_production_proof.py, ou marquer la carte [NO-PROD-PROOF] "
+            "avec l'autorisation explicite de Sébastien"
+        )
+    evidence_path, evidence = load_production_proof(proof.get("evidence_path"))
+    if evidence.get("schema") != PRODUCTION_PROOF_SCHEMA:
+        raise ProductionProofError("preuve de production d'un type inattendu")
+    if str(evidence.get("task_id") or "") != task_id:
+        raise ProductionProofError("preuve de production liée à une autre tâche")
+    if str(evidence.get("verdict") or "").upper() != "OK":
+        raise ProductionProofError(
+            "le contrôle de production n'a pas confirmé le déploiement; corriger avant clôture"
+        )
+    url = str(evidence.get("url") or "").strip()
+    if not url:
+        raise ProductionProofError("preuve de production sans URL vérifiée")
+    if not url.lower().startswith("https://"):
+        raise ProductionProofError("la preuve de production doit cibler une URL https réelle")
+    if _LOCAL_HOST_RE.match(url):
+        raise ProductionProofError("la preuve de production ne peut pas cibler un hôte local")
+    checked_ts = _parse_timestamp(evidence.get("fetched_at"))
+    if checked_ts is None:
+        raise ProductionProofError("preuve de production sans horodatage exploitable")
+    max_age = float(
+        os.environ.get(
+            "HERMES_PRODUCTION_PROOF_MAX_AGE_SECONDS",
+            str(_PRODUCTION_PROOF_MAX_AGE_SECONDS),
+        )
+    )
+    age = time.time() - checked_ts
+    if age > max_age:
+        raise ProductionProofError(
+            f"preuve de production trop ancienne ({int(age)}s); relancer verify_production_proof.py"
+        )
+    if age < -60:
+        raise ProductionProofError("preuve de production horodatée dans le futur")
+    return {
+        "schema": PRODUCTION_PROOF_SCHEMA,
+        "required": True,
+        "url": url,
+        "verdict": "OK",
+        "fetched_at": evidence.get("fetched_at"),
+        "evidence_path": str(evidence_path),
+        "matched": evidence.get("matched"),
     }
