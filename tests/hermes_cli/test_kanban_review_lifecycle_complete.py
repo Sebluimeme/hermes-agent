@@ -11,6 +11,7 @@ These tests cover the two review models that must coexist:
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -642,6 +643,72 @@ def _failures(conn, task_id: str) -> int:
     return int(conn.execute(
         "SELECT consecutive_failures FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()[0])
+
+
+def test_request_review_clears_superseded_failure_state(conn) -> None:
+    """A successful handoff cannot inherit a stale provider blocker."""
+    task_id = kb.create_task(conn, title="handoff after fallback", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=1,last_failure_error=?,"
+            "failure_class='crashed',execution_status='retrying',"
+            "next_retry_at=123,action_required='old action' WHERE id=?",
+            ("provider rate-limited (quota wall)", task_id),
+        )
+
+    assert kb.request_review(
+        conn, task_id, summary="implementation ready", reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    assert task.consecutive_failures == 1  # reliability history is retained
+    assert task.last_failure_error is None
+    assert task.failure_class is None
+    assert task.execution_status == "pending"
+    assert task.next_retry_at is None
+    assert task.action_required is None
+    assert kb.check_respawn_guard(conn, task_id, lane="review") is None
+
+
+def test_schema_reconciles_legacy_review_handoff_failure_state(conn) -> None:
+    """Opening an upgraded board repairs already-stuck review rows."""
+    task_id = kb.create_task(conn, title="legacy review", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+    assert kb.request_review(
+        conn, task_id, summary="ready", reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=?,failure_class='crashed',"
+            "execution_status='running',action_required='obsolete' WHERE id=?",
+            ("old quota error", task_id),
+        )
+
+    kb._migrate_add_optional_columns(conn)
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    assert task.last_failure_error is None
+    assert task.failure_class is None
+    assert task.execution_status == "pending"
+    assert task.action_required is None
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='review_state_reconciled' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert event is not None
+    assert json.loads(event["payload"])["reason"] == (
+        "stale_failure_state_after_review_handoff"
+    )
 
 
 def test_review_transitions_preserve_consecutive_failures(conn) -> None:

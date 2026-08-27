@@ -2866,6 +2866,46 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             },
         )
 
+    # A successful implementation handoff supersedes transient errors from
+    # earlier provider attempts. Older request_review() versions left those
+    # task-level fields behind, so the review dispatcher read an obsolete
+    # Claude quota error and returned blocker_auth forever even though the
+    # latest run had ended successfully with review_requested. Repair only
+    # that provable legacy shape; a newer reviewer failure must remain intact.
+    drifted_review = (
+        conn.execute(
+            "SELECT t.id,t.execution_status,t.failure_class,t.action_required,"
+            "t.last_failure_error FROM tasks t "
+            "WHERE t.status='review' AND t.next_retry_at IS NULL "
+            "AND (t.execution_status IN ('running','retrying','failed','blocked') "
+            "OR t.failure_class IS NOT NULL OR t.action_required IS NOT NULL "
+            "OR t.last_failure_error IS NOT NULL) "
+            "AND (SELECT r.outcome FROM task_runs r WHERE r.task_id=t.id "
+            "ORDER BY r.id DESC LIMIT 1)='review_requested'"
+        ).fetchall()
+        if repair_required <= repair_columns
+        else []
+    )
+    for row in drifted_review:
+        conn.execute(
+            "UPDATE tasks SET execution_status='pending',failure_class=NULL,"
+            "action_required=NULL,last_failure_error=NULL "
+            "WHERE id=? AND status='review' AND next_retry_at IS NULL",
+            (row["id"],),
+        )
+        _append_event(
+            conn,
+            row["id"],
+            "review_state_reconciled",
+            {
+                "reason": "stale_failure_state_after_review_handoff",
+                "previous_execution_status": row["execution_status"],
+                "previous_failure_class": row["failure_class"],
+                "previous_action_required": row["action_required"],
+                "previous_last_failure_error": row["last_failure_error"],
+            },
+        )
+
     # Never backfill historical PIDs: without a captured process start
     # identity, a PID is not sufficient authority to stop a process safely.
     from hermes_cli import worker_contracts as _worker_contracts
@@ -4881,6 +4921,32 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+
+
+def _append_state_event_if_changed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+) -> bool:
+    """Record a dispatcher state only when it differs from the last event.
+
+    The dispatcher polls every few seconds. Persisting the same guard on
+    every poll does not add audit information and can grow ``task_events`` by
+    thousands of rows while no work is happening. A different intervening
+    event re-arms the record, so a guard that genuinely recurs after progress
+    remains visible.
+    """
+    pl = json.dumps(payload, ensure_ascii=False) if payload else None
+    latest = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["kind"] == kind and latest["payload"] == pl:
+        return False
+    _append_event(conn, task_id, kind, payload)
+    return True
 
 
 def _end_run(
@@ -7153,9 +7219,11 @@ def block_task(
             # A claimed review run is itself the active reviewer.  It cannot
             # depend on another reviewer of the same card; approval,
             # requested changes, or kanban_defer_review are the supported
-            # outcomes.  Refuse the self-wait that otherwise closes the run
-            # and makes the dispatcher spawn an identical reviewer forever.
-            if source_status == "review":
+            # outcomes. Refuse that self-wait only when every real Kanban
+            # parent is satisfied. A parent may genuinely be reopened while
+            # review is active; that task must return to todo and later resume
+            # in review instead of being stranded in its active run.
+            if source_status == "review" and _parents_satisfied(conn, task_id):
                 return False
             cur = conn.execute(
                 """
@@ -7508,7 +7576,12 @@ def request_review(
                SET status        = 'review',
                    claim_lock    = NULL,
                    claim_expires = NULL,
-                   worker_pid    = NULL
+                   worker_pid    = NULL,
+                   execution_status = 'pending',
+                   failure_class = NULL,
+                   next_retry_at = NULL,
+                   action_required = NULL,
+                   last_failure_error = NULL
             """ + assignee_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
@@ -11579,9 +11652,22 @@ def check_respawn_guard(
         # crash/completion supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. Quota / auth blocker: retrying immediately will not help. A
+    # successful phase transition is stronger, newer evidence than the
+    # task-level error string: old runtimes could leave an implementation
+    # quota error behind after request_review(), trapping the independent
+    # reviewer forever. Treat that string as stale only for explicit
+    # successful outcomes; genuine later spawn/crash/auth failures still
+    # guard normally.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
+        if latest_run is not None and latest_run["outcome"] in {
+            "completed",
+            "review_requested",
+            "changes_requested",
+            "review_deferred",
+        }:
+            return None
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
@@ -12487,7 +12573,9 @@ def _dispatch_once_locked(
             result.respawn_guarded.append((row["id"], quota_reason))
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(conn, row["id"], "provider_cooldown", {"reason": quota_reason})
+                    _append_state_event_if_changed(
+                        conn, row["id"], "provider_cooldown", {"reason": quota_reason}
+                    )
                     # The card's current assignee is not currently usable
                     # (quota_dispatch_guard refused it) -- advance it one hop
                     # in its ordered fallback chain instead of deferring on
@@ -12538,7 +12626,7 @@ def _dispatch_once_locked(
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(
+                    _append_state_event_if_changed(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
@@ -12681,7 +12769,9 @@ def _dispatch_once_locked(
             result.respawn_guarded.append((row["id"], quota_reason))
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(conn, row["id"], "provider_cooldown", {"reason": quota_reason})
+                    _append_state_event_if_changed(
+                        conn, row["id"], "provider_cooldown", {"reason": quota_reason}
+                    )
             continue
         oauth_disposition = (
             claude2_oauth_dispatch_guard(conn, row["id"], row["assignee"])
@@ -12703,7 +12793,7 @@ def _dispatch_once_locked(
             result.respawn_guarded.append((row["id"], guard_reason))
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(
+                    _append_state_event_if_changed(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )

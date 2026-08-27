@@ -502,6 +502,16 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert kb.check_respawn_guard(conn, ready_id) == "active_pr"
         assert kb.check_respawn_guard(conn, review_id, lane="review") is None
 
+        # Legacy rows could retain the implementer's old quota string after
+        # the successful handoff. The latest review_requested run is stronger
+        # evidence, so this stale field must not trap the reviewer.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_failure_error=? WHERE id=?",
+                ("provider rate-limited (quota wall)", review_id),
+            )
+        assert kb.check_respawn_guard(conn, review_id, lane="review") is None
+
         res = kb.dispatch_once(conn, dry_run=True)
         spawned_ids = [s[0] for s in res.spawned]
         guarded = dict(res.respawn_guarded)
@@ -566,6 +576,14 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         guarded = kb.dispatch_once(conn, spawn_fn=spawn)
         assert guarded.respawn_guarded == [(task_id, "rate_limit_cooldown")]
         assert not guarded.spawned
+        guarded_again = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert guarded_again.respawn_guarded == [(task_id, "rate_limit_cooldown")]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='respawn_guarded'",
+            (task_id,),
+        ).fetchone()[0]
+        assert event_count == 1
         guarded_task = kb.get_task(conn, task_id)
         assert guarded_task is not None
         assert guarded_task.status == "review"
