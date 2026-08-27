@@ -150,14 +150,34 @@ def test_requires_production_proof_matches_visual_scope_with_its_own_exemption()
 def test_marker_authorization_is_denied_when_the_creator_is_an_execution_worker() -> None:
     """Title/body are immutable after creation, so the marker's presence
     traces back to the card's creator. A worker cannot hand itself the
-    exemption by creating its own marked card — only a non-worker creator
-    (dashboard, default/telegram, direct CLI, or unknown) counts as
-    Sébastien's explicit authorization."""
+    exemption by creating its own marked card — only a creator that
+    positively traces to Sébastien (dashboard, default/telegram, direct
+    CLI/user, or unknown) counts as his explicit authorization."""
     title = "Publier la landing page interne [NO-PROD-PROOF]"
     for worker in ("claude1", "claude2", "coder", "spark", "CLAUDE2"):
         assert vr.requires_production_proof(title, created_by=worker), worker
-    for trusted in ("dashboard", "default", "telegram", None, ""):
+    for trusted in ("dashboard", "default", "telegram", "user", "seb", None, ""):
         assert not vr.requires_production_proof(title, created_by=trusted), trusted
+
+
+def test_marker_authorization_is_denied_for_unaccounted_for_creator_values() -> None:
+    """An allowlist, not a 4-name denylist: any creator value that is not
+    positively known to trace to Sébastien is denied, even if it is not one
+    of the four named execution-worker profiles. This closes the exact
+    laundering path found during this incident's own remediation: card
+    t_9fbb7396 itself was auto-created with created_by="worker" — the
+    dispatcher's fallback used whenever $HERMES_PROFILE is unset
+    (tools/kanban_tools.py) — which a prior version of this gate treated as
+    trusted purely because it was not in the small denylist. Automated
+    maintenance jobs (task-consolidation, codex-*) are equally unaccounted
+    for and must not grant the exemption either."""
+    title = "Publier la landing page interne [NO-PROD-PROOF]"
+    for unaccounted in (
+        "worker", "Worker", "task-consolidation", "codex-worker",
+        "codex-safe-update", "codex-board-refresh", "codex-audit",
+        "some-future-profile",
+    ):
+        assert vr.requires_production_proof(title, created_by=unaccounted), unaccounted
 
 
 def test_render_change_cannot_complete_on_visual_review_alone(

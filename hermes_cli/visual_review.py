@@ -56,13 +56,23 @@ _PRODUCTION_PROOF_EXEMPT_MARKERS = ("[no-prod-proof]", "[sans-preuve-prod]")
 # Task title/body are immutable after creation (hermes_cli.kanban_db has no
 # update-title/body path), so the marker's presence necessarily reflects what
 # the card's *creator* wrote. That is only a real trace of Sébastien's
-# authorization if the creator was not the very worker profile that would
-# benefit from skipping the check — otherwise an execution worker could
-# create its own card (or a follow-up) with the marker pre-baked and exempt
-# itself. Restricting honoured exemptions to non-worker creators (dashboard,
-# default/telegram, direct CLI, or unset) makes the "autorisé par Sébastien"
-# requirement structurally enforced rather than a bare string convention.
-_UNTRUSTED_EXEMPTION_CREATORS = {"claude1", "claude2", "coder", "spark"}
+# authorization if the creator is a channel that positively traces back to
+# him — an *allowlist*, not merely "not one of the four named execution
+# profiles". tools/kanban_tools.py stamps created_by=$HERMES_PROFILE, falling
+# back to the literal "worker" when that env var is unset (e.g. the kernel's
+# own auto-escalation/consolidation paths, or any ad-hoc script missing the
+# profile env). A denylist limited to {claude1, claude2, coder, spark} let
+# any of those unaccounted-for values — "worker" (the dispatcher's own
+# fallback), "task-consolidation", "codex-worker", "codex-safe-update", or
+# any future profile name — pass through as if trusted, which is exactly the
+# laundering path a worker could exploit by creating a card through a
+# codepath that leaves HERMES_PROFILE unset. Only creators that this system's
+# own architecture treats as tracing directly to Sébastien's decision are
+# honoured: the Kanban dashboard UI, the default/Telegram operational
+# interlocutor (which only creates cards from Sébastien's chat messages or
+# narrowly-scoped autonomous corrections, never its own execution follow-up),
+# and an unset/empty creator (legacy rows predating created_by tracking).
+_TRUSTED_EXEMPTION_CREATORS = {"dashboard", "default", "telegram", "user", "seb"}
 _LOCAL_HOST_RE = re.compile(
     r"^https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(/|$)",
     re.IGNORECASE,
@@ -185,16 +195,20 @@ def requires_production_proof(
     ``created_by`` gates the marker itself: a card's title/body are fixed at
     creation (there is no update path), so the marker's presence traces back
     to whoever created the card. It only counts as "authorized by Sébastien"
-    when the creator is not one of the worker profiles that execute cards
-    (``claude1``/``claude2``/``coder``/``spark``) — otherwise a worker could
-    hand itself the exemption by creating its own marked card. Pass
-    ``created_by=None`` (unknown/legacy caller) to keep the marker honoured,
-    since the untrusted set is an explicit denylist, not an allowlist.
+    when the creator is a channel that positively traces to him —
+    ``created_by in _TRUSTED_EXEMPTION_CREATORS`` — not merely "not an
+    execution-worker profile"; an unaccounted-for value (``worker``, the
+    dispatcher's own fallback when ``$HERMES_PROFILE`` is unset,
+    ``task-consolidation``, a ``codex-*`` maintenance job, or any future
+    profile name) is denied by default rather than trusted by omission. An
+    unset/empty ``created_by`` (``None`` or ``""``, e.g. legacy rows
+    predating this field) is still honoured, since there the marker cannot
+    be attributed to an execution worker either.
     """
     text = f"{title or ''}\n{body or ''}".lower()
     if any(marker in text for marker in _PRODUCTION_PROOF_EXEMPT_MARKERS):
         creator = str(created_by or "").strip().lower()
-        if creator not in _UNTRUSTED_EXEMPTION_CREATORS:
+        if not creator or creator in _TRUSTED_EXEMPTION_CREATORS:
             return False
     return is_visual_web_task(title, body, metadata)
 
