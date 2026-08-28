@@ -20952,6 +20952,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+class _KanbanTurnProviderLimitError(RuntimeError):
+    """Raised by ``_run_turn`` when a goal-loop turn (turn 2+) fails on a
+    provider rate-limit / billing wall, so ``run_kanban_goal_loop`` stops the
+    loop immediately via its existing ``except Exception`` handler instead of
+    silently treating the empty reply as a normal turn and burning the rest
+    of the turn budget retrying the same dead call (t_dbf31ad3 root cause 2:
+    ``_run_turn`` used to drop ``result["failure_reason"]`` entirely, so a
+    mid-run 429 looked like "empty response, nothing to evaluate" to
+    ``judge_goal`` and the loop spun through all 12/40 turns hitting the
+    same 429 before ``block_fn`` finally gave up)."""
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -20961,6 +20973,16 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
     caller — a broken goal loop must never wedge a worker, the dispatcher's
     claim TTL / crash detection is the backstop.
+
+    Exception: a provider rate-limit/billing wall hit on turn 2+ is not
+    swallowed. It stops the loop immediately (see
+    ``_KanbanTurnProviderLimitError``) and this function then exits the
+    process with ``KANBAN_RATE_LIMIT_EXIT_CODE`` (75, EX_TEMPFAIL) exactly
+    like the existing single-turn ``_single_query_exit_code`` path does —
+    so the dispatcher's reap classifier marks the run ``rate_limited``
+    (no failure-counter increment) and ``check_respawn_guard``'s
+    ``rate_limit_cooldown`` check actually engages instead of the run being
+    misclassified as a generic turn-budget block.
     """
     import os as _os
 
@@ -20999,6 +21021,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+    # Set by _run_turn on a rate-limit/billing turn failure; checked after
+    # _run_loop() returns so the process can exit via KANBAN_RATE_LIMIT_EXIT_CODE
+    # the same way the first-turn path already does.
+    provider_limit_error: dict = {"error": None}
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
@@ -21014,6 +21040,15 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
             print(resp)
+        if (
+            isinstance(result, dict)
+            and result.get("failed")
+            and result.get("failure_reason") in ("rate_limit", "billing")
+        ):
+            provider_limit_error["error"] = str(
+                result.get("error") or result.get("final_response") or "provider rate limit"
+            ).strip()
+            raise _KanbanTurnProviderLimitError(provider_limit_error["error"])
         return resp or ""
 
     def _task_status() -> "str | None":
@@ -21052,6 +21087,34 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         log=lambda m: logger.info("%s", m),
         review_mode=_os.environ.get("HERMES_KANBAN_REVIEW_RUN") == "1",
     )
+
+    # A turn 2+ rate-limit/billing wall stopped the loop immediately (via
+    # _KanbanTurnProviderLimitError) instead of burning the rest of the turn
+    # budget. Exit with the same EX_TEMPFAIL sentinel the first-turn path
+    # uses so the dispatcher's reap classifier marks this a provider-quota
+    # exit, not a task failure.
+    error = provider_limit_error.get("error")
+    if error:
+        try:
+            from hermes_cli.kanban_db import (
+                KANBAN_RATE_LIMIT_EXIT_CODE,
+                capture_claude_provider_reset,
+                connect,
+                write_txn,
+            )
+
+            try:
+                with connect() as conn:
+                    with write_txn(conn):
+                        capture_claude_provider_reset(conn, task_id, error)
+            except Exception:
+                # Best-effort observability only; must never block the exit.
+                pass
+            sys.exit(KANBAN_RATE_LIMIT_EXIT_CODE)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
 
 
 def _single_query_exit_code(result: object) -> int:

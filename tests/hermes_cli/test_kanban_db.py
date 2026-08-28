@@ -772,6 +772,56 @@ def test_route_preflight_ok_rejects_unknown_route():
     assert reason == "unknown_route:some-other-lane"
 
 
+def test_route_preflight_ok_spark_saturation_without_cooldown_blocks(kanban_home, monkeypatch):
+    """Regression for t_dbf31ad3: Spark claimed a card after quota_preflight.py
+    recorded ``spark_5h`` at 100% (dispatch_allowed=False, reason=provider_limit)
+    because ``spark_cooldown()`` never publishes a ``cooldown_until`` for a
+    saturated-gauge record -- only the (unrelated) Claude cooldown path does.
+    ``route_preflight_ok`` used to treat "no cooldown_until" as "unknown
+    measurement" and fail OPEN, making an explicitly excluded lane claimable.
+    It must fail closed instead, exactly reproducing the live
+    ``state/ai-quota-routing.json`` shape observed for the incident."""
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    routing.write_text(json.dumps({
+        "agent_cooldowns": {
+            "spark": {
+                "dispatch_allowed": False,
+                "source": "quota_gauge",
+                "window": "spark",
+                "measured_at": "2026-08-28T12:50:55.602700+00:00",
+                "preflight_required": True,
+                "reason": "provider_limit",
+                "saturated_windows": ["spark_5h"],
+            },
+        },
+    }))
+    ok, reason = kb.route_preflight_ok("spark")
+    assert ok is False
+    assert reason == "provider_limit"
+
+
+def test_resolve_ordered_route_skips_saturated_spark_for_claude2(kanban_home, monkeypatch):
+    """End-to-end regression for t_dbf31ad3's "Spark saturé -> Claude 2"
+    acceptance scenario: a simple-tier card must route past an explicitly
+    excluded Spark lane straight to Claude 2, never claim Spark."""
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    routing.write_text(json.dumps({
+        "agent_cooldowns": {
+            "spark": {"dispatch_allowed": False, "reason": "provider_limit"},
+            "claude2": {"dispatch_allowed": True, "preflight_required": False},
+        },
+    }))
+    assignee, model_override, trace = kb.resolve_ordered_route("simple")
+    assert assignee == "claude2"
+    spark_attempt = next(t for t in trace if t["route"] == "spark")
+    assert spark_attempt["ok"] is False
+    assert spark_attempt["reason"] == "provider_limit"
+
+
 @pytest.mark.parametrize(
     "tier, green_routes, expected_assignee, expected_model",
     [

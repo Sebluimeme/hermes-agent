@@ -9504,6 +9504,7 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
         except (OSError, json.JSONDecodeError, AttributeError):
             record = None
         if isinstance(record, dict) and record.get("dispatch_allowed") is False:
+            reason = record.get("reason") or "provider_limit"
             raw_deadline = record.get("cooldown_until")
             if isinstance(raw_deadline, str):
                 try:
@@ -9514,11 +9515,24 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
                     deadline = None
                 if deadline is not None:
                     if (time.time() if now is None else now) < deadline:
-                        return (False, record.get("reason") or "provider_cooldown")
+                        return (False, reason)
                     return (True, "cooldown_expired")
-            # Unknown Codex quota is not evidence of unavailability. Only a
-            # real, future cooldown blocks this fail-open fallback lane.
-            return (True, record.get("reason") or "measurement_unknown_fail_open")
+            # dispatch_allowed=False is explicit provider evidence (e.g. a
+            # saturated spark_5h gauge) even when the record carries no
+            # cooldown_until -- spark_cooldown() in quota_preflight.py never
+            # publishes one for the "provider_limit" case, so treating a
+            # missing deadline as "unknown" made this branch dead code and
+            # let an explicitly excluded lane be claimed anyway (t_dbf31ad3:
+            # Spark claimed on run 728's preflight_passed while
+            # ai-quota-routing.json already recorded spark_5h at 100%,
+            # dispatch_allowed=false, provider_limit). Fail CLOSED here,
+            # mirroring quota_dispatch_guard's fail-closed contract for
+            # Claude -- only a fresh quota_preflight.py write that flips
+            # dispatch_allowed to True (or supplies a future cooldown_until)
+            # re-opens the lane. This is distinct from the "no cached record
+            # at all" case below, which is a genuine unmeasured lane and
+            # still fails open.
+            return (False, reason)
         return (True, "fail_open_last_resort")
     return (False, f"unknown_route:{route}")
 
