@@ -664,6 +664,98 @@ class GatewayKanbanWatchersMixin:
                             raise RuntimeError(
                                 getattr(_group_send, "error", None) or "group send failed"
                             )
+                        # A grouped human-action message must also exist in
+                        # the creator session's context.  The passive Telegram
+                        # send above is intentionally outside handle_message(),
+                        # so without this wake the next reply ("pour le 1...,
+                        # pour le 2...") reaches an agent that has never seen
+                        # which numbered choice maps to which task.  That exact
+                        # gap lost Sébastien's two Ads decisions on 2026-08-28:
+                        # the text arrived, but the session asked him to repeat
+                        # it and left both cards blocked.  Inject one synthetic
+                        # turn carrying the same ordered mapping whenever at
+                        # least one member explicitly requested notify+wake.
+                        _wake_members = [
+                            member for member in _members
+                            if (member["sub"].get("delivery_mode") or "notify")
+                            in {"notify+wake", "wake"}
+                        ]
+                        if _wake_members:
+                            from gateway.session import SessionSource
+                            from gateway.wake import (
+                                adapter_supports_push,
+                                deliver_wake,
+                            )
+
+                            if adapter_supports_push(_adapter):
+                                _wake_sub = _wake_members[0]["sub"]
+                                _wake_lines = [
+                                    "[kanban] Contexte durable des décisions "
+                                    "numérotées qui viennent d’être envoyées :"
+                                ]
+                                for _index, _member in enumerate(_members, 1):
+                                    _task = _member.get("task")
+                                    _event = next(
+                                        event for event in _member["events"]
+                                        if event.kind in {
+                                            "blocked", "block_loop_detected", "gave_up"
+                                        }
+                                    )
+                                    _reason = "une décision est nécessaire pour continuer"
+                                    if _event.payload and _event.payload.get("reason"):
+                                        _reason = _GATE_PREFIX_RE.sub(
+                                            "", str(_event.payload["reason"])[:500]
+                                        ).strip() or _reason
+                                    _title = (
+                                        _task.title if _task else _member["sub"]["task_id"]
+                                    )[:120]
+                                    _wake_lines.append(
+                                        f"{_index}. task={_member['sub']['task_id']} "
+                                        f"— {_title} — {_reason}"
+                                    )
+                                _wake_lines.append(
+                                    "Le prochain message humain peut répondre par numéro. "
+                                    "Relie chaque réponse à la carte correspondante, "
+                                    "enregistre la décision et poursuis sans lui demander "
+                                    "de répéter si son choix est clair."
+                                )
+                                _chat_type = str(
+                                    _wake_sub.get("chat_type") or "group"
+                                ).strip() or "group"
+                                _source = SessionSource(
+                                    platform=_plat,
+                                    chat_id=_wake_sub["chat_id"],
+                                    chat_type=_chat_type,
+                                    thread_id=_wake_sub.get("thread_id") or None,
+                                    user_id=_wake_sub.get("user_id"),
+                                    user_id_alt=_wake_sub.get("user_id_alt"),
+                                    profile=_profile or None,
+                                    scope_id=_wake_scope_id(_adapter, _wake_sub),
+                                )
+                                _session_id = ""
+                                for _member in _wake_members:
+                                    _task = _member.get("task")
+                                    _session_id = (
+                                        getattr(_task, "session_id", None) or _session_id
+                                    )
+                                try:
+                                    await deliver_wake(
+                                        _adapter,
+                                        text="\n".join(_wake_lines),
+                                        session_id=_session_id,
+                                        source=_source,
+                                    )
+                                except Exception as _wake_error:
+                                    # The human-facing grouped message already
+                                    # succeeded, so do not resend it and create
+                                    # duplicate questions.  Keep the failure
+                                    # visible; the numbered text still remains
+                                    # usable as a plain reply fallback.
+                                    logger.warning(
+                                        "kanban notifier: grouped action context wake "
+                                        "failed for %d tasks: %s",
+                                        len(_members), _wake_error, exc_info=True,
+                                    )
                         for _member in _members:
                             await asyncio.to_thread(
                                 self._kanban_advance,

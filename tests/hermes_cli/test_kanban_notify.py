@@ -204,7 +204,7 @@ def test_child_task_inherits_parent_chat_type(kanban_home):
 
 @pytest.mark.asyncio
 async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
-    """Two simultaneous blockers become one human action inbox message."""
+    """A grouped inbox also preserves its numbered map in session context."""
     import hermes_cli.kanban_db as kb
     from gateway.run import GatewayRunner
     from gateway.config import Platform
@@ -261,9 +261,16 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
     assert "Action requise — 2 tâches" in sent_msgs[0]
     assert "passive block" in sent_msgs[0]
     assert "active block" in sent_msgs[0]
-    # A human decision is now required; do not wake an agent to spin while it
-    # cannot progress. The operator's reply will trigger the continuation.
-    wake_mock.assert_not_awaited()
+    # The passive group send bypasses handle_message(), so inject the same
+    # mapping once into the creator session.  Otherwise a reply such as
+    # "1=A, 2=B" reaches an agent that never saw what 1 and 2 mean.
+    wake_mock.assert_awaited_once()
+    wake_text = wake_mock.await_args.kwargs["text"]
+    assert f"task={passive_tid}" in wake_text
+    assert f"task={active_tid}" in wake_text
+    assert "passive block" in wake_text
+    assert "active block" in wake_text
+    assert "sans lui demander de répéter" in wake_text
 
 
 @pytest.mark.asyncio
