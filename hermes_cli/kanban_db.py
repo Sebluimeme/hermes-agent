@@ -12645,8 +12645,12 @@ def _workspace_occupancy_conflict(left: str, right: str) -> bool:
     """Return whether two exact/repository scopes can affect one another.
 
     Equality covers the historical same-directory guard. Ancestor overlap is
-    also a collision because Git parent checkouts track nested repositories as
-    gitlinks. Sibling nested repositories remain independent.
+    normally a collision because Git parent checkouts can track nested
+    repositories as gitlinks.  A nested checkout explicitly ignored by the
+    parent is the safe exception: parent-wide status/add operations cannot see
+    it, so serializing a long parent-owned subdirectory job against that
+    independent project only strands an otherwise usable worker lane. Sibling
+    nested repositories remain independent.
     """
     try:
         left_path = Path(left).expanduser().resolve()
@@ -12654,11 +12658,48 @@ def _workspace_occupancy_conflict(left: str, right: str) -> bool:
     except OSError:
         left_path = Path(left).expanduser().absolute()
         right_path = Path(right).expanduser().absolute()
-    return (
-        left_path == right_path
-        or left_path in right_path.parents
-        or right_path in left_path.parents
-    )
+    if left_path == right_path:
+        return True
+    if left_path in right_path.parents:
+        return not _parent_ignores_nested_checkout(left_path, right_path)
+    if right_path in left_path.parents:
+        return not _parent_ignores_nested_checkout(right_path, left_path)
+    return False
+
+
+def _parent_ignores_nested_checkout(parent: Path, nested: Path) -> bool:
+    """Return whether ``nested`` is a Git checkout ignored by ``parent``.
+
+    Fail closed on every ambiguity. A tracked gitlink, a normal tracked path,
+    an unignored nested repository, or a Git command failure keeps the
+    ancestor/descendant serialization contract. Only an existing nested
+    ``.git`` marker plus a positive ``git check-ignore`` result is independent.
+    """
+    try:
+        if not (parent / ".git").exists() or not (nested / ".git").exists():
+            return False
+        relative = nested.relative_to(parent)
+        if not relative.parts:
+            return False
+        tracked = subprocess.run(
+            ["git", "-C", str(parent), "ls-files", "--stage", "--", str(relative)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if tracked.returncode != 0 or tracked.stdout.strip():
+            return False
+        ignored = subprocess.run(
+            ["git", "-C", str(parent), "check-ignore", "-q", "--", str(relative)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        return ignored.returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
 
 
 def _occupied_workspace_owner(

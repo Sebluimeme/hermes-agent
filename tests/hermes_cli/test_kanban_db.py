@@ -1217,6 +1217,45 @@ def test_dispatch_keeps_nested_sibling_repositories_parallel(
     assert len(spawned) == 2
 
 
+def test_dispatch_allows_parent_and_explicitly_ignored_nested_repository(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """An ignored independent checkout must not be a global parent lock."""
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda *_args: "ok")
+    repository = kanban_home / "repository"
+    _init_git_repo(repository)
+    parent_workspace = repository / "parent-owned-data"
+    parent_workspace.mkdir()
+    nested_repository = repository / "independent-project"
+    _init_git_repo(nested_repository)
+    (repository / ".gitignore").write_text(
+        "independent-project/\n", encoding="utf-8"
+    )
+    spawned = []
+
+    def fake_spawn(task, resolved_workspace, **_kwargs):
+        spawned.append((task.id, resolved_workspace))
+        return 93_200 + len(spawned)
+
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="parent subdirectory writer", assignee="researcher",
+            workspace_kind="dir", workspace_path=str(parent_workspace),
+        )
+        nested = kb.create_task(
+            conn, title="ignored nested project writer", assignee="coder",
+            workspace_kind="dir", workspace_path=str(nested_repository),
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+    assert result.skipped_workspace_busy == []
+    assert {task_id for task_id, _assignee, _workspace in result.spawned} == {
+        parent,
+        nested,
+    }
+    assert len(spawned) == 2
+
+
 def test_dispatch_waits_one_tick_for_terminal_worker_exit_barrier(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
