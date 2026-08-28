@@ -8,7 +8,10 @@ import pytest
 
 import cli as cli_mod
 from cli import _single_query_exit_code
-from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+from hermes_cli.kanban_db import (
+    KANBAN_GUARDRAIL_HALT_EXIT_CODE,
+    KANBAN_RATE_LIMIT_EXIT_CODE,
+)
 
 
 def test_kanban_single_query_rate_limit_uses_tempfail(monkeypatch):
@@ -33,6 +36,19 @@ def test_successful_single_query_exits_zero(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_ok")
 
     assert _single_query_exit_code({"completed": True, "final_response": "ok"}) == 0
+
+
+def test_kanban_guardrail_halt_uses_strategy_retry_sentinel(monkeypatch):
+    """A controlled guardrail stop must not masquerade as a clean success."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_guardrail")
+
+    assert _single_query_exit_code(
+        {
+            "failed": False,
+            "final_response": "change strategy",
+            "guardrail": {"code": "repeated_exact_failure_block"},
+        }
+    ) == KANBAN_GUARDRAIL_HALT_EXIT_CODE
 
 
 def test_human_kanban_single_query_failed_turn_exits_nonzero(monkeypatch):

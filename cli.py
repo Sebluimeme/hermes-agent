@@ -21056,6 +21056,17 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
 def _single_query_exit_code(result: object) -> int:
     """Return the process exit code for a one-shot chat invocation."""
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and isinstance(result, dict)
+        and result.get("guardrail")
+    ):
+        try:
+            from hermes_cli.kanban_db import KANBAN_GUARDRAIL_HALT_EXIT_CODE
+
+            return KANBAN_GUARDRAIL_HALT_EXIT_CODE
+        except Exception:
+            return 1
     if not isinstance(result, dict) or not result.get("failed"):
         return 0
     if os.environ.get("HERMES_KANBAN_TASK") and result.get("failure_reason") in (

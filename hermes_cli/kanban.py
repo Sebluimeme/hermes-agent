@@ -2873,6 +2873,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
+            "rate_limited": res.rate_limited,
+            "strategy_required": res.strategy_required,
             "promoted": res.promoted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
@@ -2900,6 +2902,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    print(f"Rate-limited: {len(res.rate_limited)}")
+    if res.rate_limited:
+        print(f"  {', '.join(res.rate_limited)}")
+    print(f"Strategy retry: {len(res.strategy_required)}")
+    if res.strategy_required:
+        print(f"  {', '.join(res.strategy_required)}")
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:

@@ -465,6 +465,14 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Sentinel used when the worker deliberately stops because the per-turn tool
+# guardrail proved that it is repeating the same failing call.  This is not a
+# successful terminal handoff (rc=0 would look like a protocol violation), nor
+# is it a task failure: the durable session/checkpoint must be resumed with a
+# different strategy. 76 is BSD EX_PROTOCOL and is otherwise unused by the
+# worker contract.
+KANBAN_GUARDRAIL_HALT_EXIT_CODE = 76
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -2868,6 +2876,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "next_retry_at", "action_required", "consecutive_failures",
         "last_failure_error",
     }
+    has_task_runs = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
     drifted_done = (
         conn.execute(
             "SELECT id,execution_status,failure_class,next_retry_at,action_required "
@@ -2916,7 +2927,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "AND (SELECT r.outcome FROM task_runs r WHERE r.task_id=t.id "
             "ORDER BY r.id DESC LIMIT 1)='review_requested'"
         ).fetchall()
-        if repair_required <= repair_columns
+        if repair_required <= repair_columns and has_task_runs
         else []
     )
     for row in drifted_review:
@@ -2955,7 +2966,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "AND e.kind='visual_review_deferred' "
             "AND lower(e.payload) LIKE '%gemini%')"
         ).fetchall()
-        if repair_required <= repair_columns
+        if repair_required <= repair_columns and has_task_runs
         else []
     )
     for row in legacy_gemini_deferred:
@@ -9741,6 +9752,10 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    strategy_required: list[str] = field(default_factory=list)
+    """Task ids whose workers stopped on the repeated-tool guardrail and were
+    released back to their source phase without consuming a failure.  The next
+    run resumes the exact session and must change strategy."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9822,6 +9837,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"guardrail_halt"`` — ``WIFEXITED`` with status
+      ``KANBAN_GUARDRAIL_HALT_EXIT_CODE``. The worker intentionally stopped a
+      repeated failing tool call; resume its checkpoint with a new strategy.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -9843,6 +9861,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_GUARDRAIL_HALT_EXIT_CODE:
+                return ("guardrail_halt", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -11087,6 +11107,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    strategy_required: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -11100,9 +11121,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     exited_hook_payloads: list[dict] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.claim_lock, t.started_at, "
+            "       t.assignee, r.started_at AS run_started_at "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -11113,7 +11136,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
             # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
+            started_at = (
+                row["run_started_at"]
+                if "run_started_at" in row.keys() and row["run_started_at"] is not None
+                else row["started_at"] if "started_at" in row.keys() else None
+            )
             if started_at is not None:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
@@ -11124,6 +11151,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            guardrail_halt_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -11188,6 +11216,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "guardrail_halt":
+                protocol_violation = False
+                guardrail_halt_exit = True
+                error_text = (
+                    "worker stopped by the repeated-tool guardrail; durable "
+                    "checkpoint preserved — resume the exact session and use "
+                    "a different tool, arguments, or verification strategy"
+                )
+                event_kind = "strategy_required"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "checkpoint_preserved": True,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -11220,7 +11263,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                _run_outcome = (
+                    "rate_limited" if rate_limited_exit
+                    else "strategy_required" if guardrail_halt_exit
+                    else "crashed"
+                )
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -11262,6 +11309,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         conn, row["id"], error_text, provider_proven=True,
                     )
                     rate_limited.append(row["id"])
+                elif guardrail_halt_exit:
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    strategy_required.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -11382,6 +11435,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_strategy_required = strategy_required  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -12543,6 +12597,11 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    _crash_strategy_required = getattr(
+        detect_crashed_workers, "_last_strategy_required", []
+    )
+    if _crash_strategy_required:
+        result.strategy_required.extend(_crash_strategy_required)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

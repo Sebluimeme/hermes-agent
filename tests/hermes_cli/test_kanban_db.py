@@ -334,6 +334,79 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_guardrail_halt_requeues_checkpoint_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """A controlled repeated-tool stop resumes with a different strategy."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="guarded", assignee="a")
+        pid = 70991
+        kb.claim_task(conn, tid, claimer=f"{host}:guardrail")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(
+            pid, _exited_status(_kb.KANBAN_GUARDRAIL_HALT_EXIT_CODE)
+        )
+
+        assert tid not in kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        strategy = getattr(
+            _kb.detect_crashed_workers, "_last_strategy_required", []
+        )
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='strategy_required' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+
+    assert task.status == "ready"
+    assert task.consecutive_failures == 0
+    assert task.last_failure_error and "different tool" in task.last_failure_error
+    assert tid in strategy
+    assert run["outcome"] == "strategy_required"
+    assert event is not None
+
+
+def test_protocol_violation_elapsed_uses_current_run_start(
+    kanban_home, monkeypatch,
+):
+    """Retry diagnostics report this run, not the task's original start."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb.time, "time", lambda: 1_000.0)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="elapsed", assignee="a")
+        pid = 70992
+        kb.claim_task(conn, tid, claimer=f"{host}:elapsed")
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute("UPDATE tasks SET worker_pid=?, started_at=100 WHERE id=?", (pid, tid))
+        conn.execute("UPDATE task_runs SET started_at=996 WHERE id=?", (run_id,))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(0))
+
+        kb.detect_crashed_workers(conn)
+        run = conn.execute(
+            "SELECT error FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+
+    assert "after 4s" in run["error"]
+    assert "after 900s" not in run["error"]
+
+
 def test_rate_limit_exit_immediately_falls_back_with_same_worktree(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
