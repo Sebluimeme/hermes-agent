@@ -91,26 +91,35 @@ Treat the handoff as a claim to verify, not as proof that the work is correct.
 When the latest handoff contains `metadata.visual_review.required=true`, the
 review is a two-stage visual gate in addition to the ordinary code checks:
 
-1. Stay in the reviewer role; never edit the candidate.
+1. Stay in the reviewer role; never edit the candidate. Before looking at the
+   screenshots, establish the exact candidate diff and its pre-change baseline.
+   Write down which visible surfaces the candidate can actually have changed.
 2. Load every handoff screenshot with `vision_analyze`. The active Coder model
    sees the pixels natively; do not call Gemini for this intermediate review.
-   Check the expected behavior, visible defects, desktop/mobile consistency,
-   overflow, truncation, contrast, empty states and the key interaction state.
-3. If a correctable defect remains, use `kanban_request_changes` immediately.
+   Check the expected behavior and regressions attributable to the candidate:
+   desktop/mobile consistency, overflow, truncation, contrast, empty states and
+   the key interaction state. A visible issue that is demonstrably pre-existing
+   or outside the task/diff is non-blocking; record it separately if useful, but
+   never send the current implementer into unrelated work.
+3. If a correctable defect caused by the candidate or violating an acceptance
+   criterion remains, use `kanban_request_changes` immediately.
 4. Only after Coder's native verdict is PASS, run exactly one final independent
    Gemini call over the whole desktop/mobile set:
 
    ```text
-   python3 ~/.hermes/scripts/gemini_review_image.py \
-     <desktop.png> <mobile.png> --task-id <current-task-id> \
-     --attendu "<observable acceptance result>"
+     python3 ~/.hermes/scripts/gemini_review_image.py \
+       <desktop.png> <mobile.png> --task-id <current-task-id> \
+       --attendu "<observable acceptance result + exact visible change scope; say explicitly when no visible change is expected>"
    ```
 
    The command prints the evidence path. It reuses a prior PASS when the exact
    screenshot hashes and expectation are unchanged, so retries do not spend a
    second Gemini request.
-5. `VERDICT: PROBLEME` means `kanban_request_changes`; never reinterpret it as
-   approval. A temporary failure prints `NEXT_RETRY_AT`. Call
+5. `VERDICT: PROBLEME` means `kanban_request_changes` only when the reported
+   problem maps to the stated acceptance result or candidate change scope. The
+   final prompt is deliberately scope-bound so a pre-existing, unrelated page
+   issue does not become a false rejection. Never edit unrelated UI merely to
+   satisfy the visual gate. A temporary failure prints `NEXT_RETRY_AT`. Call
    `kanban_defer_review(reason=..., retry_at=...)`: the dispatcher keeps the
    task in review and resumes this same reviewer session automatically. Use a
    human block only for a non-transient prerequisite that actually needs a
@@ -216,6 +225,10 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Reviewer implementation:** Editing the deliverable hides ownership and weakens the re-review boundary.
 - **Vague findings:** “Needs work” does not give the implementer a reproducible correction target.
 - **Style-only blocking:** Do not request changes for preference-level nits when behavior and repository standards are satisfied.
+- **Baseline-free visual rejection:** A screenshot can expose a real page issue
+  that the reviewed candidate did not introduce. Confirm the exact diff and
+  pre-change baseline before returning implementation work; unrelated findings
+  are not defects of this card.
 - **Baseline-free dirty check:** Never reject a candidate from a raw repository
   check that lacks the task's spawn baseline, and never clean another task's
   screenshots, artifacts, gitlinks, or uncommitted work to make the tree look

@@ -13742,6 +13742,10 @@ def _default_spawn(
             "reviewer. The active reviewer run shown by kanban_show is this "
             "process, not another worker: inspect the handoff and finish with "
             "kanban_complete, kanban_request_changes, or kanban_defer_review; "
+            "judge the candidate against the task baseline and exact diff, and "
+            "request changes only for an acceptance-criteria failure or a "
+            "regression introduced by that candidate; pre-existing or "
+            "out-of-scope observations are non-blocking; "
             f"never request another same-card review or wait for yourself{strategy_hint}"
         )
     else:
@@ -14102,6 +14106,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "handoff and choose exactly one terminal verdict: approve with "
             "kanban_complete, return defects with kanban_request_changes, or "
             "use kanban_defer_review for a transient visual-provider delay. "
+            "Establish the candidate's exact diff and baseline before judging "
+            "screenshots. Request implementation changes only when a finding "
+            "violates an acceptance criterion or is a regression introduced by "
+            "that diff; a pre-existing or out-of-scope issue is non-blocking "
+            "and must never send the implementer into unrelated rework. "
             "A completion guard rejecting an otherwise accepted implementation "
             "because of a wrong, global, foreign, or unrelated dirty workspace "
             "is an internal orchestration incident: never request implementation "
