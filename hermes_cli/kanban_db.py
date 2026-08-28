@@ -11562,9 +11562,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     strategy_required.append(row["id"])
                 elif interrupted_exit:
                     # This is neutral orchestration yield, not a failure.  Do
-                    # not retain a stale red error on a healthy resumed card.
+                    # not retain any stale red/error state on a healthy
+                    # resumed card.  In particular, ``failure_class`` may
+                    # predate this run (for example from a historical crash),
+                    # and claim_task deliberately does not clear it merely on
+                    # spawn success.  The neutral exit itself is the evidence
+                    # that the previous diagnostic no longer describes the
+                    # current transition.
                     conn.execute(
-                        "UPDATE tasks SET last_failure_error = NULL WHERE id = ?",
+                        "UPDATE tasks SET last_failure_error = NULL, "
+                        "failure_class = NULL, execution_status = 'pending', "
+                        "next_retry_at = NULL, action_required = NULL "
+                        "WHERE id = ?",
                         (row["id"],),
                     )
                     interrupted.append(row["id"])

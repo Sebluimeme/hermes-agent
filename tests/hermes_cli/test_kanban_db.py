@@ -405,7 +405,9 @@ def test_interrupted_exit_requeues_exact_session_without_counting_failure(
         kb.claim_task(conn, tid, claimer=f"{host}:interrupted")
         run_id = kb.get_task(conn, tid).current_run_id
         conn.execute(
-            "UPDATE tasks SET worker_pid=?, last_failure_error='stale' WHERE id=?",
+            "UPDATE tasks SET worker_pid=?, last_failure_error='stale', "
+            "failure_class='crashed', execution_status='retrying', "
+            "next_retry_at=999999, action_required='stale action' WHERE id=?",
             (pid, tid),
         )
         conn.execute(
@@ -429,6 +431,10 @@ def test_interrupted_exit_requeues_exact_session_without_counting_failure(
     assert task.status == "ready"
     assert task.consecutive_failures == 0
     assert task.last_failure_error is None
+    assert task.failure_class is None
+    assert task.execution_status == "pending"
+    assert task.next_retry_at is None
+    assert task.action_required is None
     assert tid in neutral
     assert run["outcome"] == "interrupted"
     assert json.loads(run["metadata"])["automatic_resume"] is True
