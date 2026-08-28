@@ -14005,10 +14005,18 @@ def adaptive_worker_turn_budget(task: Task, runs: Iterable[Run]) -> int:
 
 
 def _worker_retry_strategy_hint(runs: Iterable[Run]) -> str:
-    """Require a changed approach after the same failure repeats three times."""
+    """Require a changed approach after three repeated execution failures.
+
+    Resumable orchestration outcomes (for example ``interrupted``, ``stale``
+    and ``reclaimed``) are deliberately excluded.  They preserve work but do
+    not prove that the worker's strategy failed, so counting them here would
+    tell a healthy resumed worker to abandon its current approach.
+    """
+    failure_outcomes = {"crashed", "timed_out", "spawn_failed"}
     failures = [
         run for run in runs
-        if run.ended_at is not None and run.outcome not in {"completed", "rate_limited"}
+        if run.ended_at is not None
+        and run.outcome in failure_outcomes
         and run.error
     ][-3:]
     if len(failures) < 3:

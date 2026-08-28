@@ -36,3 +36,30 @@ def test_three_identical_failures_force_strategy_change_hint():
     assert "different strategy" in _worker_retry_strategy_hint(same)
     mixed = same[:2] + [_run(error="network timeout")]
     assert _worker_retry_strategy_hint(mixed) == ""
+
+
+def test_neutral_resume_outcomes_never_force_strategy_change_hint():
+    neutral_outcomes = (
+        "interrupted",
+        "rate_limited",
+        "reclaimed",
+        "stale",
+        "strategy_required",
+        "review_deferred",
+        "scheduled",
+        "blocked",
+    )
+    for outcome in neutral_outcomes:
+        runs = [_run(outcome=outcome, error="same resumable event") for _ in range(3)]
+        assert _worker_retry_strategy_hint(runs) == ""
+
+
+def test_neutral_yields_do_not_hide_three_real_identical_failures():
+    runs = [
+        _run(error="terminal failed: permission denied"),
+        _run(outcome="interrupted", error="neutral orchestration yield"),
+        _run(error="terminal failed: permission denied"),
+        _run(outcome="reclaimed", error="operator restart"),
+        _run(error="terminal failed: permission denied"),
+    ]
+    assert "different strategy" in _worker_retry_strategy_hint(runs)
