@@ -64,6 +64,15 @@ FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 
+# Dispatcher-owned workers often launch deterministic background jobs (tests,
+# transcription, builds) and then wait for them.  Returning to the model every
+# TERMINAL_TIMEOUT window makes the same large worker transcript cross the API
+# again even though there is no new decision to make.  Coalesce those waits
+# inside the process registry while keeping the one-second interrupt cadence.
+# Interactive sessions retain TERMINAL_TIMEOUT exactly as before.
+KANBAN_PROCESS_WAIT_SECONDS_DEFAULT = 1800
+KANBAN_PROCESS_WAIT_SECONDS_MAX = 3600
+
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
 # Any match arriving inside that cooldown window is dropped and counted as a strike.
@@ -2163,6 +2172,23 @@ class ProcessRegistry:
         max_timeout = default_timeout
         requested_timeout = timeout
         timeout_note = None
+        kanban_worker = bool(os.getenv("HERMES_KANBAN_TASK"))
+
+        if kanban_worker:
+            try:
+                configured_kanban_wait = int(
+                    os.getenv(
+                        "HERMES_KANBAN_PROCESS_WAIT_SECONDS",
+                        str(KANBAN_PROCESS_WAIT_SECONDS_DEFAULT),
+                    )
+                )
+            except (ValueError, TypeError):
+                configured_kanban_wait = KANBAN_PROCESS_WAIT_SECONDS_DEFAULT
+            configured_kanban_wait = min(
+                KANBAN_PROCESS_WAIT_SECONDS_MAX,
+                max(default_timeout, configured_kanban_wait),
+            )
+            max_timeout = configured_kanban_wait
 
         # Reject non-positive timeouts — the schema declares minimum=1, but
         # not every caller enforces schemas before dispatch. timeout=0 is
@@ -2184,13 +2210,41 @@ class ProcessRegistry:
         else:
             effective_timeout = requested_timeout or max_timeout
 
+        # A dispatcher worker has no human waiting synchronously for this tool
+        # result.  Treat its configured window as a floor as well as a cap so a
+        # model-emitted ``timeout=180`` does not force another full-context turn
+        # every three minutes.  Completion and user interruption still return
+        # immediately.
+        if kanban_worker and effective_timeout < max_timeout:
+            effective_timeout = max_timeout
+            timeout_note = (
+                f"Dispatcher worker wait was coalesced from "
+                f"{requested_timeout or default_timeout}s to {max_timeout}s"
+            )
+
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         deadline = time.monotonic() + effective_timeout
+        next_kanban_heartbeat = 0.0
 
         while time.monotonic() < deadline:
+            now_monotonic = time.monotonic()
+            if kanban_worker and now_monotonic >= next_kanban_heartbeat:
+                # Long local waits no longer generate agent activity turns, so
+                # maintain the durable claim/worker heartbeat here.  The bridge
+                # has its own 60s write rate limit and is best-effort.
+                try:
+                    from tools.kanban_tools import heartbeat_current_worker_from_env
+
+                    heartbeat_current_worker_from_env()
+                except Exception:
+                    logger.debug(
+                        "kanban heartbeat during process wait failed",
+                        exc_info=True,
+                    )
+                next_kanban_heartbeat = now_monotonic + 30.0
             session = self._refresh_detached_session(session)
             if session is None:
                 return {"status": "not_found", "error": f"No process with ID {session_id}"}
