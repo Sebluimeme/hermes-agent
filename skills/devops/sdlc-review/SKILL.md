@@ -143,6 +143,15 @@ For code work:
 4. Check error handling, edge cases, concurrency boundaries, data preservation, security boundaries, and cross-platform behavior relevant to the change.
 5. Confirm that tests assert behavior rather than merely snapshotting source text or constants.
 
+Repository cleanliness is decided by the canonical `kanban_complete` guard
+against the task's recorded spawn baseline. Do not run a raw cleanliness
+script without that baseline and then ask the implementer to delete, ignore,
+move, or commit foreign dirty paths. A path owned by another task and already
+present when this candidate/reviewer spawned is not a candidate defect while
+it remains byte-identical. Let `kanban_completion_ready`/`kanban_complete`
+evaluate the durable baseline; if the gate itself rejects, report its exact
+path and reason.
+
 For non-code work:
 
 1. Inspect the complete deliverable rather than only its summary.
@@ -207,6 +216,10 @@ Do not edit the implementation while acting as reviewer. Request changes and let
 - **Reviewer implementation:** Editing the deliverable hides ownership and weakens the re-review boundary.
 - **Vague findings:** “Needs work” does not give the implementer a reproducible correction target.
 - **Style-only blocking:** Do not request changes for preference-level nits when behavior and repository standards are satisfied.
+- **Baseline-free dirty check:** Never reject a candidate from a raw repository
+  check that lacks the task's spawn baseline, and never clean another task's
+  screenshots, artifacts, gitlinks, or uncommitted work to make the tree look
+  clean.
 - **Skipping prior rounds:** Re-review must confirm both the requested corrections and preservation of previously passing behavior.
 - **Using blockers for ordinary rework:** Correctable defects belong in `kanban_request_changes`; reserve `kanban_block` for genuine external blockers or human decisions.
 - **Completing without evidence:** Every approval summary must name the checks or artifacts actually inspected.
