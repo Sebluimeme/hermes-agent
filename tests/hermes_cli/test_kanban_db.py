@@ -1052,6 +1052,50 @@ def test_dispatch_waits_one_tick_for_terminal_worker_exit_barrier(
     assert spawned == []
 
 
+def test_dispatch_keeps_terminal_workspace_locked_while_exact_pid_lives(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A slow terminal process keeps its checkout lock beyond one tick."""
+    from hermes_cli import worker_contracts
+
+    workspace = kanban_home / "shared-workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        predecessor = kb.create_task(
+            conn, title="completed predecessor", assignee="coder",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        assert kb.complete_task(conn, predecessor)
+        successor = kb.create_task(
+            conn, title="successor", assignee="researcher",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        conn.execute(
+            "INSERT INTO worker_contracts("
+            "task_id,run_id,profile,pid,start_identity,workspace_path,created_at,"
+            "state,stopped_at) VALUES(?,?,?,?,?,?,?,'stopped',?)",
+            (predecessor, 1, "coder", 4242, "identity", str(workspace),
+             int(time.time()), int(time.time())),
+        )
+        monkeypatch.setattr(worker_contracts, "reconcile", lambda _conn: [])
+        monkeypatch.setattr(
+            worker_contracts, "proc_start_identity",
+            lambda pid: "identity" if pid == 4242 else None,
+        )
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, path, **_kwargs: spawned.append((task.id, path)) or 4243,
+            max_spawn=1,
+        )
+
+    assert result.spawned == []
+    assert result.skipped_workspace_busy == [
+        (successor, str(workspace.resolve()), predecessor),
+    ]
+    assert spawned == []
+
+
 def test_local_claude2_failure_does_not_fallback_to_another_executor(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="repair proxy", assignee="claude2")

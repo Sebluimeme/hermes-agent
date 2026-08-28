@@ -18,7 +18,12 @@ from typing import Any, Callable
 # the documented hourly worker heartbeat contract so it cannot pre-empt a
 # healthy uncapped worker at the former ten-minute threshold.
 CHECKPOINT_STALE_SECONDS = 3600
-ACTIVE_TASK_STATUSES = {"running", "review", "changes_requested"}
+EXIT_GRACE_SECONDS = 30
+# A claimed implementation or review worker always puts the card in
+# ``running``.  ``review`` is the durable handoff state *after* the
+# implementer has finished, so keeping it active here lets the reviewer race
+# the still-unwinding implementer and overwrites the old task-keyed contract.
+ACTIVE_TASK_STATUSES = {"running"}
 TERMINAL_TASK_STATUSES = {"done", "blocked", "archived", "cancelled", "triage", "todo", "ready"}
 
 
@@ -135,8 +140,13 @@ def latest_descriptive_checkpoint(conn: Any, task_id: str) -> int | None:
     return int(row["created_at"]) if isinstance(note, str) and note.strip() else None
 
 
-def safe_stop(contract: Any, *, kill: Callable[[int, int], None] | None = None) -> bool:
-    """Stop only the exact recorded process group after identity re-validation."""
+def _safe_signal(
+    contract: Any,
+    sig: int,
+    *,
+    kill: Callable[[int, int], None] | None = None,
+) -> bool:
+    """Signal only the exact recorded process group after identity validation."""
     pid = int(contract["pid"])
     if proc_start_identity(pid) != contract["start_identity"]:
         return False
@@ -145,12 +155,55 @@ def safe_stop(contract: Any, *, kill: Callable[[int, int], None] | None = None) 
     pgid = contract["process_group"]
     try:
         if pgid and process_group(pid) == int(pgid):
-            kill(-int(pgid), signal.SIGTERM)
+            kill(-int(pgid), sig)
         else:
-            kill(pid, signal.SIGTERM)
+            kill(pid, sig)
     except OSError:
         return not process_alive(pid)
     return True
+
+
+def safe_stop(contract: Any, *, kill: Callable[[int, int], None] | None = None) -> bool:
+    """Stop only the exact recorded process group after identity re-validation."""
+    return _safe_signal(contract, signal.SIGTERM, kill=kill)
+
+
+def live_exit_barriers(
+    conn: Any,
+    *,
+    now: int | None = None,
+    force_expired: bool = True,
+) -> list[dict[str, Any]]:
+    """Return stopped contracts whose exact worker process is still alive.
+
+    Reconciliation sends SIGTERM asynchronously.  A fixed one-tick barrier is
+    insufficient when an agent is still draining parallel tool calls: the next
+    worker can otherwise enter the same checkout while the old PID is alive.
+    Keep the workspace occupied until the recorded start identity disappears.
+    If the process outlives a bounded grace period, SIGKILL the exact recorded
+    process group; the barrier remains for this tick and is released only after
+    the process table confirms exit.
+    """
+    current = int(now or time.time())
+    barriers: list[dict[str, Any]] = []
+    rows = conn.execute(
+        "SELECT * FROM worker_contracts WHERE state='stopped'"
+    ).fetchall()
+    for contract in rows:
+        pid = int(contract["pid"])
+        if proc_start_identity(pid) != contract["start_identity"]:
+            continue
+        forced = False
+        stopped_at = int(contract["stopped_at"] or current)
+        if force_expired and current - stopped_at >= EXIT_GRACE_SECONDS:
+            forced = _safe_signal(contract, signal.SIGKILL)
+        barriers.append({
+            "task_id": contract["task_id"],
+            "pid": pid,
+            "workspace_path": contract["workspace_path"],
+            "forced": forced,
+        })
+    return barriers
 
 
 def reconcile(conn: Any, *, now: int | None = None, stale_seconds: int = CHECKPOINT_STALE_SECONDS) -> list[dict[str, Any]]:

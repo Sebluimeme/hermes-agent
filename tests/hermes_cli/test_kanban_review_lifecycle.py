@@ -114,6 +114,38 @@ def test_request_review_transitions_running_to_review(kanban_home: Path) -> None
         assert _events(conn, tid, kind="block_loop_detected") == []
 
 
+def test_request_review_resets_dispatch_failure_streak(
+    kanban_home: Path,
+) -> None:
+    """A clean handoff is a retry boundary even when review later asks rework."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="resume then hand off", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=1, "
+            "last_failure_error='earlier timeout' WHERE id=?",
+            (tid,),
+        )
+
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="checkpoint delivered",
+            reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        row = conn.execute(
+            "SELECT status, consecutive_failures, last_failure_error "
+            "FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+
+    assert row["status"] == "review"
+    assert row["consecutive_failures"] == 0
+    assert row["last_failure_error"] is None
+
+
 def test_active_reviewer_cannot_wait_for_or_request_itself(
     kanban_home: Path,
 ) -> None:

@@ -692,7 +692,7 @@ def test_request_review_clears_superseded_failure_state(conn) -> None:
     task = kb.get_task(conn, task_id)
     assert task is not None
     assert task.status == "review"
-    assert task.consecutive_failures == 1  # reliability history is retained
+    assert task.consecutive_failures == 0  # clean handoff starts a retry boundary
     assert task.last_failure_error is None
     assert task.failure_class is None
     assert task.execution_status == "pending"
@@ -737,14 +737,14 @@ def test_schema_reconciles_legacy_review_handoff_failure_state(conn) -> None:
     )
 
 
-def test_review_transitions_preserve_consecutive_failures(conn) -> None:
-    """M2 regression: review transitions neither reset nor increment the
-    circuit-breaker counter.
+def test_review_handoffs_reset_failure_streak_and_rework_preserves_boundary(
+    conn,
+) -> None:
+    """A valid handoff starts a clean retry budget for each review cycle.
 
-    A task with consecutive_failures=1 that cycles through
-    request_review -> request_changes -> re-request keeps the counter at 1;
-    a crash after request_changes increments it to 2 and trips a
-    failure_limit=2 breaker. Only complete_task's success path resets it.
+    Review verdicts and manual reopens are neutral.  They preserve the clean
+    boundary established by ``request_review``; subsequent worker failures
+    remain bounded by the normal circuit breaker.
     """
     task_id = kb.create_task(conn, title="flaky feature", assignee="builder")
     with kb.write_txn(conn):
@@ -759,7 +759,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         conn, task_id, summary="v1", reviewer="reviewer",
         expected_run_id=implementation.current_run_id,
     )
-    assert _failures(conn, task_id) == 1  # request_review preserved it
+    assert _failures(conn, task_id) == 0  # request_review cleared old timeout
 
     review = kb.claim_review_task(conn, task_id)
     assert review is not None
@@ -767,7 +767,7 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         conn, task_id, reason="needs fixes",
         expected_run_id=review.current_run_id,
     ) == (True, "builder")
-    assert _failures(conn, task_id) == 1  # request_changes preserved it
+    assert _failures(conn, task_id) == 0  # request_changes is neutral
 
     retry = kb.claim_task(conn, task_id, claimer="builder:2")
     assert retry is not None
@@ -775,17 +775,21 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         conn, task_id, summary="v2",
         expected_run_id=retry.current_run_id,
     )
-    assert _failures(conn, task_id) == 1  # full re-review cycle: still 1
+    assert _failures(conn, task_id) == 0  # next clean handoff stays clean
 
     # reopen_review_task (manual changes-requested) also preserves it.
     assert kb.reopen_review_task(conn, task_id)
-    assert _failures(conn, task_id) == 1
+    assert _failures(conn, task_id) == 0
 
-    # A crash now increments 1 -> 2 and trips a failure_limit=2 breaker —
-    # the counter accumulated across the review cycle instead of being
-    # amnesia-reset back to 0.
+    # Failures after rework are still bounded, but start from the clean
+    # handoff boundary instead of combining with an old implementation run.
     tripped = kb._record_task_failure(
         conn, task_id, "worker crashed", outcome="crashed", failure_limit=2,
+    )
+    assert tripped is False
+    assert _failures(conn, task_id) == 1
+    tripped = kb._record_task_failure(
+        conn, task_id, "worker crashed again", outcome="crashed", failure_limit=2,
     )
     assert tripped is True
     assert _failures(conn, task_id) == 2

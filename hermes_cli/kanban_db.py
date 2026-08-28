@@ -7658,6 +7658,7 @@ def request_review(
                    failure_class = NULL,
                    next_retry_at = NULL,
                    action_required = NULL,
+                   consecutive_failures = 0,
                    last_failure_error = NULL
             """ + assignee_sql + """
              WHERE id = ?
@@ -7671,6 +7672,14 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
+        # A valid review handoff is a successful worker protocol boundary:
+        # the implementer preserved its checkpoint, supplied evidence and
+        # yielded control to an independent reviewer.  Reset the dispatcher
+        # crash/timeout streak here so an earlier implementation timeout does
+        # not combine with a later correction timeout and falsely turn a
+        # delivered task into a human-facing ``gave_up`` block.  A reviewer
+        # can still request precise rework; every such accepted handoff starts
+        # the worker retry budget from a clean boundary.
         run_id = _end_run(
             conn,
             task_id,
@@ -7823,9 +7832,9 @@ def request_changes(
 
         new_status = _landing_status_after_parents(conn, task_id)
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
-        # reset nor incremented). Review transitions are not evidence the
-        # pathology cleared — only complete_task's success path resets the
-        # breaker counter (mirrors unblock_task, #35072).
+        # reset nor incremented) by the review verdict.  The preceding valid
+        # request_review handoff already reset the worker-failure streak;
+        # requesting precise rework is not a new worker failure.
         cur = conn.execute(
             """
             UPDATE tasks
@@ -8220,9 +8229,10 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            # consecutive_failures deliberately PRESERVED: review reopen is
-            # not a success signal; only complete_task resets the breaker
-            # counter (mirrors unblock_task, #35072).
+            # consecutive_failures deliberately PRESERVED: a manual review
+            # reopen is not a new success or failure signal.  The preceding
+            # valid request_review handoff already established the clean retry
+            # boundary (mirrors unblock_task, #35072).
             + assignee_sql
             + " WHERE id = ? AND status = 'review'",
             params,
@@ -12496,6 +12506,17 @@ def _dispatch_once_locked(
         for action in _contract_actions
         if action.get("task_id") in _active_contract_workspaces
     ]
+    # SIGTERM is asynchronous and terminal agents may still be draining a
+    # parallel tool batch.  Preserve the exact workspace lock across ticks
+    # until the recorded PID/start identity is truly gone; after the bounded
+    # contract grace, worker_contracts safely force-stops that exact group.
+    _contract_exit_barriers.extend(
+        (barrier["workspace_path"], barrier["task_id"])
+        for barrier in _worker_contracts.live_exit_barriers(
+            conn, force_expired=not dry_run,
+        )
+        if barrier.get("workspace_path")
+    )
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -12597,9 +12618,9 @@ def _dispatch_once_locked(
         )
         if _key:
             _occupied_workspaces.setdefault(_key, _workspace_row["id"])
-    # One-tick exit barrier for contracts reconciled above. The next dispatcher
-    # tick re-evaluates the real board/process state after SIGTERM has had time
-    # to take effect; no blind sleep and no duplicate writer are needed.
+    # Exit barrier for contracts reconciled above. It survives later ticks
+    # while the exact recorded process identity still exists, so a slow agent
+    # shutdown cannot overlap its successor in the same checkout.
     for _barrier_path, _barrier_task_id in _contract_exit_barriers:
         _key = _workspace_occupancy_key("dir", _barrier_path)
         if _key:

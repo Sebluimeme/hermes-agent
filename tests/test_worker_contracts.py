@@ -57,6 +57,36 @@ class WorkerContractsTests(unittest.TestCase):
         self.assertEqual(actions, [{"task_id": "t1", "pid": 42, "reason": "task_done", "stopped": True}])
         self.assertEqual(self.kills[0][0], -42)
 
+    def test_review_handoff_stops_implementer_contract(self) -> None:
+        self.register()
+        self.conn.execute("UPDATE tasks SET status='review' WHERE id='t1'")
+        with patch.object(wc, "proc_start_identity", return_value="start-42"), patch.object(wc, "process_group", return_value=42), patch.object(wc, "process_alive", return_value=True):
+            with patch.object(wc.os, "kill", side_effect=lambda pid, sig: self.kills.append((pid, sig))):
+                actions = wc.reconcile(self.conn, now=101)
+        self.assertEqual(actions, [{"task_id": "t1", "pid": 42, "reason": "task_review", "stopped": True}])
+        self.assertEqual(self.kills, [(-42, wc.signal.SIGTERM)])
+
+    def test_exit_barrier_persists_and_force_stops_after_grace(self) -> None:
+        self.register()
+        self.conn.execute(
+            "UPDATE worker_contracts SET state='stopped', stopped_at=101 WHERE task_id='t1'"
+        )
+        with patch.object(wc, "proc_start_identity", return_value="start-42"), patch.object(wc, "process_group", return_value=42):
+            with patch.object(wc.os, "kill", side_effect=lambda pid, sig: self.kills.append((pid, sig))):
+                fresh = wc.live_exit_barriers(self.conn, now=101 + wc.EXIT_GRACE_SECONDS - 1)
+                expired = wc.live_exit_barriers(self.conn, now=101 + wc.EXIT_GRACE_SECONDS)
+        self.assertEqual(fresh[0]["forced"], False)
+        self.assertEqual(expired[0]["forced"], True)
+        self.assertEqual(self.kills, [(-42, wc.signal.SIGKILL)])
+
+    def test_exit_barrier_releases_only_after_exact_identity_is_gone(self) -> None:
+        self.register()
+        self.conn.execute(
+            "UPDATE worker_contracts SET state='stopped', stopped_at=101 WHERE task_id='t1'"
+        )
+        with patch.object(wc, "proc_start_identity", return_value=None):
+            self.assertEqual(wc.live_exit_barriers(self.conn, now=102), [])
+
     def test_pid_reuse_identity_mismatch_is_never_killed(self) -> None:
         self.register()
         with patch.object(wc, "proc_start_identity", return_value="new-process"):
