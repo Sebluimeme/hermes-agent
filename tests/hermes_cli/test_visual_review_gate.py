@@ -56,6 +56,26 @@ def test_visual_classifier_supports_heuristic_marker_and_opt_out() -> None:
     assert vr.is_visual_web_task("Refactor", metadata={"changed_files": ["src/Card.tsx"]})
 
 
+def test_google_ads_configuration_is_not_misclassified_as_web_visual() -> None:
+    body = (
+        "Rendre principales les conversions « Calls from ads » et "
+        "« Formulaire Devis ». Ne modifier ni les annonces, ni le site. "
+        "Si l'interface impose une action hors périmètre, bloquer."
+    )
+    assert not vr.is_visual_web_task(
+        "Activer les conversions principales Ads Tarte Flambée", body
+    )
+    assert vr.is_visual_web_task(
+        "Activer les conversions principales Ads Tarte Flambée",
+        body,
+        metadata={"changed_files": ["src/Formulaire.tsx"]},
+    )
+    assert vr.is_visual_web_task(
+        "[VISUAL] Activer les conversions principales Ads Tarte Flambée", body
+    )
+    assert vr.is_visual_web_task("Refondre la landing page Google Ads")
+
+
 def test_capture_only_delivery_does_not_enter_implementation_review() -> None:
     body = (
         "Prendre une capture desktop et mobile de la vraie page Entreprise. "

@@ -101,6 +101,16 @@ _VISUAL_EXTENSIONS = {
     ".css", ".scss", ".sass", ".less", ".styl", ".html", ".htm",
     ".jsx", ".tsx", ".vue", ".svelte", ".astro",
 }
+_ADS_CONFIGURATION_TITLE_RE = re.compile(
+    r"\b(?:google\s+)?ads\b",
+    re.IGNORECASE,
+)
+_ADS_CONFIGURATION_OBJECT_RE = re.compile(
+    r"\b(?:conversion(?:s)?|calendrier|budget|ench[eè]re(?:s)?|"
+    r"mot(?:s)?[ -]?cl[eé](?:s)?|campagne(?:s)?|annonce(?:s)?|"
+    r"ciblage|audience(?:s)?)\b",
+    re.IGNORECASE,
+)
 
 
 class VisualReviewError(ValueError):
@@ -172,9 +182,27 @@ def is_visual_web_task(
     # shortcut when changed files were supplied.
     if is_capture_only_delivery(title, body, metadata):
         return False
+    # A Google Ads configuration card can legitimately mention UI words in
+    # its acceptance text (for example an action named "Formulaire Devis",
+    # or "si l'interface l'impose").  Those nouns do not mean that the card
+    # changes a rendered web surface.  Use the title as the operation intent:
+    # when it clearly targets an Ads configuration object and no visual source
+    # file is declared, keep the card out of the screenshot review lane.
+    # Explicit [VISUAL] markers and actual visual changed files remain
+    # authoritative, so real landing-page work is still gated.
+    changed_files = _metadata_changed_files(metadata)
+    has_visual_file = any(
+        Path(path).suffix.lower() in _VISUAL_EXTENSIONS for path in changed_files
+    )
+    if (
+        _ADS_CONFIGURATION_TITLE_RE.search(title or "")
+        and _ADS_CONFIGURATION_OBJECT_RE.search(title or "")
+        and not has_visual_file
+    ):
+        return False
     if _VISUAL_TEXT_RE.search(text):
         return True
-    return any(Path(path).suffix.lower() in _VISUAL_EXTENSIONS for path in _metadata_changed_files(metadata))
+    return has_visual_file
 
 
 def requires_production_proof(
