@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import datetime as dt
 import json
 import os
 import sqlite3
@@ -823,6 +824,82 @@ def test_dispatch_serializes_two_tasks_sharing_the_same_workspace(
     assert spawned == [(first, str(workspace.resolve()))]
 
 
+def test_dispatch_serializes_parent_checkout_against_nested_repository(
+    kanban_home, all_assignees_spawnable,
+):
+    """A parent writer must not race a nested repository gitlink writer."""
+    repository = kanban_home / "repository"
+    parent_workspace = repository / "youtube"
+    nested_repository = repository / "ecobloc"
+    nested_workspace = nested_repository / "tasks"
+    (repository / ".git").mkdir(parents=True)
+    parent_workspace.mkdir()
+    (nested_repository / ".git").mkdir(parents=True)
+    nested_workspace.mkdir()
+    spawned = []
+
+    def fake_spawn(task, resolved_workspace, **_kwargs):
+        spawned.append((task.id, resolved_workspace))
+        return 92_000 + len(spawned)
+
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="parent writer", assignee="coder",
+            workspace_kind="dir", workspace_path=str(parent_workspace),
+        )
+        nested = kb.create_task(
+            conn, title="nested writer", assignee="claude1",
+            workspace_kind="dir", workspace_path=str(nested_workspace),
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+        spawnable_while_parent_runs = kb.has_spawnable_ready(conn)
+
+    assert result.spawned == [(parent, "coder", str(parent_workspace.resolve()))]
+    assert result.skipped_workspace_busy == [
+        (nested, str(nested_repository.resolve()), parent),
+    ]
+    assert spawnable_while_parent_runs is False
+    assert spawned == [(parent, str(parent_workspace.resolve()))]
+
+
+def test_dispatch_keeps_nested_sibling_repositories_parallel(
+    kanban_home, all_assignees_spawnable,
+):
+    """Independent nested repositories retain useful lane parallelism."""
+    repository = kanban_home / "repository"
+    (repository / ".git").mkdir(parents=True)
+    first_repository = repository / "first"
+    second_repository = repository / "second"
+    (first_repository / ".git").mkdir(parents=True)
+    (second_repository / ".git").mkdir(parents=True)
+    first_workspace = first_repository / "tasks"
+    second_workspace = second_repository / "tasks"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    spawned = []
+
+    def fake_spawn(task, resolved_workspace, **_kwargs):
+        spawned.append((task.id, resolved_workspace))
+        return 93_000 + len(spawned)
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn, title="first nested writer", assignee="coder",
+            workspace_kind="dir", workspace_path=str(first_workspace),
+        )
+        second = kb.create_task(
+            conn, title="second nested writer", assignee="researcher",
+            workspace_kind="dir", workspace_path=str(second_workspace),
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+
+    assert result.skipped_workspace_busy == []
+    assert {task_id for task_id, _assignee, _workspace in result.spawned} == {
+        first, second,
+    }
+    assert len(spawned) == 2
+
+
 def test_local_claude2_failure_does_not_fallback_to_another_executor(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="repair proxy", assignee="claude2")
@@ -1295,6 +1372,39 @@ def test_claude_provider_reset_parses_minutes_and_does_not_invent_non_429_reset(
     assert no_reset["reset_source"] is None
     assert no_reset["reset_at"] is None
     assert row["assignee"] == "claude2", "capture alone must not trigger a fallback"
+
+
+def test_claude_provider_reset_parses_named_timezone_clock(kanban_home):
+    received = dt.datetime(
+        2026, 8, 28, 7, 36, tzinfo=dt.timezone.utc,
+    ).timestamp()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="work", assignee="claude2")
+        captured = kb.capture_claude_provider_reset(
+            conn,
+            task_id,
+            "HTTP 429: You've hit your session limit · resets 12:20pm (Europe/Paris)",
+            received_at=received,
+        )
+
+    assert captured is not None
+    assert captured["reset_source"] == "provider_reset_clock"
+    assert captured["reset_at"] == "2026-08-28T10:20:00+00:00"
+
+
+def test_claude_provider_reset_rejects_clock_without_valid_timezone(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="work", assignee="claude2")
+        captured = kb.capture_claude_provider_reset(
+            conn,
+            task_id,
+            "HTTP 429: session limit, resets 12:20pm (Not/A-Timezone)",
+            received_at=0,
+        )
+
+    assert captured is not None
+    assert captured["reset_source"] is None
+    assert captured["reset_at"] is None
 
 
 def test_fallback_route_blocks_explicitly_when_no_profile_resolves(kanban_home, monkeypatch):

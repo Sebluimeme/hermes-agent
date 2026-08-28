@@ -89,7 +89,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -10744,6 +10744,11 @@ _PROVIDER_CODE_RE = re.compile(r"[\"']?(?:error_)?(?:code|type)[\"']?\s*[:=]\s*[
 _RETRY_AFTER_RE = re.compile(r"\bretry[-_ ]after\s*[:=]\s*(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec(?:onds?)?)?\b", re.I)
 _MINUTES_RE = re.compile(r"\b(?:retry|reset|wait|available)[^\n]{0,60}?\b(?:in\s+)?(\d+(?:\.\d+)?)\s+minutes?\b", re.I)
 _RESET_AT_RE = re.compile(r"\breset_at\s*[:=]\s*[\"']?([^\s,\"'}]+)", re.I)
+_RESET_CLOCK_RE = re.compile(
+    r"\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*"
+    r"(a\.?m\.?|p\.?m\.?)\s*\(([^)]+)\)",
+    re.I,
+)
 _PROVIDER_SECRET_RE = re.compile(
     r"\b(?:api[_-]?key|token|authorization|bearer|secret)\b\s*[:=]\s*[\"']?[^\s,\"'}]+",
     re.I,
@@ -10768,6 +10773,44 @@ def _parse_explicit_reset_at(text: str) -> Optional[dt.datetime]:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(dt.timezone.utc)
+
+
+def _parse_explicit_reset_clock(
+    text: str, received_at: dt.datetime,
+) -> Optional[dt.datetime]:
+    """Return an explicit provider clock reset in its named timezone.
+
+    Claude CLI reports subscription walls as e.g. ``resets 12:20pm
+    (Europe/Paris)`` rather than an ISO timestamp. The clock and timezone are
+    both provider evidence; only the nearest future occurrence (today or
+    tomorrow in that timezone) is inferred. A missing/invalid timezone or
+    clock is rejected instead of guessing from the host locale.
+    """
+    match = _RESET_CLOCK_RE.search(text)
+    if not match:
+        return None
+    try:
+        hour = int(match.group(1))
+        minute = int(match.group(2) or 0)
+        if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+            return None
+        meridiem = match.group(3).replace(".", "").casefold()
+        if meridiem == "am":
+            hour = 0 if hour == 12 else hour
+        elif meridiem == "pm":
+            hour = hour if hour == 12 else hour + 12
+        else:
+            return None
+        zone = ZoneInfo(match.group(4).strip())
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
+    local_received = received_at.astimezone(zone)
+    candidate = local_received.replace(
+        hour=hour, minute=minute, second=0, microsecond=0,
+    )
+    if candidate <= local_received:
+        candidate += dt.timedelta(days=1)
+    return candidate.astimezone(dt.timezone.utc)
 
 
 def _latest_spawn_resolution(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[str], Optional[str]]:
@@ -10825,19 +10868,24 @@ def capture_claude_provider_reset(
         payload["reset_at"] = explicit_reset.isoformat()
         payload["reset_source"] = "api_reset_at"
     else:
+        explicit_clock = _parse_explicit_reset_clock(error, received_dt)
+        if explicit_clock is not None:
+            payload["reset_at"] = explicit_clock.isoformat()
+            payload["reset_source"] = "provider_reset_clock"
         delay_seconds: Optional[float] = None
-        retry = _RETRY_AFTER_RE.search(error)
-        if retry:
-            delay_seconds = float(retry.group(1))
-            if retry.group(2) and retry.group(2).lower().startswith("m"):
-                delay_seconds /= 1000
-        else:
-            minutes = _MINUTES_RE.search(error)
-            if minutes:
-                delay_seconds = float(minutes.group(1)) * 60
-        if delay_seconds is not None and delay_seconds >= 0:
-            payload["reset_at"] = (received_dt + dt.timedelta(seconds=delay_seconds)).isoformat()
-            payload["reset_source"] = "api_retry_after"
+        if explicit_clock is None:
+            retry = _RETRY_AFTER_RE.search(error)
+            if retry:
+                delay_seconds = float(retry.group(1))
+                if retry.group(2) and retry.group(2).lower().startswith("m"):
+                    delay_seconds /= 1000
+            else:
+                minutes = _MINUTES_RE.search(error)
+                if minutes:
+                    delay_seconds = float(minutes.group(1)) * 60
+            if delay_seconds is not None and delay_seconds >= 0:
+                payload["reset_at"] = (received_dt + dt.timedelta(seconds=delay_seconds)).isoformat()
+                payload["reset_source"] = "api_retry_after"
     _append_event(conn, task_id, "claude_provider_reset", payload)
     return payload
 
@@ -10852,7 +10900,9 @@ def _relay_to_coder_message(conn: sqlite3.Connection, task_id: str) -> str:
     for row in rows:
         try:
             payload = json.loads(row["payload"] or "{}")
-            if payload.get("reset_source") not in {"api_reset_at", "api_retry_after"}:
+            if payload.get("reset_source") not in {
+                "api_reset_at", "api_retry_after", "provider_reset_clock",
+            }:
                 continue
             role, reset_at = payload.get("claude_role"), payload.get("reset_at")
             if role not in ("claude2", "claude1") or not isinstance(reset_at, str):
@@ -11848,16 +11898,16 @@ def _has_spawnable_unoccupied(conn: sqlite3.Connection, status: str) -> bool:
     if not rows:
         return False
 
-    occupied: set[str] = set()
+    occupied: dict[str, str] = {}
     for running in conn.execute(
-        "SELECT workspace_kind, workspace_path FROM tasks "
+        "SELECT id, workspace_kind, workspace_path FROM tasks "
         "WHERE status = 'running' AND workspace_path IS NOT NULL"
     ):
         key = _workspace_occupancy_key(
             running["workspace_kind"], running["workspace_path"],
         )
         if key:
-            occupied.add(key)
+            occupied.setdefault(key, running["id"])
 
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
@@ -11870,7 +11920,7 @@ def _has_spawnable_unoccupied(conn: sqlite3.Connection, status: str) -> bool:
         key = _workspace_occupancy_key(
             row["workspace_kind"], row["workspace_path"],
         )
-        if key and key in occupied:
+        if key and _occupied_workspace_owner(key, occupied) is not None:
             continue
         return True
     return False
@@ -12118,12 +12168,22 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
 def _workspace_occupancy_key(
     workspace_kind: Optional[str], workspace_path: Optional[str],
 ) -> Optional[str]:
-    """Return a collision key only when ``workspace_path`` is already exact.
+    """Return the nearest writable Git checkout, or the exact path.
 
     A new ``worktree`` card initially stores its repository anchor; different
     task ids must still be allowed to materialize distinct linked worktrees
     from that shared anchor. Once the path points inside ``.worktrees`` it is
     exact and must be serialized like ``dir`` and ``scratch`` workspaces.
+
+    ``dir`` cards can point at sibling-looking subdirectories that are not
+    independent writers. For example ``repo/youtube`` belongs to the parent
+    checkout while ``repo/ecobloc/tasks`` belongs to a nested Git checkout.
+    The parent checkout observes the nested repository as a dirty gitlink, so
+    letting both cards run concurrently lets the parent worker reset or commit
+    the nested worker's pointer. Resolve each existing path to its nearest
+    ``.git`` ancestor; :func:`_workspace_occupancy_conflict` then treats
+    ancestor/descendant checkout scopes as overlapping while still allowing
+    two independent nested sibling repositories to run in parallel.
     """
     if not workspace_path:
         return None
@@ -12133,7 +12193,48 @@ def _workspace_occupancy_key(
         path = Path(workspace_path).expanduser().absolute()
     if workspace_kind == "worktree" and ".worktrees" not in path.parts:
         return None
+
+    # Files are not expected here, but using their parent keeps malformed or
+    # partially-created workspace declarations fail-safe without inventing a
+    # different collision scope.
+    probe = path if path.is_dir() else path.parent
+    for candidate in (probe, *probe.parents):
+        try:
+            if (candidate / ".git").exists():
+                return str(candidate)
+        except OSError:
+            continue
     return str(path)
+
+
+def _workspace_occupancy_conflict(left: str, right: str) -> bool:
+    """Return whether two exact/repository scopes can affect one another.
+
+    Equality covers the historical same-directory guard. Ancestor overlap is
+    also a collision because Git parent checkouts track nested repositories as
+    gitlinks. Sibling nested repositories remain independent.
+    """
+    try:
+        left_path = Path(left).expanduser().resolve()
+        right_path = Path(right).expanduser().resolve()
+    except OSError:
+        left_path = Path(left).expanduser().absolute()
+        right_path = Path(right).expanduser().absolute()
+    return (
+        left_path == right_path
+        or left_path in right_path.parents
+        or right_path in left_path.parents
+    )
+
+
+def _occupied_workspace_owner(
+    candidate: str, occupied: Mapping[str, str],
+) -> Optional[str]:
+    """Return the task owning a scope that overlaps ``candidate``."""
+    for occupied_scope, task_id in occupied.items():
+        if _workspace_occupancy_conflict(candidate, occupied_scope):
+            return task_id
+    return None
 
 
 def dispatch_once(
@@ -12564,10 +12665,14 @@ def _dispatch_once_locked(
         row_workspace_key = _workspace_occupancy_key(
             row["workspace_kind"], row["workspace_path"],
         )
-        if row_workspace_key and row_workspace_key in _occupied_workspaces:
+        occupied_by = (
+            _occupied_workspace_owner(row_workspace_key, _occupied_workspaces)
+            if row_workspace_key else None
+        )
+        if row_workspace_key and occupied_by is not None:
             result.skipped_workspace_busy.append((
                 row["id"], row_workspace_key,
-                _occupied_workspaces[row_workspace_key],
+                occupied_by,
             ))
             continue
         row_assignee = row["assignee"]
@@ -12870,10 +12975,14 @@ def _dispatch_once_locked(
         row_workspace_key = _workspace_occupancy_key(
             row["workspace_kind"], row["workspace_path"],
         )
-        if row_workspace_key and row_workspace_key in _occupied_workspaces:
+        occupied_by = (
+            _occupied_workspace_owner(row_workspace_key, _occupied_workspaces)
+            if row_workspace_key else None
+        )
+        if row_workspace_key and occupied_by is not None:
             result.skipped_workspace_busy.append((
                 row["id"], row_workspace_key,
-                _occupied_workspaces[row_workspace_key],
+                occupied_by,
             ))
             continue
         if not row["assignee"]:

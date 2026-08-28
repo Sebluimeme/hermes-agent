@@ -21063,7 +21063,30 @@ def _single_query_exit_code(result: object) -> int:
         "billing",
     ):
         try:
-            from hermes_cli.kanban_db import KANBAN_RATE_LIMIT_EXIT_CODE
+            from hermes_cli.kanban_db import (
+                KANBAN_RATE_LIMIT_EXIT_CODE,
+                capture_claude_provider_reset,
+                connect,
+                write_txn,
+            )
+
+            # Preserve the provider's exact, secret-redacted reset evidence
+            # before the worker exits. The dispatcher only sees rc=75 later;
+            # without this bridge it can classify the quota wall but loses
+            # messages such as "resets 12:20pm (Europe/Paris)", so the resumed
+            # task and final Coder relay have no honest return estimate.
+            task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+            error = str(result.get("error") or result.get("final_response") or "").strip()
+            if task_id and error:
+                try:
+                    with connect() as conn:
+                        with write_txn(conn):
+                            capture_claude_provider_reset(conn, task_id, error)
+                except Exception:
+                    # Exit classification is safety-critical; observability is
+                    # best-effort and must never turn a clean EX_TEMPFAIL into
+                    # a generic crash when the board DB is temporarily busy.
+                    pass
 
             return KANBAN_RATE_LIMIT_EXIT_CODE
         except Exception:
