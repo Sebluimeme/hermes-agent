@@ -137,6 +137,39 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+_BLOCK_REASON_PLACEHOLDERS = {
+    "test",
+    "test reason simple",
+    "reason with spaces",
+    "test debug classifier",
+    "placeholder",
+    "todo",
+    "tbd",
+    "a completer",
+    "à compléter",
+    "raison simple",
+}
+
+
+def block_reason_rejection(reason: Optional[str]) -> Optional[str]:
+    """Reject scratch text before it can become a durable human blocker.
+
+    Block reasons are rendered directly in the operator's Telegram board. A
+    worker testing CLI syntax must therefore fail closed instead of persisting
+    a placeholder that looks like a real decision. ``None`` stays valid for
+    legacy/internal callers; model-facing tools already require a reason.
+    """
+    if reason is None:
+        return None
+    normalized = re.sub(r"[\s._-]+", " ", str(reason).strip().lower())
+    normalized = normalized.strip(" \t\r\n'\"`.:;!?()[]{}")
+    if normalized in _BLOCK_REASON_PLACEHOLDERS:
+        return (
+            "placeholder block reason refused — describe the concrete "
+            "obstacle, why it blocks the task, and exactly what is needed"
+        )
+    return None
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -7227,6 +7260,9 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    reason_rejection = block_reason_rejection(reason)
+    if reason_rejection is not None:
+        raise ValueError(reason_rejection)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"

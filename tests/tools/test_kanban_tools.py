@@ -435,6 +435,21 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+@pytest.mark.parametrize("reason", ["test", "test reason simple", "reason with spaces"])
+def test_block_rejects_placeholder_reason_without_mutation(worker_env, reason):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = json.loads(kt._handle_block({"reason": reason, "kind": "needs_input"}))
+    assert "placeholder block reason refused" in out["error"]
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert not [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "blocked"
+        ]
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""

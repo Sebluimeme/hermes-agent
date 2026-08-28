@@ -1055,6 +1055,10 @@ def _handle_block(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        reason_rejection = kb.block_reason_rejection(reason)
+        if reason_rejection is not None:
+            conn.close()
+            return tool_error(reason_rejection)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(

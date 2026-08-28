@@ -50,6 +50,21 @@ def _make_running_again(conn, tid):
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["test", "test reason simple", "reason with spaces", "à compléter"],
+)
+def test_placeholder_block_reason_is_rejected_without_mutation(
+    kanban_home: Path, reason: str,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with pytest.raises(ValueError, match="placeholder block reason refused"):
+            kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        assert kb.get_task(conn, tid).status == "running"
+        assert not [event for event in kb.list_events(conn, tid) if event.kind == "blocked"]
+
+
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------
@@ -108,5 +123,4 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
-
 

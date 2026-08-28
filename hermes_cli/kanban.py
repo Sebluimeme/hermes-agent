@@ -2470,6 +2470,10 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    reason_rejection = kb.block_reason_rejection(reason)
+    if reason_rejection is not None:
+        print(f"kanban: {reason_rejection}", file=sys.stderr)
+        return 2
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
