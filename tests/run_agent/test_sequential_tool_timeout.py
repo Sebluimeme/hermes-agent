@@ -117,6 +117,17 @@ def _clarify_call(call_id: str = "clarify-1"):
     )
 
 
+def _process_wait_call(call_id: str = "process-wait-1"):
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(
+            name="process",
+            arguments='{"action": "wait", "session_id": "proc_test"}',
+        ),
+    )
+
+
 def test_sequential_tool_timeout_emits_result_and_continues(tmp_path, monkeypatch):
     agent = _make_agent(tmp_path)
     first_started = threading.Event()
@@ -347,3 +358,76 @@ def test_sequential_timeout_does_not_cut_clarify_human_wait(
     assert "timed out" not in messages[0]["content"]
     assert messages[1]["content"] == "second result"
     assert not any(event.get("error_type") == "tool_timeout" for event in terminal_events)
+
+
+def test_sequential_timeout_does_not_cut_kanban_process_wait(
+    tmp_path, monkeypatch
+):
+    """The process registry owns the bounded, interruptible worker wait."""
+    agent = _make_agent(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t-worker")
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "1.0")
+    terminal_events: list[dict] = []
+
+    def _dispatch(name, _args, _task_id, *, tool_call_id, **_kwargs):
+        if name == "process":
+            time.sleep(1.3)
+            return '{"status": "exited", "exit_code": 0}'
+        return "second result"
+
+    messages: list[dict] = []
+    started = time.monotonic()
+    with (
+        patch("run_agent.handle_function_call", side_effect=_dispatch),
+        patch(
+            "agent.tool_executor._emit_terminal_post_tool_call",
+            side_effect=lambda *_args, **kwargs: terminal_events.append(kwargs),
+        ),
+    ):
+        execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(
+                tool_calls=[_process_wait_call(), _tool_call("next")]
+            ),
+            messages,
+            "task",
+        )
+
+    assert time.monotonic() - started < 10.0
+    assert [message["tool_call_id"] for message in messages] == [
+        "process-wait-1",
+        "next",
+    ]
+    assert json.loads(messages[0]["content"])["status"] == "exited"
+    assert messages[1]["content"] == "second result"
+    assert not any(
+        event.get("error_type") == "tool_timeout" for event in terminal_events
+    )
+
+
+def test_sequential_timeout_still_bounds_interactive_process_wait(
+    tmp_path, monkeypatch
+):
+    """Only dispatcher-owned waits bypass the generic executor deadline."""
+    agent = _make_agent(tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "1.0")
+    release = threading.Event()
+
+    def _dispatch(*_args, **_kwargs):
+        release.wait()
+        return "late result"
+
+    messages: list[dict] = []
+    try:
+        with patch("run_agent.handle_function_call", side_effect=_dispatch):
+            execute_tool_calls_sequential(
+                agent,
+                SimpleNamespace(tool_calls=[_process_wait_call()]),
+                messages,
+                "task",
+            )
+    finally:
+        release.set()
+
+    assert "timed out after 1.0s" in messages[0]["content"]

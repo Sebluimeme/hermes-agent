@@ -787,6 +787,28 @@ def _run_agent_tool_execution_middleware(
 _SEQUENTIAL_INTERRUPT_POLL_SECONDS = 1.0
 
 
+def _tool_owns_sequential_deadline(
+    function_name: str, function_args: dict[str, Any]
+) -> bool:
+    """Return whether a tool has a stronger bounded-wait contract of its own.
+
+    Human ``clarify`` waits already own their configured deadline.  A
+    dispatcher-owned ``process(wait)`` now does too: ProcessRegistry bounds the
+    coalesced wait, checks interruption every second, and maintains the Kanban
+    heartbeat.  Wrapping that 1800s wait in the generic 420s tool deadline
+    abandons its thread early and forces the model back into polling — exactly
+    the quota churn the coalescing contract prevents.  Interactive process
+    waits remain protected by the generic deadline.
+    """
+    if function_name in _NEVER_PARALLEL_TOOLS:
+        return True
+    return (
+        function_name == "process"
+        and function_args.get("action") == "wait"
+        and bool(os.getenv("HERMES_KANBAN_TASK"))
+    )
+
+
 def _resolve_sequential_tool_timeout() -> float | None:
     """Deadline for one sequential tool call (#85125 Phase 2a).
 
@@ -840,7 +862,7 @@ def _run_sequential_tool_execution_middleware(
         "display_index": display_index,
         "middleware_trace": middleware_trace,
     }
-    if function_name in _NEVER_PARALLEL_TOOLS:
+    if _tool_owns_sequential_deadline(function_name, function_args):
         return _run_agent_tool_execution_middleware(agent, **kwargs)
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
