@@ -9,7 +9,10 @@ It deliberately contains no LLM call.  The Kanban domain uses it to:
 * validate the final Gemini evidence, or its explicit Coder/GPT fallback,
   against those same immutable hashes.
 
-The final evidence file is produced by ``~/.hermes/scripts/gemini_review_image.py``.
+The final evidence file is produced by
+``/home/seb/.hermes/scripts/gemini_review_image.py``. Worker profiles have an
+isolated ``HOME``, so a tilde path would resolve to a profile-private directory
+where the shared operational script does not exist.
 Keeping hashes and routing policy here prevents a prose-only "looks good"
 claim from bypassing the review lane.
 """

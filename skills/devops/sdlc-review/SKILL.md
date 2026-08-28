@@ -107,7 +107,7 @@ review is a two-stage visual gate in addition to the ordinary code checks:
    Gemini call over the whole desktop/mobile set:
 
    ```text
-     python3 ~/.hermes/scripts/gemini_review_image.py \
+   python3 /home/seb/.hermes/scripts/gemini_review_image.py \
        <desktop.png> <mobile.png> --task-id <current-task-id> \
        --attendu "<observable acceptance result + exact visible change scope; say explicitly when no visible change is expected>"
    ```
