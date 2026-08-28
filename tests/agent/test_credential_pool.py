@@ -143,6 +143,70 @@ def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeyp
     assert statuses["cred-model-config"] == STATUS_EXHAUSTED
 
 
+def test_codex_429_cannot_rotate_back_to_same_credential_after_positive_probe(
+    tmp_path, monkeypatch,
+):
+    """A concrete inference 429 wins over an optimistic generic usage probe.
+
+    The Codex usage endpoint can report session/weekly capacity while the
+    selected model still returns ``usage_limit_reached``.  Selection then
+    clears the just-written cooldown and used to hand the sole credential
+    straight back to the retry loop indefinitely.
+    """
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-codex",
+                        "label": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "jwt-like-runtime-token",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+
+    pool = load_pool("openai-codex")
+    monkeypatch.setattr(
+        pool,
+        "_codex_quota_restored_upstream",
+        lambda _entry: True,
+    )
+
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        api_key_hint="jwt-like-runtime-token",
+        credential_id="cred-codex",
+        error_context={
+            "reason": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "reset_at": time.time() + 3600,
+        },
+        failure_reason="rate_limit",
+    )
+
+    assert next_entry is None
+    entry = pool.entries()[0]
+    assert entry.last_status == STATUS_EXHAUSTED
+    assert entry.last_error_code == 429
+    assert pool.current() is None
+
+    persisted = json.loads((hermes_home / "auth.json").read_text())
+    assert persisted["credential_pool"]["openai-codex"][0]["last_status"] == STATUS_EXHAUSTED
+
+
 def test_stale_credential_id_prefers_api_key_hint(tmp_path, monkeypatch):
     """#79156: disagreeing credential_id + api_key_hint must mark the key.
 

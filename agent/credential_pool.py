@@ -2273,6 +2273,36 @@ class CredentialPool:
                 )
             self._current_id = None
             next_entry, _pending = self._select_unlocked(refresh=False)
+            # A rotation is only a recovery when it selects a *different*
+            # credential.  For Codex, _select_unlocked() may live-probe the
+            # usage endpoint and clear the entry we just exhausted even though
+            # the inference request itself returned a concrete 429 (for
+            # example a model-specific limit not reflected by the generic
+            # session/weekly windows).  Returning that same entry makes the
+            # caller retry it immediately and can spin hundreds of requests
+            # per minute while emitting misleading heartbeats.  Re-latch the
+            # exact failure and surface it; a later turn may probe/retry after
+            # the durable cooldown instead.
+            if next_entry is not None and next_entry.id == entry.id:
+                logger.warning(
+                    "credential pool: rotation selected the credential that "
+                    "just failed (%s) — preserving exhaustion and surfacing "
+                    "the error instead of retrying in a loop",
+                    _label,
+                )
+                current_entry = next(
+                    (candidate for candidate in self._entries if candidate.id == entry.id),
+                    next_entry,
+                )
+                if current_entry.last_status not in {STATUS_EXHAUSTED, STATUS_DEAD}:
+                    self._mark_exhausted(
+                        current_entry,
+                        status_code,
+                        error_context,
+                        failure_reason=failure_reason,
+                    )
+                self._current_id = None
+                return None
             if next_entry:
                 _next_label = next_entry.label or next_entry.id[:8]
                 logger.info("credential pool: rotated to %s", _next_label)
