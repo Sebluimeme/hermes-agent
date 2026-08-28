@@ -9981,6 +9981,26 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Keep a strong reference to every dispatcher-spawned ``Popen`` until our
+# explicit reap loop has captured its raw wait status.  Dropping the object
+# immediately lets ``subprocess._cleanup()`` reap it opportunistically the
+# next time *any* Popen is created in the gateway.  That loses the exit code,
+# so a deliberate neutral sentinel (quota / guardrail / interruption) later
+# degrades to ``kind=unknown`` and is charged as a crash.  The registry is
+# naturally bounded by the number of live workers and entries are removed by
+# ``_record_worker_exit`` as soon as the child is reaped.
+_live_worker_processes: "dict[int, subprocess.Popen[Any]]" = {}
+_live_worker_processes_lock = threading.Lock()
+
+
+def _retain_worker_process(proc: "subprocess.Popen[Any]") -> None:
+    """Retain *proc* until :func:`reap_worker_zombies` records its exit."""
+    pid = getattr(proc, "pid", None)
+    if not pid or int(pid) <= 0:
+        return
+    with _live_worker_processes_lock:
+        _live_worker_processes[int(pid)] = proc
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -9990,6 +10010,8 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
     """
     if not pid or pid <= 0:
         return
+    with _live_worker_processes_lock:
+        _live_worker_processes.pop(int(pid), None)
     now = time.time()
     _recent_worker_exits[int(pid)] = (int(raw_status), now)
     # Age-based trim: drop entries older than the TTL.
@@ -14305,6 +14327,7 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    _retain_worker_process(proc)
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's

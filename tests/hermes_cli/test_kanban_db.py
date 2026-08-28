@@ -3123,6 +3123,38 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name == "nt", reason="waitpid registry is POSIX-only")
+def test_retained_worker_preserves_interrupted_exit_status():
+    """Unrelated Popen cleanup cannot consume a worker's neutral sentinel."""
+    import hermes_cli.kanban_db as _kb
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", f"raise SystemExit({_kb.KANBAN_INTERRUPTED_EXIT_CODE})"]
+    )
+    _kb._retain_worker_process(proc)
+    pid = proc.pid
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if pid in _kb.reap_worker_zombies():
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("retained worker was not reaped")
+
+        assert _kb._classify_worker_exit(pid) == (
+            "interrupted",
+            _kb.KANBAN_INTERRUPTED_EXIT_CODE,
+        )
+        assert pid not in _kb._live_worker_processes
+    finally:
+        _kb._live_worker_processes.pop(pid, None)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 
 
 

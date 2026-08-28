@@ -21501,12 +21501,27 @@ def main(
         # the flush against any rare blocking-I/O case (the reporter measured
         # flush in <1ms; the alarm is a failsafe, not the common path).
         if os.environ.get("HERMES_KANBAN_TASK"):
+            # A signal-driven worker stop is a neutral orchestration
+            # interruption, not clean task success.  The normal one-shot path
+            # already returns this sentinel when ``run_conversation`` reports
+            # ``interrupted``; use the same code on the emergency os._exit
+            # path so the dispatcher resumes the exact session without
+            # charging the task's crash/protocol-violation budgets.
+            try:
+                from hermes_cli.kanban_db import (
+                    KANBAN_INTERRUPTED_EXIT_CODE as _kanban_interrupt_exit,
+                )
+            except Exception:
+                _kanban_interrupt_exit = 77
             try:
                 import signal as _sig_mod
                 if hasattr(_sig_mod, "SIGALRM"):
                     # Cancel any pre-existing alarm to avoid colliding with
                     # caller-installed timers.
-                    _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
+                    _sig_mod.signal(
+                        _sig_mod.SIGALRM,
+                        lambda *_: os._exit(_kanban_interrupt_exit),
+                    )
                     _sig_mod.alarm(5)
             except Exception:
                 pass
@@ -21528,7 +21543,7 @@ def main(
                     _stream.flush()
                 except Exception:
                     pass
-            os._exit(0)
+            os._exit(_kanban_interrupt_exit)
         raise KeyboardInterrupt()
     try:
         import signal as _signal

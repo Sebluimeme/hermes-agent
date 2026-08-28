@@ -11,9 +11,9 @@ dispatcher's ``_pid_alive`` check returns True forever, and the task stays
 ``running`` indefinitely.
 
 The fix: when the process is a dispatcher-spawned worker (``HERMES_KANBAN_TASK``
-env var set), flush logging + stdout/stderr and call ``os._exit(0)`` instead.
+env var set), flush logging + stdout/stderr and call ``os._exit(77)`` instead.
 The kernel reclaims the PID immediately, and ``detect_crashed_workers``
-reclaims the stale claim on the next dispatcher tick.
+classifies the sentinel as a neutral interruption on the next dispatcher tick.
 
 These tests use a synthetic Python script that mirrors the cli.py signal
 handler shape so we can exercise the exit-path contract without booting the
@@ -59,13 +59,13 @@ def _synthetic_worker_script() -> str:
             if os.environ.get("HERMES_KANBAN_TASK"):
                 try:
                     if hasattr(signal, "SIGALRM"):
-                        signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
+                        signal.signal(signal.SIGALRM, lambda *_: os._exit(77))
                         signal.alarm(2)
                 except Exception:
                     pass
                 sys.stdout.flush()
                 sys.stderr.flush()
-                os._exit(0)
+                os._exit(77)
             raise KeyboardInterrupt()
 
         signal.signal(signal.SIGTERM, handler)
@@ -166,13 +166,14 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
         t0 = time.time()
         os.kill(proc.pid, signal.SIGTERM)
 
-        # Should die in <2s. The handler sleeps ~50ms, then os._exit(0)
+        # Should die in <2s. The handler sleeps ~50ms, then os._exit(77)
         # is immediate. Give generous headroom for slow CI runners.
         deadline = t0 + 2.0
         while time.time() < deadline:
             if not _is_alive_like_dispatcher(proc.pid):
                 elapsed = time.time() - t0
                 assert elapsed < 2.0
+                assert proc.wait(timeout=1) == 77
                 return
             time.sleep(0.02)
         pytest.fail(
@@ -214,5 +215,4 @@ def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path():
             pass
     finally:
         _cleanup(proc)
-
 
