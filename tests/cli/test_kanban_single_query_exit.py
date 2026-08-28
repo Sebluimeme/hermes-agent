@@ -11,6 +11,7 @@ import cli as cli_mod
 from cli import _single_query_exit_code
 from hermes_cli.kanban_db import (
     KANBAN_GUARDRAIL_HALT_EXIT_CODE,
+    KANBAN_INTERRUPTED_EXIT_CODE,
     KANBAN_RATE_LIMIT_EXIT_CODE,
 )
 
@@ -50,6 +51,26 @@ def test_kanban_guardrail_halt_uses_strategy_retry_sentinel(monkeypatch):
             "guardrail": {"code": "repeated_exact_failure_block"},
         }
     ) == KANBAN_GUARDRAIL_HALT_EXIT_CODE
+
+
+def test_kanban_interrupted_turn_uses_neutral_resume_sentinel(monkeypatch):
+    """An interrupted worker turn must not masquerade as clean success."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_interrupted")
+
+    assert _single_query_exit_code(
+        {
+            "failed": False,
+            "interrupted": True,
+            "interrupt_message": "orchestrator continuation",
+        }
+    ) == KANBAN_INTERRUPTED_EXIT_CODE
+
+
+def test_non_kanban_interrupted_single_query_keeps_normal_contract(monkeypatch):
+    """Human one-shot interruptions are outside the Kanban exit protocol."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    assert _single_query_exit_code({"interrupted": True}) == 0
 
 
 def test_human_kanban_single_query_failed_turn_exits_nonzero(monkeypatch):

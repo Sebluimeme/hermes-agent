@@ -389,6 +389,52 @@ def test_guardrail_halt_requeues_checkpoint_without_counting_failure(
     assert event is not None
 
 
+def test_interrupted_exit_requeues_exact_session_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """An orchestration interruption is a neutral resumable yield."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="interrupted", assignee="a")
+        pid = 70993
+        kb.claim_task(conn, tid, claimer=f"{host}:interrupted")
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, last_failure_error='stale' WHERE id=?",
+            (pid, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET metadata=? WHERE id=?",
+            ('{"worker_session_id":"sess-resume"}', run_id),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            pid, _exited_status(_kb.KANBAN_INTERRUPTED_EXIT_CODE)
+        )
+
+        assert tid not in kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        neutral = getattr(
+            _kb.detect_crashed_workers, "_last_interrupted", []
+        )
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE id=?", (run_id,),
+        ).fetchone()
+
+    assert task.status == "ready"
+    assert task.consecutive_failures == 0
+    assert task.last_failure_error is None
+    assert tid in neutral
+    assert run["outcome"] == "interrupted"
+    assert json.loads(run["metadata"])["automatic_resume"] is True
+    assert _kb._transient_resume_session_id(tid, board=None) == "sess-resume"
+
+
 def test_protocol_violation_elapsed_uses_current_run_start(
     kanban_home, monkeypatch,
 ):

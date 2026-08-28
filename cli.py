@@ -21122,6 +21122,17 @@ def _single_query_exit_code(result: object) -> int:
     if (
         os.environ.get("HERMES_KANBAN_TASK")
         and isinstance(result, dict)
+        and result.get("interrupted")
+    ):
+        try:
+            from hermes_cli.kanban_db import KANBAN_INTERRUPTED_EXIT_CODE
+
+            return KANBAN_INTERRUPTED_EXIT_CODE
+        except Exception:
+            return 1
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and isinstance(result, dict)
         and result.get("guardrail")
     ):
         try:

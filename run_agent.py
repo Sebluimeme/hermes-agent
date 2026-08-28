@@ -3341,6 +3341,33 @@ class AIAgent:
             else ("user sent a new message" if message else "user interrupt")
         )
 
+        # Dispatcher-owned workers have no interactive input surface of their
+        # own.  If one is interrupted, record the concrete call site (never the
+        # arbitrary message text) so a recurring orchestration source can be
+        # identified without guessing from the generic process-tool note.
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            try:
+                import inspect as _inspect
+
+                _caller = _inspect.currentframe().f_back
+                _caller_code = getattr(_caller, "f_code", None)
+                logger.warning(
+                    "Kanban worker interrupt requested: task=%s session=%s "
+                    "hard_cancel=%s reason=%s caller=%s:%s:%s",
+                    os.environ.get("HERMES_KANBAN_TASK"),
+                    getattr(self, "session_id", None),
+                    hard_cancel,
+                    tool_interrupt_reason,
+                    getattr(_caller_code, "co_filename", "<unknown>"),
+                    getattr(_caller, "f_lineno", 0),
+                    getattr(_caller_code, "co_name", "<unknown>"),
+                )
+            except Exception:
+                logger.debug(
+                    "Could not capture Kanban interrupt call site",
+                    exc_info=True,
+                )
+
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:

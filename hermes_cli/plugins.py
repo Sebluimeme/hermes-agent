@@ -314,10 +314,11 @@ VALID_HOOKS: Set[str] = {
     # reclaim/accounting txn has committed. Exit visibility latency is
     # bounded by the dispatcher tick interval. Adds:
     #   worker_pid: int,
-    #   exit_kind: "clean_exit" | "rate_limited" | "nonzero_exit"
-    #              | "signaled" | "unknown",
+    #   exit_kind: "clean_exit" | "rate_limited" | "guardrail_halt"
+    #              | "interrupted" | "nonzero_exit" | "signaled" | "unknown",
     #   exit_code: int | None,
-    #   outcome: "crashed" | "rate_limited",
+    #   outcome: "crashed" | "rate_limited" | "strategy_required"
+    #            | "interrupted",
     #   retry_status: str  (the phase the task was released back to).
     "on_kanban_worker_exited",
     # on_kanban_worker_stale_claim fires when release_stale_claims reclaims
@@ -345,7 +346,8 @@ VALID_HOOKS: Set[str] = {
     #   outcome: "ok" | "skipped_locked" | "idle",
     #   result: hermes_cli.kanban_db.DispatchResult (spawned, reclaimed,
     #     promoted, reconciled_orphans, crashed, stale, timed_out,
-    #     auto_blocked, rate_limited, auto_assigned_default,
+    #     auto_blocked, rate_limited, strategy_required, interrupted,
+    #     auto_assigned_default,
     #     respawn_guarded, skipped_per_profile_capped, skipped_unassigned,
     #     skipped_nonspawnable, skipped_locked).
     #   Privacy: result carries task ids, assignees, and workspace paths.

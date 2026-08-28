@@ -504,6 +504,14 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # worker contract.
 KANBAN_GUARDRAIL_HALT_EXIT_CODE = 76
 
+# Sentinel used when a dispatcher-owned one-shot worker's agent loop reports a
+# graceful interruption before it could call a terminal Kanban tool.  This is
+# infrastructure steering/cancellation, not a successful worker exit and not a
+# task failure.  A dedicated code keeps it out of the clean-exit protocol-
+# violation circuit while preserving the exact worker session for immediate
+# resume.  77 is otherwise unused by the worker contract.
+KANBAN_INTERRUPTED_EXIT_CODE = 77
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -9942,6 +9950,10 @@ class DispatchResult:
     """Task ids whose workers stopped on the repeated-tool guardrail and were
     released back to their source phase without consuming a failure.  The next
     run resumes the exact session and must change strategy."""
+    interrupted: list[str] = field(default_factory=list)
+    """Task ids whose dispatcher-owned worker turn was interrupted before a
+    terminal Kanban call.  They are released to their source phase without
+    consuming a failure and resume the exact durable session."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -10026,6 +10038,10 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     * ``"guardrail_halt"`` — ``WIFEXITED`` with status
       ``KANBAN_GUARDRAIL_HALT_EXIT_CODE``. The worker intentionally stopped a
       repeated failing tool call; resume its checkpoint with a new strategy.
+    * ``"interrupted"`` — ``WIFEXITED`` with status
+      ``KANBAN_INTERRUPTED_EXIT_CODE``. The one-shot worker was interrupted by
+      orchestration before a terminal Kanban call; resume its exact session
+      without charging the task's failure/protocol-violation budgets.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -10049,6 +10065,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("rate_limited", code)
             if code == KANBAN_GUARDRAIL_HALT_EXIT_CODE:
                 return ("guardrail_halt", code)
+            if code == KANBAN_INTERRUPTED_EXIT_CODE:
+                return ("interrupted", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -11294,6 +11312,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     crashed: list[str] = []
     rate_limited: list[str] = []
     strategy_required: list[str] = []
+    interrupted: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -11338,6 +11357,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             guardrail_halt_exit = False
+            interrupted_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -11417,6 +11437,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "exit_code": code,
                     "checkpoint_preserved": True,
                 }
+            elif kind == "interrupted":
+                protocol_violation = False
+                interrupted_exit = True
+                error_text = (
+                    "dispatcher-owned worker turn was interrupted before a "
+                    "terminal Kanban call; durable checkpoint and exact "
+                    "session preserved for automatic resume"
+                )
+                event_kind = "interrupted"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "checkpoint_preserved": True,
+                    "automatic_resume": True,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -11452,6 +11488,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 _run_outcome = (
                     "rate_limited" if rate_limited_exit
                     else "strategy_required" if guardrail_halt_exit
+                    else "interrupted" if interrupted_exit
                     else "crashed"
                 )
                 run_id = _end_run(
@@ -11501,6 +11538,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     strategy_required.append(row["id"])
+                elif interrupted_exit:
+                    # This is neutral orchestration yield, not a failure.  Do
+                    # not retain a stale red error on a healthy resumed card.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = NULL WHERE id = ?",
+                        (row["id"],),
+                    )
+                    interrupted.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -11622,6 +11667,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     detect_crashed_workers._last_strategy_required = strategy_required  # type: ignore[attr-defined]
+    detect_crashed_workers._last_interrupted = interrupted  # type: ignore[attr-defined]
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -12876,6 +12922,11 @@ def _dispatch_once_locked(
     )
     if _crash_strategy_required:
         result.strategy_required.extend(_crash_strategy_required)
+    _crash_interrupted = getattr(
+        detect_crashed_workers, "_last_interrupted", []
+    )
+    if _crash_interrupted:
+        result.interrupted.extend(_crash_interrupted)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
@@ -13919,7 +13970,7 @@ def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optio
             )
             if previous is None or previous.outcome not in {
                 "blocked", "rate_limited", "crashed", "timed_out", "stale",
-                "review_deferred", "reclaimed", "scheduled",
+                "review_deferred", "reclaimed", "scheduled", "interrupted",
             }:
                 return None
             if previous.profile and task.assignee and previous.profile != task.assignee:
