@@ -9700,10 +9700,12 @@ class DispatchResult:
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
     skipped_workspace_busy: list[tuple[str, str, str]] = field(default_factory=list)
-    """Tasks held because another live card owns the exact same workspace.
+    """Tasks held because another live card owns an overlapping workspace.
 
-    Entries are ``(task_id, workspace_path, owner_task_id)``. This is a normal
-    serialization wait, not a provider failure or human blocker.
+    Entries are ``(task_id, workspace_scope, owner_task_id)``. The owner may
+    also be a just-terminated worker protected by the one-tick exit barrier.
+    This is a normal serialization wait, not a provider failure or human
+    blocker.
     """
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
@@ -12427,8 +12429,25 @@ def _dispatch_once_locked(
     result = DispatchResult()
     # Contracts are created only by _set_worker_pid after a dispatcher spawn.
     # A manual Claude/Desktop session has no contract and cannot be stopped.
+    # Snapshot their workspaces before reconcile changes contract state: a
+    # terminal worker receives SIGTERM during reconcile, but signal delivery
+    # is asynchronous. Its successor must not enter the same/overlapping Git
+    # checkout in this very tick while the old process is still unwinding.
     from hermes_cli import worker_contracts as _worker_contracts
-    _worker_contracts.reconcile(conn)
+    _active_contract_workspaces = {
+        row["task_id"]: row["workspace_path"]
+        for row in conn.execute(
+            "SELECT task_id, workspace_path FROM worker_contracts "
+            "WHERE state = 'active'"
+        )
+        if row["workspace_path"]
+    }
+    _contract_actions = _worker_contracts.reconcile(conn)
+    _contract_exit_barriers = [
+        (_active_contract_workspaces[action["task_id"]], action["task_id"])
+        for action in _contract_actions
+        if action.get("task_id") in _active_contract_workspaces
+    ]
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -12530,6 +12549,13 @@ def _dispatch_once_locked(
         )
         if _key:
             _occupied_workspaces.setdefault(_key, _workspace_row["id"])
+    # One-tick exit barrier for contracts reconciled above. The next dispatcher
+    # tick re-evaluates the real board/process state after SIGTERM has had time
+    # to take effect; no blind sleep and no duplicate writer are needed.
+    for _barrier_path, _barrier_task_id in _contract_exit_barriers:
+        _key = _workspace_occupancy_key("dir", _barrier_path)
+        if _key:
+            _occupied_workspaces.setdefault(_key, _barrier_task_id)
 
     ready_rows = conn.execute(
         "SELECT id, assignee, routing_tier, workspace_kind, workspace_path FROM tasks "

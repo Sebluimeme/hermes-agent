@@ -900,6 +900,55 @@ def test_dispatch_keeps_nested_sibling_repositories_parallel(
     assert len(spawned) == 2
 
 
+def test_dispatch_waits_one_tick_for_terminal_worker_exit_barrier(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A successor cannot spawn in the tick that SIGTERMs its predecessor."""
+    from hermes_cli import worker_contracts
+
+    workspace = kanban_home / "shared-workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        predecessor = kb.create_task(
+            conn, title="completed predecessor", assignee="coder",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        assert kb.complete_task(conn, predecessor)
+        successor = kb.create_task(
+            conn, title="successor", assignee="researcher",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        conn.execute(
+            "INSERT INTO worker_contracts("
+            "task_id,run_id,profile,pid,start_identity,workspace_path,created_at,state"
+            ") VALUES(?,?,?,?,?,?,?,'active')",
+            (predecessor, 1, "coder", 4242, "identity", str(workspace), int(time.time())),
+        )
+
+        monkeypatch.setattr(
+            worker_contracts,
+            "reconcile",
+            lambda _conn: [{
+                "task_id": predecessor,
+                "pid": 4242,
+                "reason": "task_done",
+                "stopped": True,
+            }],
+        )
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, path, **_kwargs: spawned.append((task.id, path)) or 4243,
+            max_spawn=1,
+        )
+
+    assert result.spawned == []
+    assert result.skipped_workspace_busy == [
+        (successor, str(workspace.resolve()), predecessor),
+    ]
+    assert spawned == []
+
+
 def test_local_claude2_failure_does_not_fallback_to_another_executor(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="repair proxy", assignee="claude2")
