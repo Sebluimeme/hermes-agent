@@ -11738,11 +11738,13 @@ def check_respawn_guard(
     Checks in priority order:
 
     ``"rate_limit_cooldown"``
-        The task's most recent run ended with the ``rate_limited`` outcome
-        (a worker bailed on a provider quota wall via the EX_TEMPFAIL
-        sentinel) within ``_resolve_rate_limit_cooldown_seconds()``. The
-        quota almost certainly hasn't reset yet, so defer the respawn until
-        the cooldown elapses — then allow a cheap probe. This is checked
+        The task's most recent run on its currently assigned profile ended
+        with the ``rate_limited`` outcome (a worker bailed on a provider quota
+        wall via the EX_TEMPFAIL sentinel) within
+        ``_resolve_rate_limit_cooldown_seconds()``. The quota almost certainly
+        hasn't reset yet, so defer the respawn until the cooldown elapses —
+        then allow a cheap probe. Reassignment to a different profile bypasses
+        the old profile's cooldown. This is checked
         BEFORE ``blocker_auth`` because the rate-limit requeue stamps a
         quota-flavored ``last_failure_error`` that would otherwise match the
         auth-blocker regex and park the task forever (the rate-limit path
@@ -11777,7 +11779,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -11785,9 +11787,10 @@ def check_respawn_guard(
 
     now = int(time.time())
 
-    # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
-    #    (quota wall) — defer while inside the cooldown window, then allow a
-    #    cheap probe. Must run BEFORE the blocker_auth regex check, because a
+    # 1. Rate-limit cooldown. The most recent run on the currently assigned
+    #    profile ended ``rate_limited`` (quota wall) — defer while inside the
+    #    cooldown window, then allow a cheap probe. Must run BEFORE the
+    #    blocker_auth regex check, because a
     #    rate-limit requeue stamps a quota-flavored last_failure_error that
     #    the regex would otherwise match → defer forever (no failure counter
     #    increment on this path means the breaker can never free it).
@@ -11797,7 +11800,7 @@ def check_respawn_guard(
     #    no longer applies and the normal paths take over.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
-        "SELECT outcome, ended_at FROM task_runs "
+        "SELECT outcome, ended_at, profile FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
@@ -11805,6 +11808,7 @@ def check_respawn_guard(
     if (
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
+        and latest_run["profile"] == row["assignee"]
     ):
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
@@ -11882,12 +11886,18 @@ def check_respawn_guard(
     return None
 
 
-def _has_spawnable_unoccupied(conn: sqlite3.Connection, status: str) -> bool:
+def _has_spawnable_unoccupied(
+    conn: sqlite3.Connection,
+    status: str,
+    *,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> bool:
     """Return whether ``status`` contains work that can run *now*.
 
-    An assigned card sharing the exact workspace of a running card is healthy
-    queued work, not evidence that the dispatcher is stuck.  Keep the health
-    probe aligned with the dispatcher's single-writer workspace guard.
+    An assigned card sharing the workspace of a running card, or assigned to a
+    profile already at its configured concurrency cap, is healthy queued work,
+    not evidence that the dispatcher is stuck.  Keep the health probe aligned
+    with the dispatcher's workspace and per-profile guards.
     """
     rows = conn.execute(
         "SELECT id, assignee, workspace_kind, workspace_path FROM tasks "
@@ -11916,8 +11926,28 @@ def _has_spawnable_unoccupied(conn: sqlite3.Connection, status: str) -> bool:
     except Exception:
         profile_exists = None
 
+    per_profile_cap = (
+        max_in_progress_per_profile
+        if isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+        else None
+    )
+    per_profile_running: dict[str, int] = {}
+    if per_profile_cap is not None:
+        for running in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        ):
+            per_profile_running[running["assignee"]] = int(running["n"])
+
     for row in rows:
         if profile_exists is not None and not profile_exists(row["assignee"]):
+            continue
+        if (
+            per_profile_cap is not None
+            and per_profile_running.get(row["assignee"], 0) >= per_profile_cap
+        ):
             continue
         key = _workspace_occupancy_key(
             row["workspace_kind"], row["workspace_path"],
@@ -11928,9 +11958,14 @@ def _has_spawnable_unoccupied(conn: sqlite3.Connection, status: str) -> bool:
     return False
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    *,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a real Hermes profile and still has profile
+    capacity when ``max_in_progress_per_profile`` is configured.
 
     Used by the gateway- and CLI-embedded dispatchers' health telemetry to
     decide whether ``0 spawned`` is a "stuck" condition (real spawnable
@@ -11942,18 +11977,31 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
     """
-    return _has_spawnable_unoccupied(conn, "ready")
+    return _has_spawnable_unoccupied(
+        conn,
+        "ready",
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(
+    conn: sqlite3.Connection,
+    *,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    whose assignee maps to a real Hermes profile and still has profile
+    capacity when ``max_in_progress_per_profile`` is configured.
 
     Mirror of :func:`has_spawnable_ready` for the review column —
     used by the health telemetry to decide whether the dispatcher
     should have spawned a review agent.
     """
-    return _has_spawnable_unoccupied(conn, "review")
+    return _has_spawnable_unoccupied(
+        conn,
+        "review",
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
 
 
 def review_dispatch_enabled() -> bool:
@@ -12562,7 +12610,14 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "AND queue_class = 'active' "
         "AND (next_retry_at IS NULL OR next_retry_at <= CAST(strftime('%s','now') AS INTEGER)) "
-        "ORDER BY priority DESC, created_at ASC"
+        # Resume a failed/timed-out checkpoint before starting unrelated fresh
+        # work on the same scarce profile. This is especially important for
+        # shared checkouts: the retry owns any durable uncommitted changes it
+        # left behind, while a fresh sibling must not inherit and accidentally
+        # commit them. Rate-limit exits keep consecutive_failures=0, so an
+        # exhausted provider does not monopolize the head of the queue.
+        "ORDER BY CASE WHEN consecutive_failures > 0 THEN 0 ELSE 1 END, "
+        "priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
     # budget split below can see whether review work exists at all.

@@ -2242,8 +2242,8 @@ class GatewayKanbanWatchersMixin:
 
         def _ready_nonempty() -> bool:
             """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+            task on ANY board whose assignee maps to a real Hermes profile and
+            has capacity (i.e. one the dispatcher would actually spawn for)?
 
             Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
             ``orion-research``) are pulled by terminals via
@@ -2263,14 +2263,46 @@ class GatewayKanbanWatchersMixin:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            # A full configured concurrency budget is healthy backpressure,
+            # not a stuck dispatcher. Count once across active boards for the
+            # host-level cap; the per-board cap is checked inside the loop.
+            total_running = 0
+            if max_in_progress is not None:
+                for b in boards:
+                    slug = b.get("slug") or _kb.DEFAULT_BOARD
+                    conn = None
+                    try:
+                        conn = _kb.connect(board=slug)
+                        total_running += _kb.count_running_tasks(conn)
+                    except Exception:
+                        continue
+                    finally:
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                if total_running >= max_in_progress:
+                    return False
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    if (
+                        max_spawn is not None
+                        and _kb.count_running_tasks(conn) >= max_spawn
+                    ):
+                        continue
+                    if _kb.has_spawnable_ready(
+                        conn,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                    ):
                         return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
+                    if _review_probe and _kb.has_spawnable_review(
+                        conn,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                    ):
                         return True
                 except Exception:
                     continue

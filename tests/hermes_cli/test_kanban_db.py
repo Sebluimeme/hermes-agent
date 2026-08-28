@@ -419,6 +419,39 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_does_not_transfer_rate_limit_to_new_profile(
+    kanban_home, monkeypatch,
+):
+    """An explicit reassignment must bypass the exhausted profile's cooldown."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reroute-rl", assignee="spark")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("provider quota wall", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        assert kb.assign_task(conn, tid, "coder") is True
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_dispatch_fails_closed_for_claude_cooldown_unknown_and_expired_preflight(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
@@ -822,6 +855,76 @@ def test_dispatch_serializes_two_tasks_sharing_the_same_workspace(
     assert second_task is not None and second_task.status == "ready"
     assert spawnable_while_first_runs is False
     assert spawned == [(first, str(workspace.resolve()))]
+
+
+def test_health_probe_ignores_ready_work_for_a_profile_at_capacity(
+    kanban_home, all_assignees_spawnable,
+):
+    """A preloaded same-profile card is healthy queued work, not a stall."""
+    running_workspace = kanban_home / "running-worktree"
+    ready_workspace = kanban_home / "ready-worktree"
+    running_workspace.mkdir()
+    ready_workspace.mkdir()
+
+    with kb.connect() as conn:
+        running = kb.create_task(
+            conn, title="running", assignee="coder",
+            workspace_kind="dir", workspace_path=str(running_workspace),
+        )
+        kb.claim_task(conn, running)
+        kb.create_task(
+            conn, title="preloaded", assignee="coder",
+            workspace_kind="dir", workspace_path=str(ready_workspace),
+        )
+
+        assert kb.has_spawnable_ready(conn) is True
+        assert kb.has_spawnable_ready(
+            conn, max_in_progress_per_profile=1,
+        ) is False
+
+
+def test_dispatch_resumes_failed_checkpoint_before_fresh_same_profile_work(
+    kanban_home, all_assignees_spawnable,
+):
+    """A retry keeps ownership of its durable checkout state before new work."""
+    fresh_workspace = kanban_home / "fresh-worktree"
+    retry_workspace = kanban_home / "retry-worktree"
+    fresh_workspace.mkdir()
+    retry_workspace.mkdir()
+    spawned = []
+
+    def fake_spawn(task, resolved_workspace, **_kwargs):
+        spawned.append((task.id, resolved_workspace))
+        return 95_001
+
+    with kb.connect() as conn:
+        fresh = kb.create_task(
+            conn, title="older fresh task", assignee="coder",
+            workspace_kind="dir", workspace_path=str(fresh_workspace),
+        )
+        retry = kb.create_task(
+            conn, title="newer checkpoint retry", assignee="coder",
+            workspace_kind="dir", workspace_path=str(retry_workspace),
+        )
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=1 WHERE id=?", (retry,),
+        )
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=2,
+            max_in_progress_per_profile=1,
+        )
+
+    assert result.spawned == [
+        (retry, "coder", str(retry_workspace.resolve())),
+    ]
+    assert result.skipped_per_profile_capped == [
+        (fresh, "coder", 1),
+    ]
+    assert spawned == [(retry, str(retry_workspace.resolve()))]
 
 
 def test_dispatch_serializes_parent_checkout_against_nested_repository(
