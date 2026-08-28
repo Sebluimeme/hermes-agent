@@ -73,8 +73,57 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
+DEFAULT_MEMORY_LIMIT_MB = 2048
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+
+
+def _bounded_local_child_argv(
+    child_python: str,
+    script_path: str,
+    memory_limit_mb: int,
+) -> Tuple[List[str], str]:
+    """Return a private-cgroup argv for a live gateway child when possible.
+
+    ``execute_code`` used to launch generated Python directly inside the
+    gateway/kanban-worker cgroup.  A single accidental aggregate analysis
+    reached 8.7 GiB and let the kernel OOM-kill the messaging control plane.
+    A transient user scope gives the generated script its own finite memory
+    domain.  If it exceeds the bound, the tool call fails and the parent agent
+    can recover from its durable checkpoint; the gateway remains alive.
+
+    CLI runs and platforms without a usable user systemd instance retain the
+    portable direct-spawn path.  Setting ``memory_limit_mb`` to zero disables
+    the optional containment explicitly.
+    """
+    direct = [child_python, script_path]
+    if (
+        _IS_WINDOWS
+        or memory_limit_mb <= 0
+        or os.environ.get("_HERMES_GATEWAY") != "1"
+    ):
+        return direct, ""
+    try:
+        from tools.process_registry import (
+            _build_systemd_scope_argv,
+            _systemd_run_user_scope_available,
+        )
+
+        if not _systemd_run_user_scope_available():
+            return direct, ""
+        suffix = f"code-{os.getpid()}-{uuid.uuid4().hex[:10]}"
+        argv = _build_systemd_scope_argv(
+            direct,
+            unit_suffix=suffix,
+            memory_max_bytes=int(memory_limit_mb) * 1024 * 1024,
+        )
+        return argv, f"hermes-worker-{suffix}.scope"
+    except Exception as exc:
+        logger.warning(
+            "execute_code memory scope unavailable; using direct child: %s",
+            exc,
+        )
+        return direct, ""
 
 
 def _assemble_stdout_result(
@@ -1362,6 +1411,12 @@ def execute_code(
     _cfg = _load_config()
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    try:
+        memory_limit_mb = int(
+            _cfg.get("memory_limit_mb", DEFAULT_MEMORY_LIMIT_MB)
+        )
+    except (TypeError, ValueError):
+        memory_limit_mb = DEFAULT_MEMORY_LIMIT_MB
 
     # Determine which tools the sandbox can call
     session_tools = set(enabled_tools) if enabled_tools else set()
@@ -1397,6 +1452,7 @@ def execute_code(
     exec_start = time.monotonic()
     server_sock = None
     stop_event = threading.Event()
+    child_scope_unit = ""
 
     try:
         # Write the auto-generated hermes_tools module.
@@ -1541,8 +1597,13 @@ def execute_code(
             _pp_parts.append(_existing_pp)
         child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
 
+        child_argv, child_scope_unit = _bounded_local_child_argv(
+            _child_python,
+            _script_path,
+            memory_limit_mb,
+        )
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            child_argv,
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,
@@ -1757,6 +1818,16 @@ def execute_code(
         }, ensure_ascii=False)
 
     finally:
+        if child_scope_unit:
+            try:
+                from tools.process_registry import _stop_systemd_unit
+                _stop_systemd_unit(child_scope_unit)
+            except Exception as exc:
+                logger.debug(
+                    "Could not collect execute_code scope %s: %s",
+                    child_scope_unit,
+                    exc,
+                )
         # Cleanup temp dir and socket
         if server_sock is not None:
             try:

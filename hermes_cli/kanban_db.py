@@ -12146,6 +12146,86 @@ MEMORY_GUARD_MB_PER_WORKER = 512
 DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
+# Every live Kanban worker is placed in its own transient systemd scope.  The
+# cap is deliberately high enough for one CPU Whisper-base transcription on
+# the reference 15-GiB workstation, but low enough to stop an accidental
+# aggregate scan before it can consume the host and kill the gateway.
+KANBAN_WORKER_MEMORY_DEFAULT_MB = 6144
+KANBAN_WORKER_MEMORY_MIN_MB = 512
+KANBAN_WORKER_MEMORY_MAX_MB = 8192
+
+
+def _kanban_worker_memory_max_bytes() -> int:
+    """Resolve the finite per-Kanban-worker cgroup limit.
+
+    ``kanban.worker_memory_max_mb`` is operator-configurable but cannot exceed
+    8 GiB or half of physical RAM.  On small machines the physical bound wins,
+    while the 512-MiB floor keeps the unit startable for ordinary workers.
+    """
+    configured: Any = None
+    try:
+        from hermes_cli.config import load_config_readonly
+        configured = (load_config_readonly() or {}).get("kanban", {}).get(
+            "worker_memory_max_mb"
+        )
+    except Exception:
+        configured = None
+    try:
+        requested_mb = int(configured)
+    except (TypeError, ValueError):
+        requested_mb = KANBAN_WORKER_MEMORY_DEFAULT_MB
+    requested_mb = max(
+        KANBAN_WORKER_MEMORY_MIN_MB,
+        min(requested_mb, KANBAN_WORKER_MEMORY_MAX_MB),
+    )
+    try:
+        physical_mb = (
+            int(os.sysconf("SC_PHYS_PAGES"))
+            * int(os.sysconf("SC_PAGE_SIZE"))
+            // (1024 * 1024)
+        )
+        host_bound_mb = max(KANBAN_WORKER_MEMORY_MIN_MB, physical_mb // 2)
+        requested_mb = min(requested_mb, host_bound_mb)
+    except (OSError, ValueError, TypeError):
+        pass
+    return requested_mb * 1024 * 1024
+
+
+def _bounded_kanban_worker_argv(
+    cmd: list[str], task_id: str,
+) -> tuple[list[str], str]:
+    """Isolate a live gateway-spawned Kanban worker from the gateway cgroup."""
+    if _IS_WINDOWS or os.environ.get("_HERMES_GATEWAY") != "1":
+        return cmd, ""
+    try:
+        from tools.process_registry import (
+            _build_systemd_scope_argv,
+            _systemd_run_user_scope_available,
+        )
+
+        if not _systemd_run_user_scope_available():
+            _log.warning(
+                "kanban worker %s shares the gateway cgroup because the "
+                "user systemd scope is unavailable",
+                task_id,
+            )
+            return cmd, ""
+        safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id)[:48]
+        suffix = f"kanban-{safe_task}-{secrets.token_hex(5)}"
+        argv = _build_systemd_scope_argv(
+            cmd,
+            unit_suffix=suffix,
+            memory_max_bytes=_kanban_worker_memory_max_bytes(),
+        )
+        return argv, f"hermes-worker-{suffix}.scope"
+    except Exception as exc:
+        _log.warning(
+            "kanban worker %s memory scope unavailable; using direct spawn: %s",
+            task_id,
+            exc,
+        )
+        return cmd, ""
+
 
 def _system_memory_sample() -> dict:
     """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
@@ -13955,10 +14035,13 @@ def _default_spawn(
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
+    spawn_cmd, worker_scope_unit = _bounded_kanban_worker_argv(cmd, task.id)
+    if worker_scope_unit:
+        env["HERMES_KANBAN_SYSTEMD_UNIT"] = worker_scope_unit
     log_f = open(log_path, "ab")
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
+            spawn_cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
             stdin=subprocess.DEVNULL,
             stdout=log_f,

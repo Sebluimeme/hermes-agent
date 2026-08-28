@@ -89,6 +89,51 @@ agent:
         assert required in pinned
 
 
+def test_default_spawn_isolates_live_gateway_worker_in_memory_scope(
+    monkeypatch, tmp_path,
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        "tools.process_registry._systemd_run_user_scope_available",
+        lambda: True,
+    )
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    kb._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
+
+    assert captured["cmd"][0] == "/usr/bin/systemd-run"
+    assert "--scope" in captured["cmd"]
+    memory_prop = next(x for x in captured["cmd"] if x.startswith("MemoryMax="))
+    assert 512 * 1024 * 1024 <= int(memory_prop.split("=", 1)[1]) <= 8 * 1024 * 1024 * 1024
+    assert captured["env"]["HERMES_KANBAN_SYSTEMD_UNIT"].startswith(
+        "hermes-worker-kanban-t_spawn_tools-"
+    )
+    assert "hermes" in captured["cmd"][captured["cmd"].index("--") + 1:]
+
+
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
     """The dispatcher's pre-``chat`` model flag must reach ``args.model``.
 

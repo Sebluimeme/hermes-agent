@@ -1807,6 +1807,19 @@ class TestSystemdCgroupIsolation:
         # The session must record the unit name so kill_process can stop it.
         assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
 
+    def test_scope_builder_accepts_a_stricter_call_site_limit(self, monkeypatch):
+        """Nested execute-code/Kanban scopes can provide their own finite cap."""
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+        from tools.process_registry import _build_systemd_scope_argv
+
+        argv = _build_systemd_scope_argv(
+            ["/usr/bin/python3", "script.py"],
+            unit_suffix="bounded-child",
+            memory_max_bytes=2 * 1024 * 1024 * 1024,
+        )
+
+        assert "MemoryMax=2147483648" in argv
+
     def test_falls_back_when_systemd_run_unavailable(self, registry, monkeypatch, _gateway_identity):
         """Under a supervisor but without systemd-run, fall back to the
         legacy ``start_new_session=True`` path (worker shares the gateway

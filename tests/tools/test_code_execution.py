@@ -47,8 +47,28 @@ from tools.code_execution_tool import (
     _TOOL_DOC_LINES,
     _execute_remote,
     _format_interrupted_output,
+    _bounded_local_child_argv,
 )
 from tools.registry import registry
+
+
+def test_bounded_local_child_uses_private_scope_in_gateway(monkeypatch):
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setattr(
+        "tools.process_registry._systemd_run_user_scope_available",
+        lambda: True,
+    )
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+    argv, unit = _bounded_local_child_argv(
+        "/usr/bin/python3", "/tmp/script.py", 2048
+    )
+
+    assert argv[0] == "/usr/bin/systemd-run"
+    assert "MemoryMax=2147483648" in argv
+    assert argv[-2:] == ["/usr/bin/python3", "/tmp/script.py"]
+    assert unit.startswith("hermes-worker-code-")
+    assert unit.endswith(".scope")
 
 
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):

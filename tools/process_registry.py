@@ -283,6 +283,8 @@ def _is_supervised_gateway_process() -> bool:
 def _build_systemd_scope_argv(
     shell_argv: List[str],
     unit_suffix: str,
+    *,
+    memory_max_bytes: Optional[int] = None,
 ) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation.
 
@@ -299,7 +301,13 @@ def _build_systemd_scope_argv(
         # guard anyway so we never pass None into Popen.
         return shell_argv
     unit_name = f"hermes-worker-{unit_suffix}"
-    memory_max = _worker_memory_max_bytes()
+    memory_max = (
+        int(memory_max_bytes)
+        if memory_max_bytes is not None
+        else _worker_memory_max_bytes()
+    )
+    if memory_max < _MIN_WORKER_MEMORY_MAX_BYTES:
+        memory_max = _MIN_WORKER_MEMORY_MAX_BYTES
     return [
         binary,
         "--user",
