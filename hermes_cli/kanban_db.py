@@ -127,6 +127,11 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# A transient worker stop is a resumable yield, not a human blocker. Keep a
+# short delay so the exiting worker has time to release its process/workspace
+# barrier before the dispatcher reclaims the exact checkpointed session.
+TRANSIENT_RETRY_DELAY_SECONDS = 10
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -2975,6 +2980,50 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "previous_last_failure_error": row["last_failure_error"],
             },
         )
+
+    # Before transient blocks became first-class autonomous retries, they were
+    # stored as human ``blocked`` cards with no retry timestamp. Repair that
+    # provable legacy shape at startup so upgrading the runtime also wakes
+    # already-stranded checkpoints (including long-running data jobs) without
+    # requiring an operator to find and unblock every card manually.
+    legacy_transient_blocks = (
+        conn.execute(
+            "SELECT id,mission_id FROM tasks "
+            "WHERE status='blocked' AND block_kind='transient'"
+        ).fetchall()
+        if {"id", "status", "block_kind"} <= repair_columns
+        else []
+    )
+    for row in legacy_transient_blocks:
+        source_status = _resume_status_from_events(conn, row["id"])
+        landing_status = _landing_status_after_parents(conn, row["id"])
+        retry_status = (
+            "review"
+            if landing_status == "ready" and source_status == "review"
+            else landing_status
+        )
+        retry_at = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status=?,execution_status='retrying',"
+            "failure_class='transient',next_retry_at=?,action_required=NULL "
+            "WHERE id=? AND status='blocked' AND block_kind='transient'",
+            (retry_status, retry_at, row["id"]),
+        )
+        conn.execute(
+            "UPDATE human_actions SET status='resolved',resolved_at=? "
+            "WHERE task_id=? AND kind='transient' AND status='open'",
+            (retry_at, row["id"]),
+        )
+        _append_event(
+            conn, row["id"], "legacy_transient_block_requeued",
+            {
+                "reason": "transient_blocks_now_resume_automatically",
+                "source_status": source_status,
+                "retry_status": retry_status,
+                "retry_at": retry_at,
+            },
+        )
+        _refresh_mission_status(conn, row["mission_id"])
 
     # The former Gemini policy parked otherwise-accepted visual candidates
     # until a distant retry time. The hash-bound Coder/GPT fallback makes that
@@ -7290,12 +7339,15 @@ def block_task(
       of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
       forcing a human-in-the-loop triage decision.
 
-    * ``transient`` — treated like a generic block for routing, but a worker
-      can use it to signal "this might clear on its own"; it still participates
-      in the loop breaker so a forever-flaky task eventually escalates.
+    * ``transient`` — an autonomous resumable yield. The active run is closed
+      with its checkpoint, the card returns to its source queue phase after a
+      short retry delay, and no human action is created. Repeated yields remain
+      observable through ``block_recurrences`` but never become a fake human
+      question.
 
-    Returns True on any successful transition (to ``blocked``, ``todo``, or
-    ``triage``), False when the task wasn't in a blockable state.
+    Returns True on any successful transition (to ``blocked``, ``todo``,
+    ``triage``, or an auto-retry source phase), False when the task wasn't in
+    a blockable state.
     """
     reason_rejection = block_reason_rejection(reason)
     if reason_rejection is not None:
@@ -7385,6 +7437,74 @@ def block_task(
                 run_id=run_id,
                 reason=reason,
             )
+            return True
+
+        # A transient stop never belongs in the human ``blocked`` bucket. The
+        # previous implementation parked it there with ``next_retry_at=NULL``
+        # and even opened a human action. A perfectly resumable long-running
+        # job could therefore leave every lane idle forever after writing a
+        # valid checkpoint. Close this run, retain the exact-session metadata,
+        # and let the ordinary dispatcher resume it automatically.
+        if kind == "transient":
+            same_cause = prev_kind == kind
+            recurrences = prev_recurrences + 1 if same_cause else 1
+            retry_status = (
+                source_status if source_status in {"ready", "review"} else "ready"
+            )
+            retry_at = int(time.time()) + TRANSIENT_RETRY_DELAY_SECONDS
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?,
+                       block_recurrences = ?,
+                       execution_status = 'retrying',
+                       failure_class = 'transient',
+                       action_required = NULL,
+                       next_retry_at = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                (retry_status, kind, recurrences, retry_at, task_id)
+                if expected_run_id is None
+                else (retry_status, kind, recurrences, retry_at, task_id, int(expected_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn, task_id,
+                outcome="blocked", status="blocked",
+                summary=reason,
+                metadata=metadata,
+            )
+            if run_id is None and reason:
+                run_id = _synthesize_ended_run(
+                    conn, task_id, outcome="blocked", summary=reason,
+                    metadata=metadata,
+                )
+            _append_event(
+                conn, task_id, "transient_retry_scheduled",
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    "source_status": source_status,
+                    "retry_status": retry_status,
+                    "retry_at": retry_at,
+                },
+                run_id=run_id,
+            )
+            # Repair an action left by the legacy transient-block behavior if
+            # this card was manually resumed once before the upgrade.
+            conn.execute(
+                "UPDATE human_actions SET status = 'resolved', resolved_at = ? "
+                "WHERE task_id = ? AND kind = 'transient' AND status = 'open'",
+                (int(time.time()), task_id),
+            )
+            _refresh_mission_status(conn, cur_row["mission_id"])
             return True
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
@@ -8101,6 +8221,10 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
+    For compatibility, calling this on an already auto-scheduled transient
+    retry accelerates it by clearing ``next_retry_at``. It deliberately keeps
+    ``block_kind='transient'`` so exact-session resume remains provable.
+
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
     is a no-op. If a future or external write left the pointer dangling,
@@ -8111,9 +8235,28 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status, mission_id FROM tasks WHERE id = ?",
+            "SELECT status, mission_id, block_kind, next_retry_at "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        if (
+            current
+            and current["status"] in {"ready", "review"}
+            and current["block_kind"] == "transient"
+            and current["next_retry_at"] is not None
+        ):
+            conn.execute(
+                "UPDATE tasks SET next_retry_at = NULL, "
+                "execution_status = 'pending', failure_class = NULL, "
+                "action_required = NULL WHERE id = ?",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "transient_retry_accelerated",
+                {"status": current["status"]},
+            )
+            _refresh_mission_status(conn, current["mission_id"])
+            return True
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"

@@ -1035,7 +1035,7 @@ def _handle_completion_ready(args: dict, **kw) -> str:
 
 
 def _handle_block(args: dict, **kw) -> str:
-    """Transition the task to blocked with a reason a human will read."""
+    """Route a task to a human block, dependency wait, or transient retry."""
     delegated_err = _reject_delegated_child_mutation("kanban_block")
     if delegated_err:
         return delegated_err
@@ -1066,8 +1066,8 @@ def _handle_block(args: dict, **kw) -> str:
             )
         # A transient block is explicitly safe to retry. Preserve this worker's
         # session id in the closed run so the dispatcher can resume the same
-        # conversation after an explicit unblock. Human/capability blocks keep
-        # their existing fresh-worker behavior.
+        # conversation automatically. Human/capability blocks keep their
+        # existing fresh-worker behavior.
         metadata = (
             _stamp_worker_session_metadata(tid, None)
             if kind == "transient"

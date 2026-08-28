@@ -7,6 +7,8 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 * ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
   never enter the human ``blocked`` bucket a cron would keep unblocking.
+* ``transient`` blocks return to the dispatchable phase with a bounded retry
+  time and exact-session checkpoint, without creating a human action.
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
@@ -17,6 +19,7 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -93,6 +96,81 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_transient_block_schedules_automatic_resume_without_human_action(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        before = int(time.time())
+
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="checkpoint durable écrit; reprendre le traitement restant",
+            kind="transient",
+            metadata={"worker_session_id": "session-checkpointed"},
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.execution_status == "retrying"
+        assert task.block_kind == "transient"
+        assert task.next_retry_at is not None
+        assert before < task.next_retry_at <= before + kb.TRANSIENT_RETRY_DELAY_SECONDS + 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM human_actions "
+            "WHERE task_id = ? AND status = 'open'",
+            (tid,),
+        ).fetchone()[0] == 0
+        events = kb.list_events(conn, tid)
+        assert events[-1].kind == "transient_retry_scheduled"
+        assert events[-1].payload["retry_status"] == "ready"
+
+    assert kb._transient_resume_session_id(
+        tid, board=kb.get_current_board(),
+    ) == "session-checkpointed"
+
+
+def test_init_requeues_a_legacy_transient_human_block(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy transient", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked',block_kind='transient',"
+                "execution_status='blocked',failure_class='transient',"
+                "action_required='reprendre le checkpoint',next_retry_at=NULL "
+                "WHERE id=?",
+                (tid,),
+            )
+            conn.execute(
+                "INSERT INTO human_actions "
+                "(task_id,kind,prompt,status,created_at) "
+                "VALUES (?,'transient','reprendre le checkpoint','open',?)",
+                (tid, int(time.time())),
+            )
+            kb._append_event(
+                conn,
+                tid,
+                "blocked",
+                {"kind": "transient", "source_status": "ready"},
+            )
+
+    kb.init_db()
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.execution_status == "retrying"
+        assert task.next_retry_at is not None
+        assert task.action_required is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM human_actions "
+            "WHERE task_id=? AND status='open'",
+            (tid,),
+        ).fetchone()[0] == 0
+        assert kb.list_events(conn, tid)[-1].kind == "legacy_transient_block_requeued"
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
@@ -123,4 +201,3 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 # Validation + back-compat
 # ---------------------------------------------------------------------------
-
