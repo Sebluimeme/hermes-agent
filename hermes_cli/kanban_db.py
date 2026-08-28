@@ -12307,6 +12307,14 @@ def _workspace_occupancy_key(
         path = Path(workspace_path).expanduser().absolute()
     if workspace_kind == "worktree" and ".worktrees" not in path.parts:
         return None
+    # Managed scratch directories are private per-task coordination spaces,
+    # not writers for whichever Git repository happens to contain the Hermes
+    # data root.  Mapping them to a parent ``~/.hermes/.git`` checkout turns a
+    # board-only orchestrator into a global repository lock and idles every
+    # otherwise independent project lane.  Exact-path serialization is enough:
+    # two tasks never share the same managed scratch directory.
+    if workspace_kind == "scratch":
+        return str(path)
 
     # Files are not expected here, but using their parent keeps malformed or
     # partially-created workspace declarations fail-safe without inventing a
@@ -12710,42 +12718,9 @@ def _dispatch_once_locked(
             "AND (next_retry_at IS NULL OR next_retry_at <= CAST(strftime('%s','now') AS INTEGER)) "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
-    # Review-lane reservation (OOF-30 review finding): the ready loop runs
-    # first and used to consume the ENTIRE shared budget, so a sustained
-    # ready backlog permanently starved autonomous reviews — completed work
-    # sat in 'review' forever while new work kept spawning. When spawnable
-    # review work exists and the tick has any budget, hold one slot back
-    # from the ready loop so the review lane always gets a spawn
-    # opportunity. The reservation is per-tick and self-releasing: with no
-    # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
-    def _any_spawnable_review() -> bool:
-        if not review_rows:
-            return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
-
-    ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
-        ready_budget = max(spawn_budget - 1, 0)
-    spawned = 0
-    # Per-profile concurrency cap (#21582): when set, track how many
-    # workers each assignee already has in flight, and refuse to spawn
-    # when this would push that assignee past the cap. Prevents
-    # fan-out workloads from melting a single profile's local model /
-    # API quota / browser pool while leaving other profiles idle.
-    # Tasks blocked this way go to skipped_per_profile_capped (not
-    # skipped_unassigned — the operator-actionable signal is different:
-    # "this profile is busy, try again later" not "this needs routing").
+    # Per-profile concurrency is needed both by the reservation probe and by
+    # the actual ready/review loops.  Compute it before deciding whether a
+    # review can really consume the reserved slot.
     _per_profile_cap = max_in_progress_per_profile if (
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
@@ -12758,6 +12733,62 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+
+    # Review-lane reservation (OOF-30 review finding): the ready loop runs
+    # first and used to consume the ENTIRE shared budget, so a sustained
+    # ready backlog permanently starved autonomous reviews — completed work
+    # sat in 'review' forever while new work kept spawning. When spawnable
+    # review work exists and the tick has any budget, hold one slot back
+    # from the ready loop so the review lane always gets a spawn
+    # opportunity. The reservation is per-tick and self-releasing: with no
+    # spawnable review work (or no cap at all) the ready loop keeps the
+    # full budget. "Spawnable" mirrors the gates that are knowable without
+    # mutating provider state: real profile, free profile lane, available
+    # workspace, quota and respawn guard.  Reserving for a review that cannot
+    # start this tick strands capacity and leaves an unrelated Claude/Codex
+    # lane idle.
+    def _any_spawnable_review() -> bool:
+        if not review_rows:
+            return False
+        try:
+            from hermes_cli.profiles import profile_exists as _rpe
+        except Exception:
+            _rpe = None
+        for row in review_rows:
+            assignee = row["assignee"]
+            if not assignee:
+                continue
+            if _rpe is not None and not _rpe(assignee):
+                continue
+            if (
+                _per_profile_cap is not None
+                and _per_profile_running.get(assignee, 0) >= _per_profile_cap
+            ):
+                continue
+            workspace_key = _workspace_occupancy_key(
+                row["workspace_kind"], row["workspace_path"],
+            )
+            if (
+                workspace_key
+                and _occupied_workspace_owner(
+                    workspace_key, _occupied_workspaces,
+                ) is not None
+            ):
+                continue
+            if quota_dispatch_guard(assignee) is not None:
+                continue
+            if check_respawn_guard(conn, row["id"], lane="review") is not None:
+                continue
+            return True
+        return False
+
+    ready_budget = spawn_budget
+    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
+        ready_budget = max(spawn_budget - 1, 0)
+    spawned = 0
+    # Per-profile concurrency cap (#21582): the counters above are shared by
+    # the reservation probe and both dispatch loops, then incremented after
+    # every real or dry-run spawn.
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.

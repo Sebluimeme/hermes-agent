@@ -290,6 +290,50 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     assert len(res.spawned) == 2
 
 
+def test_workspace_busy_review_does_not_tax_ready_budget(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A review blocked by an active checkout cannot strand the last slot."""
+    import hermes_cli.config as cfgmod
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    occupied = kanban_home / "occupied"
+    independent = kanban_home / "independent"
+    occupied.mkdir()
+    independent.mkdir()
+    spawns: list = []
+    with kb.connect() as conn:
+        owner = kb.create_task(
+            conn, title="active writer", assignee="researcher",
+            workspace_kind="dir", workspace_path=str(occupied),
+        )
+        assert kb.claim_task(conn, owner) is not None
+        ready_id = kb.create_task(
+            conn, title="free agent lane", assignee="alice",
+            workspace_kind="dir", workspace_path=str(independent),
+        )
+        review_id = _park_in_review(conn, "busy review", "coder")
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path=? WHERE id=?",
+            (str(occupied), review_id),
+        )
+        conn.commit()
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=2,
+            max_in_progress_per_profile=1,
+        )
+
+    assert [item[0] for item in res.spawned] == [ready_id]
+    with kb.connect() as conn:
+        review = kb.get_task(conn, review_id)
+    assert review is not None and review.status == "review"
+
+
 def test_review_budget_still_bounded_by_shared_cap(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):

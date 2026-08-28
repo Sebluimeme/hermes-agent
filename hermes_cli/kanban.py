@@ -2886,6 +2886,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_workspace_busy": [
+                {"task_id": tid, "workspace": workspace, "owner_task_id": owner}
+                for (tid, workspace, owner) in res.skipped_workspace_busy
+            ],
+            "skipped_locked": res.skipped_locked,
+            "memory_pressure": res.memory_pressure,
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2930,6 +2936,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, workspace, owner in res.skipped_workspace_busy:
+        print(f"Deferred (workspace {workspace} owned by {owner}): {tid}")
+    if res.skipped_locked:
+        print("Deferred (another dispatcher owns the board lock).")
+    if res.memory_pressure:
+        print(f"Memory pressure: {res.memory_pressure}")
     return 0
 
 

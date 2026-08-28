@@ -807,6 +807,8 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert KANBAN_GUIDANCE.count("Decision ownership.") == 1
     assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
+    assert "A board-only control task" in KANBAN_GUIDANCE
+    assert "Never attach such a task to a project root" in KANBAN_GUIDANCE
 
 
 # ---------------------------------------------------------------------------

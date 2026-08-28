@@ -1038,6 +1038,39 @@ def test_dispatch_serializes_parent_checkout_against_nested_repository(
     assert spawned == [(parent, str(parent_workspace.resolve()))]
 
 
+def test_private_scratch_task_does_not_lock_its_parent_hermes_repository(
+    kanban_home, all_assignees_spawnable,
+):
+    """Board-only scratch work must not reserve every nested project repo."""
+    (kanban_home / ".git").mkdir()
+    scratch = kanban_home / "kanban" / "workspaces" / "control-task"
+    scratch.mkdir(parents=True)
+    project = kanban_home / "workspace" / "project"
+    (project / ".git").mkdir(parents=True)
+    spawned = []
+
+    with kb.connect() as conn:
+        control = kb.create_task(
+            conn, title="triage board", assignee="claude2",
+            workspace_kind="scratch", workspace_path=str(scratch),
+        )
+        assert kb.claim_task(conn, control) is not None
+        delivery = kb.create_task(
+            conn, title="independent project", assignee="alice",
+            workspace_kind="dir", workspace_path=str(project),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, path, **_kwargs: spawned.append((task.id, path)) or 93_501,
+            max_in_progress=2,
+            max_in_progress_per_profile=1,
+        )
+
+    assert result.skipped_workspace_busy == []
+    assert result.spawned == [(delivery, "alice", str(project.resolve()))]
+    assert spawned == [(delivery, str(project.resolve()))]
+
+
 def test_dispatch_keeps_nested_sibling_repositories_parallel(
     kanban_home, all_assignees_spawnable,
 ):

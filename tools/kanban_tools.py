@@ -2752,7 +2752,10 @@ KANBAN_CREATE_SCHEMA = {
         "one (pass the current task id in ``parents``). Used by "
         "orchestrator workers to fan out — decompose work into child "
         "tasks, link them into a pipeline, then complete your own task. "
-        "Omit assignee to use the central routing policy."
+        "Omit assignee to use the central routing policy. For board-only "
+        "triage/supervision tasks, also omit workspace_kind/workspace_path: "
+        "the private scratch default prevents a control card from locking "
+        "every project below a shared repository root."
     ),
     "parameters": {
         "type": "object",
@@ -2807,7 +2810,8 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Workspace flavor: 'scratch' (fresh tmp dir, "
                     "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "absolute workspace_path), 'worktree' (git worktree). "
+                    "Use the scratch default for Kanban-only control work."
                 ),
             },
             "workspace_path": {
