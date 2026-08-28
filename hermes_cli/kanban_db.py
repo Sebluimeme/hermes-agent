@@ -171,6 +171,32 @@ def block_reason_rejection(reason: Optional[str]) -> Optional[str]:
     return None
 
 
+_SCHEDULE_SERIALIZATION_RE = re.compile(
+    r"(?:s[ée]rialis(?:ation|er)|\bworkspace\b|\bcheckout\b|"
+    r"\bd[ée]pendance(?:s)?\b|\bdependency\b)",
+    re.IGNORECASE,
+)
+
+
+def schedule_reason_rejection(reason: Optional[str]) -> Optional[str]:
+    """Refuse using a time-only pause as a workspace/dependency lock.
+
+    ``scheduled`` has no intrinsic wake condition: an external timer or
+    automation must call :func:`unblock_task`. Parking ordinary dependency or
+    checkout serialization there therefore creates a silent queue. Real task
+    links and the dispatcher's workspace lock already provide automatic wakeup.
+    """
+    if reason is None:
+        return None
+    if _SCHEDULE_SERIALIZATION_RE.search(str(reason)):
+        return (
+            "scheduled is reserved for a time-based pause with an external "
+            "wake-up; use Kanban parent dependencies or let the dispatcher "
+            "serialize the workspace automatically"
+        )
+    return None
+
+
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
@@ -9175,6 +9201,9 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
+    reason_rejection = schedule_reason_rejection(reason)
+    if reason_rejection is not None:
+        raise ValueError(reason_rejection)
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
@@ -13653,7 +13682,7 @@ def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optio
             )
             if previous is None or previous.outcome not in {
                 "blocked", "rate_limited", "crashed", "timed_out", "stale",
-                "review_deferred", "reclaimed",
+                "review_deferred", "reclaimed", "scheduled",
             }:
                 return None
             if previous.profile and task.assignee and previous.profile != task.assignee:

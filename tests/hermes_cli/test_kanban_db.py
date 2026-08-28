@@ -208,6 +208,18 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
 
 
+def test_schedule_task_refuses_workspace_or_dependency_serialization(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="must auto resume", assignee="coder")
+        with pytest.raises(ValueError, match="time-based pause"):
+            kb.schedule_task(
+                conn,
+                task_id,
+                reason="automatic serialization hold: wait for workspace dependency",
+            )
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
 
 
 
@@ -1472,6 +1484,31 @@ def test_operator_reclaim_resumes_the_exact_checkpointed_session(kanban_home):
     assert kb._transient_resume_session_id(
         task_id, board=kb.get_current_board(),
     ) == "worker-session-reclaimed"
+
+
+def test_scheduled_time_pause_resumes_the_exact_checkpointed_session(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="maintenance pause", assignee="coder")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.heartbeat_worker(
+            conn,
+            task_id,
+            note="manifest reconciled, processing pending",
+            expected_run_id=claimed.current_run_id,
+            worker_session_id="worker-session-scheduled",
+        )
+        assert kb.schedule_task(
+            conn,
+            task_id,
+            reason="resume after the 03:00 maintenance window",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.unblock_task(conn, task_id)
+
+    assert kb._transient_resume_session_id(
+        task_id, board=kb.get_current_board(),
+    ) == "worker-session-scheduled"
 
 
 def test_failed_simple_routes_advance_spark_then_claude_then_coder(kanban_home, all_assignees_spawnable):
