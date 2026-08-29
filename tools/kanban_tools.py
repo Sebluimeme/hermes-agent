@@ -1770,15 +1770,44 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            task_status = new_task.status if new_task else None
+            execution_started = bool(
+                new_task
+                and task_status == "running"
+                and new_task.current_run_id is not None
+                and new_task.worker_pid is not None
+            )
+            if execution_started:
+                execution_state = "running"
+                operator_guidance = (
+                    "A live worker run and PID are verified; activity may be "
+                    "reported to the user."
+                )
+            elif task_status in {"done", "archived"}:
+                execution_state = "terminal"
+                operator_guidance = (
+                    "The task is terminal; report its verified result, not active work."
+                )
+            else:
+                execution_state = "queued"
+                operator_guidance = (
+                    "Task is queued only; no live worker run is verified. Do not tell "
+                    "the user that the assignee is working. Verify kanban_show or "
+                    "kanban_runs before claiming activity."
+                )
             return _ok(
                 task_id=new_tid,
-                status=new_task.status if new_task else None,
+                status=task_status,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
                 mission_id=new_task.mission_id if new_task else None,
                 queue_class=new_task.queue_class if new_task else None,
+                execution_started=execution_started,
+                execution_state=execution_state,
+                activity_claim_allowed=execution_started,
+                operator_guidance=operator_guidance,
             )
         finally:
             conn.close()
@@ -2755,7 +2784,10 @@ KANBAN_CREATE_SCHEMA = {
         "Omit assignee to use the central routing policy. For board-only "
         "triage/supervision tasks, also omit workspace_kind/workspace_path: "
         "the private scratch default prevents a control card from locking "
-        "every project below a shared repository root."
+        "every project below a shared repository root. Creation normally "
+        "queues work; it does not prove that a worker started. Never tell the "
+        "user an assignee is working unless the response has "
+        "execution_started=true or a live run is verified separately."
     ),
     "parameters": {
         "type": "object",
