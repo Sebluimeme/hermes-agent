@@ -1665,9 +1665,22 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
-    _inherit_project = workspace_kind is None and workspace_path is None
-    if workspace_kind is None:
+    read_only, read_only_error = _parse_bool_arg(args, "read_only")
+    if read_only_error:
+        return tool_error(read_only_error)
+    workspace_forced_scratch = bool(read_only)
+    if read_only:
+        # A bounded no-write lookup must never wait behind a repository writer.
+        # The source path belongs in the task body and remains readable by
+        # absolute path; no checkout identity is inherited or reserved.
         workspace_kind = "scratch"
+        workspace_path = None
+        project_id = None
+        _inherit_project = False
+    else:
+        _inherit_project = workspace_kind is None and workspace_path is None
+        if workspace_kind is None:
+            workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
@@ -1804,6 +1817,8 @@ def _handle_create(args: dict, **kw) -> str:
                 subscribed=subscribed,
                 mission_id=new_task.mission_id if new_task else None,
                 queue_class=new_task.queue_class if new_task else None,
+                read_only=bool(read_only),
+                workspace_forced_scratch=workspace_forced_scratch,
                 execution_started=execution_started,
                 execution_state=execution_state,
                 activity_claim_allowed=execution_started,
@@ -2787,7 +2802,10 @@ KANBAN_CREATE_SCHEMA = {
         "every project below a shared repository root. Creation normally "
         "queues work; it does not prove that a worker started. Never tell the "
         "user an assignee is working unless the response has "
-        "execution_started=true or a live run is verified separately."
+        "execution_started=true or a live run is verified separately. For a "
+        "bounded delegated lookup that performs no writes and does not require "
+        "an exact checkout, pass read_only=true: Hermes forces a private scratch "
+        "workspace even if project/workspace fields were supplied."
     ),
     "parameters": {
         "type": "object",
@@ -2809,6 +2827,16 @@ KANBAN_CREATE_SCHEMA = {
                     "Opening post: full spec, acceptance criteria, "
                     "links. The assigned worker reads this as part of "
                     "its context."
+                ),
+            },
+            "read_only": {
+                "type": "boolean",
+                "description": (
+                    "Declare a bounded no-write lookup that can read any source "
+                    "by absolute path and does not require an exact branch. "
+                    "Forces a private scratch workspace and ignores project or "
+                    "workspace fields, preventing unrelated repository writers "
+                    "from blocking it. Do not use for branch-specific reviews."
                 ),
             },
             "parents": {

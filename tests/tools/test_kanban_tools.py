@@ -1193,6 +1193,39 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_read_only_forces_private_scratch(monkeypatch, worker_env):
+    """A no-write lookup cannot reserve a project directory accidentally."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "bounded account lookup",
+        "body": "Read /srv/example by absolute path; do not modify it.",
+        "assignee": "peer",
+        "read_only": True,
+        "workspace_kind": "dir",
+        "workspace_path": "/srv/example",
+        "project": "must-not-be-resolved",
+    }))
+
+    assert out["ok"] is True
+    assert out["read_only"] is True
+    assert out["workspace_forced_scratch"] is True
+    assert out["workspace_kind"] == "scratch"
+    assert out["workspace_path"] is None
+    assert out["project_id"] is None
+    assert out["execution_started"] is False
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, out["task_id"])
+        assert task.workspace_kind == "scratch"
+        assert task.workspace_path is None
+        assert task.project_id is None
+    finally:
+        conn.close()
+
+
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     """TUI / desktop sessions don't have a platform/chat_id (single
     local channel), but the parent process exports HERMES_SESSION_KEY.
