@@ -759,7 +759,9 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
                     "obtenu et jeton valide, mais l’appel API échoue en 403 car "
                     "mybusinessaccountmanagement.googleapis.com est désactivée pour "
                     "le projet 362154063865 ; décision attendue de Sébastien - "
-                    "activer l’API dans ce projet ou autoriser Hermes à le faire."
+                    "activer l’API dans ce projet ou autoriser Hermes à le faire. "
+                    "Une fois activée, je relance la vérification en lecture seule "
+                    "pour clore la carte."
                 ),
                 "kind": "capability",
                 "recurrences": 2,
@@ -792,6 +794,8 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert (
         "activer l’API dans ce projet ou autoriser Hermes à le faire." in text
     ), "the exact Ecobloc action must survive after the long technical diagnosis"
+    assert "clore la carte." in text, "the single-task action must not be truncated"
+    assert "réutili\n" not in text, "copy must never be cut in the middle of a word"
     assert "Ensuite : Hermes reprend automatiquement" in text
     assert "@worker" not in text, "no assignee/profile tag on a human-decision message"
     assert "[default]" not in text, "no bracketed board-tag prefix on a human-decision message"

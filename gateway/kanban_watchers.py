@@ -45,7 +45,21 @@ _HUMAN_ACTION_MARKER_RE = re.compile(
 )
 
 
-def _human_block_copy(payload: Any) -> tuple[str, str]:
+def _bounded_human_text(value: str, limit: int) -> str:
+    """Bound copy at a word boundary and mark an actual truncation."""
+    value = " ".join(value.split())
+    if len(value) <= limit:
+        return value
+    prefix = value[: max(1, limit - 1)].rsplit(" ", 1)[0].rstrip(" .;:—–-")
+    return f"{prefix or value[: max(1, limit - 1)]}…"
+
+
+def _human_block_copy(
+    payload: Any,
+    *,
+    cause_limit: int = 360,
+    action_limit: int = 360,
+) -> tuple[str, str]:
     """Return separately bounded ``(cause, action)`` human-facing copy.
 
     New block events carry a structured ``action``. The marker split keeps
@@ -74,12 +88,19 @@ def _human_block_copy(payload: Any) -> tuple[str, str]:
             "répondre à Hermes avec l’accord, la décision ou l’information "
             "nécessaire pour débloquer cette tâche"
         )
-    return cause[:360], action[:360]
+    return (
+        _bounded_human_text(cause, cause_limit),
+        _bounded_human_text(action, action_limit),
+    )
 
 
 def _human_block_message(*, title: str, payload: Any, icon: str) -> str:
     """Render a human blocker with diagnosis, exact ask, and continuation."""
-    cause, action = _human_block_copy(payload)
+    cause, action = _human_block_copy(
+        payload,
+        cause_limit=420,
+        action_limit=700,
+    )
     return (
         f"{icon} {title}\n"
         f"Blocage : {cause}\n"
@@ -696,7 +717,11 @@ class GatewayKanbanWatchersMixin:
                                 event for event in _member["events"]
                                 if event.kind in {"blocked", "block_loop_detected", "gave_up"}
                             )
-                            _, _action = _human_block_copy(_event.payload)
+                            _, _action = _human_block_copy(
+                                _event.payload,
+                                cause_limit=220,
+                                action_limit=220,
+                            )
                             if (
                                 not (_event.payload or {}).get("reason")
                                 and (_event.payload or {}).get("error")
@@ -754,7 +779,11 @@ class GatewayKanbanWatchersMixin:
                                             "blocked", "block_loop_detected", "gave_up"
                                         }
                                     )
-                                    _reason, _action = _human_block_copy(_event.payload)
+                                    _reason, _action = _human_block_copy(
+                                        _event.payload,
+                                        cause_limit=300,
+                                        action_limit=300,
+                                    )
                                     _title = (
                                         _task.title if _task else _member["sub"]["task_id"]
                                     )[:120]
