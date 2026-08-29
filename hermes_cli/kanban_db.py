@@ -1596,6 +1596,26 @@ CREATE TABLE IF NOT EXISTS human_actions (
     resolved_at INTEGER
 );
 
+-- Provider authentication incidents are fleet/profile concerns, not task
+-- blockers.  Keep them outside ``human_actions`` so a task that successfully
+-- continues through a fallback may still complete without falsely resolving
+-- the profile credential incident.  The composite primary key deduplicates
+-- repeated workers until a later successful primary resolution closes it.
+CREATE TABLE IF NOT EXISTS provider_auth_incidents (
+    profile         TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open',
+    error           TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    task_id         TEXT,
+    fallback_active INTEGER NOT NULL DEFAULT 0,
+    fallback        TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    resolved_at     INTEGER,
+    PRIMARY KEY (profile, provider)
+);
+
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id  TEXT NOT NULL,
     child_id   TEXT NOT NULL,
@@ -1712,6 +1732,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_missions_idempotency
     ON missions(idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_mission_events        ON mission_events(mission_id, id);
 CREATE INDEX IF NOT EXISTS idx_human_actions_open    ON human_actions(status, mission_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_provider_auth_open    ON provider_auth_incidents(status, updated_at);
 """
 
 
@@ -9764,6 +9785,33 @@ def oauth_canary_transition_required(
     return False, "steady_state"
 
 
+def _failure_error_for_current_assignee(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    assignee: Optional[str],
+    error: Optional[str],
+) -> Optional[str]:
+    """Return ``error`` only when its latest attempt belongs to ``assignee``.
+
+    ``last_failure_error`` is task-scoped while provider failures are
+    profile-scoped.  Automatic routing intentionally preserves the prior
+    failure text for the next worker's context, so it cannot also be used as a
+    guard against that *new* worker.  This ownership check prevents a Spark
+    quota message from becoming a fake Claude authentication blocker.
+    """
+    if not error:
+        return None
+    latest = conn.execute(
+        "SELECT profile FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["profile"] and latest["profile"] != assignee:
+        return None
+    return error
+
+
 def claude2_oauth_dispatch_guard(
     conn: sqlite3.Connection, task_id: str, assignee: Optional[str],
 ) -> Optional[str]:
@@ -9792,7 +9840,16 @@ def claude2_oauth_dispatch_guard(
     task = get_task(conn, task_id)
     model_override = task.model_override if task is not None else None
     provider_override = task.provider_override if task is not None else None
-    task_failure_error = task.last_failure_error if task is not None else None
+    task_failure_error = (
+        _failure_error_for_current_assignee(
+            conn,
+            task_id,
+            assignee=assignee,
+            error=task.last_failure_error,
+        )
+        if task is not None
+        else None
+    )
     credentials_mtime = credentials_fingerprint()
     stored = load_oauth_transition_state(assignee)
     required, trigger = oauth_canary_transition_required(
@@ -11018,6 +11075,101 @@ def _safe_provider_error_detail(error: str) -> str:
     return _PROVIDER_SECRET_RE.sub("[redacted]", redact_sensitive_text(error))[:500]
 
 
+def record_provider_auth_incident(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile: str,
+    provider: str,
+    error: str,
+    action: str,
+    fallback_active: bool,
+    fallback: Optional[str] = None,
+    emit_event: bool = True,
+) -> bool:
+    """Open or refresh one deduplicated profile authentication incident.
+
+    Returns ``True`` only when this call opened a new incident (or reopened a
+    previously resolved one).  Repeated workers on the same broken
+    ``(profile, provider)`` update the durable evidence but do not emit another
+    Telegram-facing event.  A task may continue through a fallback while this
+    incident stays open; task completion therefore never resolves it.
+    """
+    safe_profile = (profile or "unknown").strip()[:80] or "unknown"
+    safe_provider = (provider or "unknown").strip()[:80] or "unknown"
+    safe_error = _safe_provider_error_detail(error or "authentication failed")
+    safe_action = _safe_provider_error_detail(
+        action or "Reconnecter ce fournisseur dans le profil Hermes concerné."
+    )
+    safe_fallback = _safe_provider_error_detail(fallback or "") or None
+    now = int(time.time())
+    opened = False
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT status FROM provider_auth_incidents "
+            "WHERE profile = ? AND provider = ?",
+            (safe_profile, safe_provider),
+        ).fetchone()
+        opened = current is None or current["status"] != "open"
+        conn.execute(
+            "INSERT INTO provider_auth_incidents "
+            "(profile, provider, status, error, action, task_id, "
+            " fallback_active, fallback, created_at, updated_at, resolved_at) "
+            "VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, NULL) "
+            "ON CONFLICT(profile, provider) DO UPDATE SET "
+            "status='open', error=excluded.error, action=excluded.action, "
+            "task_id=excluded.task_id, fallback_active=excluded.fallback_active, "
+            "fallback=excluded.fallback, updated_at=excluded.updated_at, "
+            "resolved_at=NULL",
+            (
+                safe_profile,
+                safe_provider,
+                safe_error,
+                safe_action,
+                task_id,
+                1 if fallback_active else 0,
+                safe_fallback,
+                now,
+                now,
+            ),
+        )
+        if opened and emit_event:
+            _append_event(
+                conn,
+                task_id,
+                "provider_auth_required",
+                {
+                    "profile": safe_profile,
+                    "provider": safe_provider,
+                    "error": safe_error,
+                    "action": safe_action,
+                    "fallback_active": bool(fallback_active),
+                    "fallback": safe_fallback,
+                },
+            )
+    return opened
+
+
+def resolve_provider_auth_incident(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    provider: str,
+) -> bool:
+    """Close an open profile auth incident after primary auth succeeds."""
+    safe_profile = (profile or "unknown").strip()[:80] or "unknown"
+    safe_provider = (provider or "unknown").strip()[:80] or "unknown"
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE provider_auth_incidents SET status='resolved', "
+            "updated_at=?, resolved_at=? "
+            "WHERE profile=? AND provider=? AND status='open'",
+            (now, now, safe_profile, safe_provider),
+        )
+    return cur.rowcount == 1
+
+
 def _parse_explicit_reset_at(text: str) -> Optional[dt.datetime]:
     """Return an API-supplied ISO reset timestamp, never a guessed one."""
     match = _RESET_AT_RE.search(text)
@@ -12159,7 +12311,12 @@ def check_respawn_guard(
     # reviewer forever. Treat that string as stale only for explicit
     # successful outcomes; genuine later spawn/crash/auth failures still
     # guard normally.
-    err = row["last_failure_error"]
+    err = _failure_error_for_current_assignee(
+        conn,
+        task_id,
+        assignee=row["assignee"],
+        error=row["last_failure_error"],
+    )
     if err and _RESPAWN_BLOCKER_RE.search(err):
         if latest_run is not None and latest_run["outcome"] in {
             "completed",

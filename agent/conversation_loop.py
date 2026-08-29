@@ -5545,6 +5545,22 @@ def run_conversation(
                         "switching to fallback provider..."
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
+                        try:
+                            from hermes_cli.kanban_auth_incident import (
+                                report_kanban_auth_required,
+                            )
+
+                            report_kanban_auth_required(
+                                RuntimeError(agent._summarize_api_error(api_error)),
+                                provider=str(_provider or "unknown"),
+                                fallback=(
+                                    f"{getattr(agent, 'provider', 'unknown')}/"
+                                    f"{getattr(agent, 'model', 'unknown')}"
+                                ),
+                                confirmed=True,
+                            )
+                        except Exception:
+                            pass
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6118,6 +6134,19 @@ def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
+                    if classified.is_auth:
+                        try:
+                            from hermes_cli.kanban_auth_incident import (
+                                report_kanban_auth_required,
+                            )
+
+                            report_kanban_auth_required(
+                                RuntimeError(agent._summarize_api_error(api_error)),
+                                provider=str(_provider or "unknown"),
+                                confirmed=True,
+                            )
+                        except Exception:
+                            pass
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /

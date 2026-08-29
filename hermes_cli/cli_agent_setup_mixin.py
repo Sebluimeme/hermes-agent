@@ -37,7 +37,10 @@ class CLIAgentSetupMixin:
             format_runtime_provider_error,
         )
 
+        _primary_requested_provider = self.requested_provider
         _primary_exc = None
+        _primary_auth_exc = None
+        _fallback_label = None
         runtime = None
         try:
             runtime = resolve_runtime_provider(
@@ -52,6 +55,7 @@ class CLIAgentSetupMixin:
         if runtime is None and _primary_exc is not None:
             from hermes_cli.auth import AuthError
             if isinstance(_primary_exc, AuthError):
+                _primary_auth_exc = _primary_exc
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
                 for _fb in _fb_chain:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
@@ -75,15 +79,39 @@ class CLIAgentSetupMixin:
                         _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
+                        _fallback_label = f"{_fb_provider}/{_fb_model}"
                         _primary_exc = None
                         break
                     except Exception:
                         continue
 
+        if _primary_auth_exc is not None:
+            from hermes_cli.kanban_auth_incident import report_kanban_auth_required
+
+            report_kanban_auth_required(
+                _primary_auth_exc,
+                provider=(
+                    getattr(_primary_auth_exc, "provider", None)
+                    or _primary_requested_provider
+                ),
+                fallback=_fallback_label,
+            )
+
         if runtime is None:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
             ChatConsole().print(f"[bold red]{message}[/]")
             return False
+
+        if _primary_auth_exc is None:
+            from hermes_cli.kanban_auth_incident import mark_kanban_auth_healthy
+
+            mark_kanban_auth_healthy(
+                provider=(
+                    runtime.get("requested_provider")
+                    or _primary_requested_provider
+                    or runtime.get("provider")
+                )
+            )
 
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")

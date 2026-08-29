@@ -807,6 +807,47 @@ def test_notifier_delivers_one_clean_final_coder_relay(tmp_path, monkeypatch):
     assert "@default" not in adapter.sent[0]["text"]
 
 
+def test_notifier_explains_provider_auth_action_while_fallback_continues(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "provider-auth-required.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="Vérifier Ecobloc", assignee="claude2")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn,
+            tid,
+            "provider_auth_required",
+            {
+                "profile": "claude2",
+                "provider": "anthropic",
+                "error": "OAuth token expired",
+                "action": "Reconnecter anthropic dans le profil claude2.",
+                "fallback_active": True,
+                "fallback": "openai-codex/gpt-5.5",
+            },
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "Authentification à corriger" in message
+    assert "claude2 (anthropic)" in message
+    assert "OAuth token expired" in message
+    assert "Reconnecter anthropic" in message
+    assert "continue automatiquement via openai-codex/gpt-5.5" in message
+    assert tid not in message
+
+
 def test_notifier_explains_visual_retry_requires_no_human_action(tmp_path, monkeypatch):
     db_path = tmp_path / "visual-review-deferred.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

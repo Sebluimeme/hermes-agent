@@ -299,7 +299,8 @@ class GatewayKanbanWatchersMixin:
         For each subscription row, fetches ``task_events`` newer than the
         stored cursor with kind in the terminal set (``completed``,
         ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``block_loop_detected``). Sends one
+        ``review_requested``, ``block_loop_detected``,
+        ``provider_auth_required``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
         task is ``archived``. A ``done`` task can be reopened for review or
@@ -337,7 +338,7 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "archived", "unblocked", "block_loop_detected", "review_requested", "visual_review_deferred", "relayed_to_coder")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "archived", "unblocked", "block_loop_detected", "review_requested", "visual_review_deferred", "relayed_to_coder", "provider_auth_required")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -861,7 +862,28 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "provider_auth_required":
+                            payload = ev.payload or {}
+                            profile = str(payload.get("profile") or "profil inconnu")[:80]
+                            provider = str(payload.get("provider") or "fournisseur inconnu")[:80]
+                            error = str(payload.get("error") or "authentification refusée")[:280]
+                            action = str(
+                                payload.get("action")
+                                or "Reconnecter ce fournisseur dans le profil Hermes concerné."
+                            )[:320]
+                            fallback = str(payload.get("fallback") or "").strip()[:160]
+                            continuation = (
+                                f"La tâche continue automatiquement via {fallback}."
+                                if payload.get("fallback_active") and fallback
+                                else "La carte attend la correction de cette authentification."
+                            )
+                            msg = (
+                                f"⚠️ Authentification à corriger — {profile} ({provider})\n"
+                                f"Erreur : {error}\n"
+                                f"Action : {action}\n"
+                                f"{continuation}"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
