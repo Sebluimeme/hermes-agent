@@ -435,6 +435,30 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_human_block_requires_and_persists_exact_action(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    missing = json.loads(kt._handle_block({
+        "reason": "The Ecobloc project API is disabled.",
+        "kind": "capability",
+    }))
+    assert "action is required" in missing["error"]
+
+    action = "Autoriser Hermes à activer l’API Google Business Profile."
+    accepted = json.loads(kt._handle_block({
+        "reason": "The Ecobloc project API is disabled.",
+        "action": action,
+        "kind": "capability",
+    }))
+    assert accepted["ok"] is True
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task.action_required == action
+        event = [e for e in kb.list_events(conn, worker_env) if e.kind == "blocked"][-1]
+        assert event.payload["action"] == action
+
+
 @pytest.mark.parametrize("reason", ["test", "test reason simple", "reason with spaces"])
 def test_block_rejects_placeholder_reason_without_mutation(worker_env, reason):
     from tools import kanban_tools as kt

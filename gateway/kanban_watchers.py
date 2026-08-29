@@ -34,6 +34,59 @@ logger = logging.getLogger("gateway.run")
 # contract that keeps the remainder of the reason human-readable on its own.
 _GATE_PREFIX_RE = re.compile(r"^gate:\S+\s*[—-]\s*")
 
+# Legacy workers stored the diagnosis and the requested decision in one long
+# ``reason`` string. Split the common authoring forms before truncating so a
+# technical prefix can never push the actual call to action out of a Telegram
+# message (the Ecobloc GBP incident did exactly that).
+_HUMAN_ACTION_MARKER_RE = re.compile(
+    r"\b(?:action\s+(?:attendue|requise)|d[ée]cision\s+attendue)"
+    r"(?:\s+de\s+[^:;—–-]{1,80})?\s*[:;—–-]\s*",
+    re.IGNORECASE,
+)
+
+
+def _human_block_copy(payload: Any) -> tuple[str, str]:
+    """Return separately bounded ``(cause, action)`` human-facing copy.
+
+    New block events carry a structured ``action``. The marker split keeps
+    already-durable events and older clients readable without a migration.
+    A conservative fallback still states what reply Hermes needs instead of
+    presenting a diagnosis as though it were an instruction.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    raw_reason = _GATE_PREFIX_RE.sub(
+        "", str(payload.get("reason") or "").strip()
+    ).strip()
+    cause = raw_reason or "une décision est nécessaire pour continuer"
+    action = _GATE_PREFIX_RE.sub(
+        "", str(payload.get("action") or "").strip()
+    ).strip()
+
+    marker = _HUMAN_ACTION_MARKER_RE.search(raw_reason)
+    if marker:
+        marker_action = raw_reason[marker.end():].strip()
+        cause = raw_reason[:marker.start()].strip(" .;:—–-") or cause
+        if not action and marker_action:
+            action = marker_action
+
+    if not action:
+        action = (
+            "répondre à Hermes avec l’accord, la décision ou l’information "
+            "nécessaire pour débloquer cette tâche"
+        )
+    return cause[:360], action[:360]
+
+
+def _human_block_message(*, title: str, payload: Any, icon: str) -> str:
+    """Render a human blocker with diagnosis, exact ask, and continuation."""
+    cause, action = _human_block_copy(payload)
+    return (
+        f"{icon} {title}\n"
+        f"Blocage : {cause}\n"
+        f"Action attendue de toi : {action}\n"
+        "Ensuite : Hermes reprend automatiquement la tâche et te confirme le résultat."
+    )
+
 INTERNAL_AUTHORIZATION_SYNC_MESSAGE = (
     "Problème interne d’autorisation — aucune action de votre part. "
     "Reprise automatique en cours."
@@ -643,17 +696,16 @@ class GatewayKanbanWatchersMixin:
                                 event for event in _member["events"]
                                 if event.kind in {"blocked", "block_loop_detected", "gave_up"}
                             )
-                            _reason = "une décision est nécessaire pour continuer"
-                            if _event.payload and _event.payload.get("reason"):
-                                _reason = _GATE_PREFIX_RE.sub(
-                                    "", str(_event.payload["reason"])[:220]
-                                ).strip() or _reason
-                            elif _event.payload and _event.payload.get("error"):
-                                _reason = str(_event.payload["error"])[:220].strip() or _reason
+                            _, _action = _human_block_copy(_event.payload)
+                            if (
+                                not (_event.payload or {}).get("reason")
+                                and (_event.payload or {}).get("error")
+                            ):
+                                _action = str(_event.payload["error"])[:360].strip() or _action
                             _title = (_task.title if _task else _member["sub"]["task_id"])[:100]
-                            _lines.append(f"{_index}. {_title} — {_reason}")
+                            _lines.append(f"{_index}. {_title}\n   Action : {_action}")
                         _lines.append(
-                            "Répondez avec le numéro et l'action demandée ; "
+                            "Répondez avec le numéro et votre décision ; "
                             "les autres tâches continuent automatiquement."
                         )
                         _group_send = await _adapter.send(
@@ -702,17 +754,13 @@ class GatewayKanbanWatchersMixin:
                                             "blocked", "block_loop_detected", "gave_up"
                                         }
                                     )
-                                    _reason = "une décision est nécessaire pour continuer"
-                                    if _event.payload and _event.payload.get("reason"):
-                                        _reason = _GATE_PREFIX_RE.sub(
-                                            "", str(_event.payload["reason"])[:500]
-                                        ).strip() or _reason
+                                    _reason, _action = _human_block_copy(_event.payload)
                                     _title = (
                                         _task.title if _task else _member["sub"]["task_id"]
                                     )[:120]
                                     _wake_lines.append(
                                         f"{_index}. task={_member['sub']['task_id']} "
-                                        f"— {_title} — {_reason}"
+                                        f"— {_title} — blocage={_reason} — action={_action}"
                                     )
                                 _wake_lines.append(
                                     "Le prochain message humain peut répondre par numéro. "
@@ -953,13 +1001,7 @@ class GatewayKanbanWatchersMixin:
                             # write (see AGENTS.md "motif de blocage
                             # exploitable"); the board still carries the raw
                             # reason for anyone who opens the card.
-                            reason = "une décision est nécessaire pour continuer"
-                            if ev.payload and ev.payload.get("reason"):
-                                cleaned = _GATE_PREFIX_RE.sub(
-                                    "", str(ev.payload["reason"])[:280]
-                                ).strip()
-                                if cleaned:
-                                    reason = cleaned
+                            reason, _ = _human_block_copy(ev.payload)
                             authorization_classification = _classify_authorization_block(
                                 ev.payload,
                                 has_instruction_grant=has_instruction_grant,
@@ -991,9 +1033,10 @@ class GatewayKanbanWatchersMixin:
                                 # Other kinds (completed/crashed/...) keep the tag
                                 # for fleet legibility; this one must read as a
                                 # plain human ask, not a worker log line.
-                                msg = (
-                                    f"⏸ {title}\n"
-                                    f"Action requise : {reason}"
+                                msg = _human_block_message(
+                                    title=title,
+                                    payload=ev.payload,
+                                    icon="⏸",
                                 )
                         elif kind == "gave_up":
                             err = ""
@@ -1085,13 +1128,7 @@ class GatewayKanbanWatchersMixin:
                             # decision resolved itself and nothing is sent.
                             if task is None or task.status != "triage":
                                 continue
-                            reason = "une décision est nécessaire pour continuer"
-                            if ev.payload and ev.payload.get("reason"):
-                                cleaned = _GATE_PREFIX_RE.sub(
-                                    "", str(ev.payload["reason"])[:280]
-                                ).strip()
-                                if cleaned:
-                                    reason = cleaned
+                            reason, _ = _human_block_copy(ev.payload)
                             authorization_classification = _classify_authorization_block(
                                 ev.payload,
                                 has_instruction_grant=has_instruction_grant,
@@ -1120,9 +1157,10 @@ class GatewayKanbanWatchersMixin:
                                 # Same rationale as the `blocked` branch above: no
                                 # bracketed board/profile prefix on a
                                 # human-decision message.
-                                msg = (
-                                    f"🛑 {title}\n"
-                                    f"Action requise : {reason}"
+                                msg = _human_block_message(
+                                    title=title,
+                                    payload=ev.payload,
+                                    icon="🛑",
                                 )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
@@ -1265,7 +1303,10 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "completed", "gave_up", "crashed", "timed_out",
+                            "blocked", "block_loop_detected",
+                        )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
@@ -1301,7 +1342,8 @@ class GatewayKanbanWatchersMixin:
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
-                            if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if {"blocked", "block_loop_detected"} & _wake_kinds:
+                                _parts.append(t("gateway.kanban.wake.blocked"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",

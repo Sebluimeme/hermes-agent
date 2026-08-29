@@ -96,6 +96,34 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_human_block_persists_exact_action_separately(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, title="Ecobloc API")
+        action = (
+            "Autoriser Hermes à activer l’API Google Business Profile dans "
+            "le projet 362154063865."
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Le jeton est valide mais l’API du projet est désactivée.",
+            action=action,
+            kind="capability",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task.action_required == action
+        event = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"][-1]
+        assert event.payload["reason"].startswith("Le jeton est valide")
+        assert event.payload["action"] == action
+        row = conn.execute(
+            "SELECT prompt FROM human_actions "
+            "WHERE task_id = ? AND status = 'open'",
+            (tid,),
+        ).fetchone()
+        assert row["prompt"] == action
+
+
 def test_transient_block_schedules_automatic_resume_without_human_action(
     kanban_home: Path,
 ) -> None:

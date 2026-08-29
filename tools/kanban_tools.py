@@ -1052,6 +1052,9 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    action = args.get("action")
+    if action is not None:
+        action = redact_sensitive_text(str(action), force=True).strip()
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1059,6 +1062,13 @@ def _handle_block(args: dict, **kw) -> str:
         if reason_rejection is not None:
             conn.close()
             return tool_error(reason_rejection)
+        if kind in {"needs_input", "capability"} and not action:
+            conn.close()
+            return tool_error(
+                "action is required for needs_input/capability — state the "
+                "exact reply, choice, authorization, or operation expected "
+                "from the human"
+            )
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
             return tool_error(
@@ -1101,6 +1111,7 @@ def _handle_block(args: dict, **kw) -> str:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
+                action=action,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
                 metadata=metadata,
@@ -2498,7 +2509,11 @@ KANBAN_BLOCK_SCHEMA = {
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
+        "``reason`` is shown to the human on the board. "
+        "For 'needs_input' and 'capability', ``action`` is mandatory and "
+        "must state exactly what the human should reply, choose, authorize, "
+        "or do. ``reason`` explains the cause; never hide the action at the "
+        "end of a technical diagnosis. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
@@ -2516,6 +2531,16 @@ KANBAN_BLOCK_SCHEMA = {
                     "What you need answered or what stopped you, in one or "
                     "two sentences. Don't paste the whole conversation; the "
                     "human has the board and can ask follow-ups via comments."
+                ),
+            },
+            "action": {
+                "type": "string",
+                "description": (
+                    "Exact action expected from the human, written as a "
+                    "direct instruction. Required when kind is "
+                    "'needs_input' or 'capability'. Example: 'Autoriser "
+                    "Hermes à activer l’API Google Business Profile dans le "
+                    "projet 362154063865.'"
                 ),
             },
             "kind": {

@@ -738,12 +738,33 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="loops forever", assignee="worker")
-        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        tid = kb.create_task(
+            conn,
+            title="Identifier compte e-mail gérant API Ecobloc",
+            assignee="worker",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+        )
         kb._append_event(
             conn, tid, "block_loop_detected",
-            {"reason": "gate:credentials — needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+            {
+                "reason": (
+                    "gate:credentials — Consentement OAuth Google Business Profile "
+                    "obtenu et jeton valide, mais l’appel API échoue en 403 car "
+                    "mybusinessaccountmanagement.googleapis.com est désactivée pour "
+                    "le projet 362154063865 ; décision attendue de Sébastien - "
+                    "activer l’API dans ce projet ou autoriser Hermes à le faire."
+                ),
+                "kind": "capability",
+                "recurrences": 2,
+                "limit": kb.BLOCK_RECURRENCE_LIMIT,
+            },
         )
         # Mirror kanban_db.block_task's real recurrence-limit transition: the
         # task actually lands in `triage` and stays there (no auto-decompose
@@ -764,11 +785,19 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert "TRIAGE" not in text, "no raw internal TRIAGE wording in a human message"
     assert tid not in text, "no raw task id in a direct chat message"
     assert "gate:" not in text, "internal gate: marker must not leak"
-    assert "needs credentials" in text, "the plain-language reason must survive"
-    assert "loops forever" in text, "the human task title must be shown"
-    assert "Action requise" in text, "must read as a clear French action request"
+    assert "Blocage :" in text, "the diagnosis must be labelled separately"
+    assert "l’appel API échoue en 403" in text, "the plain-language cause must survive"
+    assert "Identifier compte e-mail gérant API Ecobloc" in text
+    assert "Action attendue de toi :" in text
+    assert (
+        "activer l’API dans ce projet ou autoriser Hermes à le faire." in text
+    ), "the exact Ecobloc action must survive after the long technical diagnosis"
+    assert "Ensuite : Hermes reprend automatiquement" in text
     assert "@worker" not in text, "no assignee/profile tag on a human-decision message"
     assert "[default]" not in text, "no bracketed board-tag prefix on a human-decision message"
+    assert len(adapter.handled) == 1, (
+        "block_loop_detected must wake the owning Hermes conversation after notifying"
+    )
     # Cursor advanced: the event is claimed and not re-delivered.
     conn = kb.connect()
     try:
@@ -988,6 +1017,9 @@ def test_notifier_sends_clean_human_ping_for_blocked_task(tmp_path, monkeypatch)
     assert "needs the Ecobloc GSC token to continue" in message, (
         "the plain-language reason must survive"
     )
+    assert "Blocage :" in message
+    assert "Action attendue de toi :" in message
+    assert "Ensuite : Hermes reprend automatiquement" in message
     assert "codex-worker" not in message, (
         "no assignee/profile tag on a human-decision message"
     )

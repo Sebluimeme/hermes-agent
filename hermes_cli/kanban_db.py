@@ -7344,11 +7344,17 @@ def block_task(
     task_id: str,
     *,
     reason: Optional[str] = None,
+    action: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     metadata: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
+
+    ``action`` is the exact human response or operation needed to continue.
+    It is persisted separately from the diagnosis so notifiers never have to
+    infer a call to action from a long technical reason. Legacy callers may
+    omit it; their reason remains the fallback human action.
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
     un-typed block) drives routing instead of every block landing in one
@@ -7545,6 +7551,8 @@ def block_task(
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
+        human_action = action or reason or "Une intervention humaine est nécessaire."
+
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
@@ -7563,8 +7571,8 @@ def block_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, kind, reason, task_id) if expected_run_id is None
-                else (kind, recurrences, kind, reason, task_id, int(expected_run_id)),
+                (kind, recurrences, kind, human_action, task_id) if expected_run_id is None
+                else (kind, recurrences, kind, human_action, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -7582,6 +7590,7 @@ def block_task(
                 conn, task_id, "block_loop_detected",
                 {
                     "reason": reason,
+                    "action": action,
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
@@ -7606,7 +7615,7 @@ def block_task(
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                     """,
-                    (kind, recurrences, kind, reason, task_id),
+                    (kind, recurrences, kind, human_action, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -7625,7 +7634,7 @@ def block_task(
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
                     """,
-                    (kind, recurrences, kind, reason, task_id, int(expected_run_id)),
+                    (kind, recurrences, kind, human_action, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -7647,6 +7656,7 @@ def block_task(
                 conn, task_id, "blocked",
                 {
                     "reason": reason,
+                    "action": action,
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
@@ -7659,7 +7669,7 @@ def block_task(
             "VALUES (?, ?, ?, ?, 'open', ?)",
             (
                 cur_row["mission_id"], task_id, kind or "needs_input",
-                reason or "Une intervention humaine est nécessaire.",
+                human_action,
                 int(time.time()),
             ),
         )

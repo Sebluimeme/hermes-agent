@@ -83,6 +83,29 @@ def test_kanban_block_reason_scrubbed_jwt(worker_env):
     assert jwt not in stored
 
 
+def test_kanban_block_action_scrubbed_jwt(worker_env):
+    """A structured human action must never persist a bearer token."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        ".dozjgNryP4J3jVmNHl0w5N_5NjP1-iXkpHgcth826Iw"
+    )
+    result = json.loads(kt._handle_block({
+        "reason": "The Google Business Profile API needs an authorization.",
+        "action": f"Authorize Hermes with Bearer {jwt}",
+        "kind": "capability",
+    }))
+    assert result["ok"] is True
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, worker_env)
+        event = [e for e in kb.list_events(conn, worker_env) if e.kind == "blocked"][-1]
+    assert jwt not in (task.action_required or "")
+    assert jwt not in str(event.payload.get("action") or "")
+
+
 # ---------------------------------------------------------------------------
 # Negative test — plain text passes through unchanged
 # ---------------------------------------------------------------------------
