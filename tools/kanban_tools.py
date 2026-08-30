@@ -906,6 +906,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    completion_validation_source="tool",
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -917,6 +918,11 @@ def _handle_complete(args: dict, **kw) -> str:
             except kb.VisualReviewGateError as visual_err:
                 return tool_error(
                     f"kanban_complete: visual review gate not ready — {visual_err}"
+                )
+            except kb.CompletionValidationError as validation_err:
+                return tool_error(
+                    "kanban_complete: completion validator rejected handoff — "
+                    f"{validation_err}"
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -984,6 +990,16 @@ def _handle_completion_ready(args: dict, **kw) -> str:
             visual_rejection, metadata = kb.visual_completion_projection(
                 conn, tid, metadata,
             )
+            validator_rejection, metadata = kb.completion_validation_projection(
+                conn,
+                tid,
+                metadata,
+                summary=args.get("summary"),
+                result=args.get("result"),
+                created_cards=args.get("created_cards"),
+                source="tool",
+                dry_run=True,
+            )
             evidence = closure_evidence.classify_closure_evidence(
                 prior_status=task.status,
                 metadata=metadata,
@@ -1000,6 +1016,8 @@ def _handle_completion_ready(args: dict, **kw) -> str:
                 )
             if visual_rejection is not None:
                 missing.append(f"visual review: {visual_rejection}")
+            if validator_rejection is not None:
+                missing.append(f"completion validator: {validator_rejection}")
             if task.status != "review" and not (args.get("summary") or args.get("result")):
                 missing.append("summary or result")
             return json.dumps({
@@ -1196,6 +1214,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 reviewer=reviewer,
                 expected_run_id=_worker_run_id(tid),
                 with_reason=True,
+                review_handoff_source="tool",
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"
