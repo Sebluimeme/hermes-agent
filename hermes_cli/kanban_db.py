@@ -6219,6 +6219,15 @@ class VisualReviewGateError(ValueError):
     """Raised when a web/UI card lacks its two-stage visual proof."""
 
 
+class CompletionValidationError(ValueError):
+    """Raised when a plugin completion validator vetoes completion."""
+
+    def __init__(self, reason: str, *, code: str = "validator_rejected"):
+        self.reason = reason
+        self.code = code
+        super().__init__(reason)
+
+
 def _latest_review_handoff_metadata(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[dict[str, Any]]:
@@ -6376,6 +6385,82 @@ def visual_completion_projection(
         return str(exc), metadata
 
 
+def _completion_validation_projection_result(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict[str, Any]],
+    *,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    source: str = "core",
+    dry_run: bool = False,
+) -> tuple[str | Exception | None, Optional[dict[str, Any]]]:
+    """Project plugin completion validators without mutating Kanban state."""
+    row = conn.execute(
+        "SELECT title, body, created_by, status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return "task not found", metadata
+    try:
+        from hermes_cli.kanban_completion_validators import (
+            KanbanCompletionValidationContext,
+            KanbanCompletionValidationError as _PluginValidationError,
+            project_kanban_completion_validation,
+        )
+
+        projected, _outcomes = project_kanban_completion_validation(
+            KanbanCompletionValidationContext(
+                task_id=task_id,
+                title=row["title"],
+                body=row["body"],
+                created_by=row["created_by"],
+                board=get_current_board(),
+                prior_status=row["status"],
+                assignee=row["assignee"],
+                run_id=row["current_run_id"],
+                summary=summary,
+                result=result,
+                metadata=dict(metadata or {}),
+                created_cards=tuple(str(c) for c in (created_cards or ())),
+                source=source,
+                surface=source,
+                dry_run=dry_run,
+            )
+        )
+        return None, projected
+    except _PluginValidationError as exc:
+        return exc, metadata
+
+
+def completion_validation_projection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict[str, Any]],
+    *,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    source: str = "core",
+    dry_run: bool = False,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Project plugin completion validators without mutating Kanban state."""
+    rejection, projected = _completion_validation_projection_result(
+        conn,
+        task_id,
+        metadata,
+        summary=summary,
+        result=result,
+        created_cards=created_cards,
+        source=source,
+        dry_run=dry_run,
+    )
+    if rejection is None:
+        return None, projected
+    return str(rejection), projected
+
+
 def record_visual_check(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6418,6 +6503,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    completion_validation_source: str = "core",
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -6452,6 +6538,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    created_cards_tuple = tuple(str(c) for c in (created_cards or ()))
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -6462,9 +6549,9 @@ def complete_task(
     # tiny dedicated txn, then raise. The caller is responsible for
     # surfacing HallucinatedCardsError to the worker; this function
     # never mutates task state on a phantom-card rejection.
-    if created_cards:
+    if created_cards_tuple:
         verified_cards, phantom_cards = _verify_created_cards(
-            conn, task_id, created_cards
+            conn, task_id, created_cards_tuple
         )
         if phantom_cards:
             with write_txn(conn):
@@ -6490,6 +6577,21 @@ def complete_task(
     visual_error, metadata = visual_completion_projection(conn, task_id, metadata)
     if visual_error is not None:
         raise VisualReviewGateError(visual_error)
+    validation_error, metadata = _completion_validation_projection_result(
+        conn,
+        task_id,
+        metadata,
+        summary=summary,
+        result=result,
+        created_cards=created_cards_tuple,
+        source=completion_validation_source,
+        dry_run=False,
+    )
+    if validation_error is not None:
+        raise CompletionValidationError(
+            str(validation_error),
+            code=getattr(validation_error, "code", "validator_rejected"),
+        )
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
