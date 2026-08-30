@@ -1214,6 +1214,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 reviewer=reviewer,
                 expected_run_id=_worker_run_id(tid),
                 with_reason=True,
+                review_handoff_source="tool",
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"

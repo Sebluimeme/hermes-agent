@@ -366,6 +366,19 @@ VALID_HOOKS: Set[str] = {
     #   created_by, board, prior_status, assignee, run_id, summary, result, metadata,
     #   created_cards, source/surface: "core" | "cli" | "tool", dry_run: bool.
     "validate_kanban_completion",
+    # Pre-review-handoff validator hook. Fired after the built-in visual-review
+    # handoff normalization and before request_review mutates durable board
+    # state. Return values are honored: callbacks must return an explicit
+    # Result or mapping decision ({"accepted": True}, {"ok": True},
+    # {"allow": True}, {"action": "allow"}); they may project metadata and
+    # reviewer via {"metadata": {...}, "reviewer": "coder"} or veto via an
+    # explicit false decision / action=block. None/True/ambiguous mappings,
+    # exceptions, malformed results, and reentrance fail closed.
+    # Kwargs include a typed context plus additive scalar fields:
+    #   context: KanbanReviewHandoffContext, task_id, title, body, created_by,
+    #   board, prior_status, assignee, run_id, summary, metadata, reviewer,
+    #   source/surface: "core" | "cli" | "tool".
+    "validate_kanban_review_handoff",
     # Gateway platform-boundary observer hooks (#64176). Observer-only; each
     # callback isolated by invoke_hook. Payloads are normalized envelopes only,
     # never raw platform SDK objects (per #64176 / #64182 ground rule). This

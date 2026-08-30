@@ -2743,6 +2743,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             expected_run_id=_worker_run_id_for(tid),
             force=bool(getattr(args, "force", False)),
             with_reason=True,
+            review_handoff_source="cli",
         )
         if not ok:
             detail = reason or "not running/ready?"

@@ -7820,6 +7820,120 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _prior_reviewer_from_latest_changes(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return reviewer provenance from the latest changes_requested boundary."""
+    changes_run = conn.execute(
+        "SELECT id FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'changes_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    changes_event = None
+    if changes_run is not None:
+        changes_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'changes_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(changes_run["id"])),
+        ).fetchone()
+    try:
+        changes_payload = (
+            json.loads(changes_event["payload"])
+            if changes_event and changes_event["payload"]
+            else {}
+        )
+    except (json.JSONDecodeError, TypeError):
+        changes_payload = {}
+    prior_reviewer = (
+        changes_payload.get("reviewer")
+        if isinstance(changes_payload, dict)
+        else None
+    )
+    if changes_run is None:
+        return None, None
+    if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
+        return None, (
+            "re-review has no durable reviewer provenance (the "
+            "latest changes_requested event is missing or "
+            "malformed); pass reviewer= explicitly"
+        )
+    return prior_reviewer, None
+
+
+def _review_handoff_projection_result(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict[str, Any]],
+    reviewer: Optional[str],
+    *,
+    summary: Optional[str] = None,
+    source: str = "core",
+) -> tuple[str | Exception | None, Optional[dict[str, Any]], Optional[str], Optional[sqlite3.Row]]:
+    """Project review handoff plugins before any request_review mutation.
+
+    This deliberately runs outside ``write_txn``. Recursive callbacks must be
+    detected by the seam itself, not masked by SQLite's nested-transaction
+    guard and then laundered into an apparent allow.
+    """
+    row = conn.execute(
+        "SELECT title, body, created_by, assignee, status, claim_lock, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return "task not found", metadata, reviewer, None
+    try:
+        from hermes_cli.visual_review import prepare_review_handoff
+
+        metadata, reviewer = prepare_review_handoff(
+            task_id=task_id,
+            title=row["title"] or "",
+            body=row["body"] or "",
+            metadata=metadata if isinstance(metadata, dict) else None,
+            reviewer=reviewer,
+        )
+        if reviewer is None:
+            prior_reviewer, prior_error = _prior_reviewer_from_latest_changes(conn, task_id)
+            if prior_error is not None:
+                return prior_error, metadata, reviewer, row
+            reviewer = prior_reviewer
+        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+
+        from hermes_cli.kanban_review_handoff_validators import (
+            KanbanReviewHandoffContext,
+            KanbanReviewHandoffValidationError as _PluginReviewHandoffError,
+            project_kanban_review_handoff,
+        )
+
+        projected_metadata, projected_reviewer, _outcomes = project_kanban_review_handoff(
+            KanbanReviewHandoffContext(
+                task_id=task_id,
+                title=row["title"],
+                body=row["body"],
+                created_by=row["created_by"],
+                board=get_current_board(),
+                prior_status=row["status"],
+                assignee=row["assignee"],
+                run_id=row["current_run_id"],
+                summary=summary,
+                metadata=dict(metadata or {}),
+                reviewer=reviewer,
+                source=source,
+                surface=source,
+            )
+        )
+        reviewer = _canonical_assignee(projected_reviewer) if projected_reviewer is not None else None
+        return None, projected_metadata, reviewer, row
+    except ValueError as exc:
+        return exc, metadata, reviewer, row
+    except Exception as exc:
+        return exc, metadata, reviewer, row
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7830,6 +7944,7 @@ def request_review(
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    review_handoff_source: str = "core",
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -7855,15 +7970,44 @@ def request_review(
         return (ok, reason) if with_reason else ok
 
     summary = redact_review_value(summary)
+    if not _parents_satisfied(conn, task_id):
+        return _ret(False, "parent dependencies are not satisfied")
+    metadata = redact_review_value(metadata if isinstance(metadata, dict) else None)
+    projection_error, metadata, reviewer, projected_row = _review_handoff_projection_result(
+        conn,
+        task_id,
+        metadata if isinstance(metadata, dict) else None,
+        reviewer,
+        summary=summary,
+        source=review_handoff_source,
+    )
+    if projection_error is not None:
+        prefix = "visual review handoff rejected"
+        if getattr(projection_error, "code", None) is not None:
+            prefix = "review handoff validator rejected handoff"
+        return _ret(False, f"{prefix}: {projection_error}")
+    metadata = redact_review_value(metadata)
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT title, body, assignee, status, claim_lock, current_run_id "
+            "SELECT title, body, created_by, assignee, status, claim_lock, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        if projected_row is not None and (
+            trow["status"] != projected_row["status"]
+            or trow["assignee"] != projected_row["assignee"]
+            or trow["claim_lock"] != projected_row["claim_lock"]
+            or trow["current_run_id"] != projected_row["current_run_id"]
+            or trow["title"] != projected_row["title"]
+            or trow["body"] != projected_row["body"]
+        ):
+            return _ret(
+                False,
+                "task changed while projecting review handoff; retry request_review",
+            )
         if (
             trow["status"] == "running"
             and trow["current_run_id"] is not None
@@ -7878,23 +8022,6 @@ def request_review(
                 "or defer a transient visual dependency with "
                 "kanban_defer_review instead of requesting another review",
             )
-        # Web/UI candidates always enter the independent Coder review lane.
-        # The handoff is normalised here (the domain boundary shared by CLI,
-        # dashboard and model tools), so a caller cannot bypass desktop/mobile
-        # screenshot hashing by choosing another control surface.
-        try:
-            from hermes_cli.visual_review import prepare_review_handoff
-
-            metadata, reviewer = prepare_review_handoff(
-                task_id=task_id,
-                title=trow["title"] or "",
-                body=trow["body"] or "",
-                metadata=metadata if isinstance(metadata, dict) else None,
-                reviewer=reviewer,
-            )
-        except ValueError as exc:
-            return _ret(False, f"visual review handoff rejected: {exc}")
-        metadata = redact_review_value(metadata)
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -7910,45 +8037,6 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
-        if reviewer is None:
-            changes_run = conn.execute(
-                "SELECT id FROM task_runs "
-                "WHERE task_id = ? AND outcome = 'changes_requested' "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            changes_event = None
-            if changes_run is not None:
-                changes_event = conn.execute(
-                    "SELECT payload FROM task_events "
-                    "WHERE task_id = ? AND run_id = ? "
-                    "AND kind = 'changes_requested' "
-                    "ORDER BY id DESC LIMIT 1",
-                    (task_id, int(changes_run["id"])),
-                ).fetchone()
-            try:
-                changes_payload = (
-                    json.loads(changes_event["payload"])
-                    if changes_event and changes_event["payload"]
-                    else {}
-                )
-            except (json.JSONDecodeError, TypeError):
-                changes_payload = {}
-            prior_reviewer = (
-                changes_payload.get("reviewer")
-                if isinstance(changes_payload, dict)
-                else None
-            )
-            if changes_run is not None:
-                if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
-                    return _ret(
-                        False,
-                        "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
-                    )
-                reviewer = prior_reviewer
-        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
