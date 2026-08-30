@@ -217,3 +217,4 @@ native/fts5_cjk/*.so
 # source and its tests belong in Git; dated pre-change snapshots do not.
 *.bak-*
 *.pre-*
+.skills_prompt_snapshot.json

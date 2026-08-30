@@ -147,6 +147,28 @@ def _classify_authorization_block(payload: Any, *, has_instruction_grant: bool =
     return "needs_user_authorization"
 
 
+_LOCAL_PATH_RE = re.compile(
+    r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|"
+    r"[A-Za-z]:\\[^\s,;]+)"
+)
+
+
+def _safe_review_reason(value: Any, limit: int = 160) -> str:
+    """Return a mobile-friendly review reason safe for external delivery."""
+    from agent.redact import redact_sensitive_text
+
+    reason = redact_sensitive_text(
+        "" if value is None else str(value),
+        force=True,
+        redact_url_credentials=True,
+    )
+    reason = _LOCAL_PATH_RE.sub("[local path]", reason)
+    reason = " ".join(reason.split())
+    if len(reason) > limit:
+        reason = reason[: limit - 1].rstrip() + "…"
+    return reason
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -373,7 +395,8 @@ class GatewayKanbanWatchersMixin:
         For each subscription row, fetches ``task_events`` newer than the
         stored cursor with kind in the terminal set (``completed``,
         ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``block_loop_detected``,
+        ``review_requested``, ``changes_requested``, ``block_loop_detected``,
+        ``visual_review_deferred``, ``relayed_to_coder`` and
         ``provider_auth_required``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
@@ -412,7 +435,12 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "archived", "unblocked", "block_loop_detected", "review_requested", "visual_review_deferred", "relayed_to_coder", "provider_auth_required")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "status", "archived", "unblocked", "block_loop_detected",
+            "review_requested", "changes_requested", "visual_review_deferred",
+            "relayed_to_coder", "provider_auth_required",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -650,6 +678,11 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
                                     )
+                                    _has_instruction_grant = bool(
+                                        task and _kb.task_has_instruction_edit_authorization(
+                                            conn, sub["task_id"]
+                                        )
+                                    )
                                     deliveries.append({
                                         "sub": sub,
                                         "old_cursor": old_cursor,
@@ -658,11 +691,7 @@ class GatewayKanbanWatchersMixin:
                                         "task": task,
                                         "board": slug,
                                         "failure_note": failure_note,
-                                        "has_instruction_grant": bool(
-                                            task and _kb.task_has_instruction_edit_authorization(
-                                                conn, sub["task_id"]
-                                            )
-                                        ),
+                                        "has_instruction_grant": _has_instruction_grant,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -676,7 +705,7 @@ class GatewayKanbanWatchersMixin:
                             conn.close()
                     return deliveries
 
-                deliveries = await asyncio.to_thread(_collect)
+                deliveries = await _to_thread_process_service(_collect)
                 # Coalesce simultaneous human blockers by destination. Fifteen
                 # parallel cards must produce one Action requise inbox message,
                 # not fifteen Telegram pings. Claims for every member advance
@@ -931,6 +960,7 @@ class GatewayKanbanWatchersMixin:
                     # `wake`-only subscriptions already use — the completion is
                     # never silently lost just because the raw ping is skipped.
                     _completed_defers_to_wake = False
+                    wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
                         has_instruction_grant = bool(d.get("has_instruction_grant"))
@@ -1097,7 +1127,16 @@ class GatewayKanbanWatchersMixin:
                             # first-class review lane. Wake the origin thread.
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
-                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                                summary = str(ev.payload["summary"])
+                                handoff = f"\n{summary[:200]}"
+                                # Carry the worker's handoff into the wake turn
+                                # like ``completed`` does: a reviewer woken with
+                                # a bare "ready for review" has to re-read the
+                                # board to learn what was implemented.
+                                lines = summary.strip().splitlines()
+                                wake_handoff = (
+                                    lines[0][:200] if lines else summary[:200]
+                                )
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"
@@ -1124,6 +1163,22 @@ class GatewayKanbanWatchersMixin:
                             msg = "Relais automatique vers Coder."
                             if ev.payload and isinstance(ev.payload.get("message"), str):
                                 msg = ev.payload["message"]
+                        elif kind == "changes_requested":
+                            payload = ev.payload or {}
+                            reason = _safe_review_reason(payload.get("reason"))
+                            reviewer = _safe_review_reason(payload.get("reviewer"), 48)
+                            implementer = _safe_review_reason(payload.get("implementer"), 48)
+                            reason_text = reason or "reviewer feedback requires changes"
+                            provenance = ""
+                            if reviewer:
+                                provenance += f" — reviewer @{reviewer}"
+                            if implementer:
+                                provenance += f" → implementer @{implementer}"
+                            msg = (
+                                f"🛑 {board_tag}Kanban {sub['task_id']} review requested "
+                                f"changes/BLOCK: {reason_text}{provenance}"
+                            )
+                            wake_review_detail = reason_text
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -1332,9 +1387,18 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
+                        # Kinds that hand a decision back to the origin, so the
+                        # origin has to take a turn. ``review_requested`` (the
+                        # implementation is done and waits for a reviewer),
+                        # ``changes_requested`` (a reviewer BLOCKed and work
+                        # returns to the implementer) and ``block_loop_detected``
+                        # (routed to triage) belong here for the same reason
+                        # ``blocked`` does. ``status`` / ``archived`` /
+                        # ``unblocked`` stay out: bookkeeping.
                         _WAKE_KINDS = (
                             "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "block_loop_detected",
+                            "blocked", "review_requested", "changes_requested",
+                            "block_loop_detected",
                         )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
@@ -1371,8 +1435,10 @@ class GatewayKanbanWatchersMixin:
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
-                            if {"blocked", "block_loop_detected"} & _wake_kinds:
-                                _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
+                            if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
+                            if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -1397,6 +1463,11 @@ class GatewayKanbanWatchersMixin:
                                 _synth += "\n" + t(
                                     "gateway.kanban.wake.failure",
                                     detail=_failure_detail,
+                                )
+                            if wake_review_detail:
+                                _synth += "\n" + t(
+                                    "gateway.kanban.wake.review_detail",
+                                    reason=wake_review_detail,
                                 )
                             _synth += "\n\n" + t(
                                 "gateway.kanban.wake.guidance"
