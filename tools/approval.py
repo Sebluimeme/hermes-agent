@@ -3699,11 +3699,73 @@ def _await_kanban_worker_approval(
     task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     session_key = get_current_session_key()
     from agent.redact import redact_sensitive_text
-    from tools import worker_approval
 
     redacted_target = redact_sensitive_text(display_target)
     redacted_description = redact_sensitive_text(description)
     stable_keys = sorted({str(key).strip() for key in pattern_keys if str(key).strip()})
+    primary_key = stable_keys[0] if stable_keys else "kanban_worker"
+
+    # Worker approvals used to bypass the selected plugin transport entirely
+    # and jump straight to the core mailbox bridge.  A selected transport now
+    # owns the presentation round-trip for this path too; the host still owns
+    # redaction, timeout, correlation validation and final persistence.
+    transport_attempt = _present_with_selected_transport(
+        command=display_target,
+        description=description,
+        pattern_key=primary_key,
+        pattern_keys=stable_keys or [primary_key],
+        session_key=session_key,
+        surface="kanban_worker",
+        allow_session=allow_session,
+        allow_permanent=allow_permanent,
+    )
+    if transport_attempt.get("selected"):
+        transport_failure = transport_attempt.get("failure")
+        if transport_failure and transport_attempt.get("fallback") == "builtin":
+            logger.warning(
+                "Approval transport %r failed (%s); using explicit builtin fallback",
+                transport_attempt.get("name"),
+                transport_failure,
+            )
+        elif transport_failure:
+            return _transport_denied_result(
+                pattern_key=primary_key,
+                description=description,
+                failure=transport_failure,
+            )
+        else:
+            choice = transport_attempt.get("choice")
+            if choice in {None, "deny", "timeout"}:
+                outcome = "denied" if choice == "deny" else "timeout"
+                detail = (
+                    "refusée par l’utilisateur"
+                    if outcome == "denied"
+                    else "expirée sans réponse"
+                )
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: Approbation {detail} via le transport "
+                        "sélectionné. Aucun consentement n’a été donné. Ne pas "
+                        "retenter ni contourner cette action."
+                    ),
+                    "pattern_key": primary_key,
+                    "description": description,
+                    "outcome": outcome,
+                    "user_consent": False,
+                }
+            if choice == "session" and allow_session:
+                for key in stable_keys:
+                    approve_session(session_key, key)
+            elif choice == "always" and allow_permanent:
+                for key in stable_keys:
+                    approve_session(session_key, key)
+                    approve_permanent(key)
+                save_permanent_allowlist(_permanent_approved)
+            return {"approved": True, "message": None, "user_consent": True}
+
+    from tools import worker_approval
+
     target_hash = hashlib.sha256(redacted_target.encode("utf-8")).hexdigest()[:16]
     request_key = "command:" + ",".join(stable_keys) + ":" + target_hash
     decision = worker_approval.request_decision(
