@@ -746,7 +746,7 @@ class GatewayKanbanWatchersMixin:
                                 event for event in _member["events"]
                                 if event.kind in {"blocked", "block_loop_detected", "gave_up"}
                             )
-                            _, _action = _human_block_copy(
+                            _reason, _action = _human_block_copy(
                                 _event.payload,
                                 cause_limit=220,
                                 action_limit=220,
@@ -757,7 +757,11 @@ class GatewayKanbanWatchersMixin:
                             ):
                                 _action = str(_event.payload["error"])[:360].strip() or _action
                             _title = (_task.title if _task else _member["sub"]["task_id"])[:100]
-                            _lines.append(f"{_index}. {_title}\n   Action : {_action}")
+                            _lines.append(
+                                f"{_index}. {_title}\n"
+                                f"   Blocage : {_reason}\n"
+                                f"   Action : {_action}"
+                            )
                         _lines.append(
                             "Répondez avec le numéro et votre décision ; "
                             "les autres tâches continuent automatiquement."
