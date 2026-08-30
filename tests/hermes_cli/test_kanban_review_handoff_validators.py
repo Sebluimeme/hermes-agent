@@ -53,31 +53,6 @@ def review_handoff_validators(kanban_home, monkeypatch):
         mgr._discovered = saved_discovered
 
 
-@pytest.fixture
-def fake_visual_handoff(monkeypatch):
-    calls = []
-
-    def _prepare_review_handoff(*, task_id, title, body, metadata, reviewer):
-        calls.append(
-            {
-                "task_id": task_id,
-                "title": title,
-                "body": body,
-                "metadata": dict(metadata or {}),
-                "reviewer": reviewer,
-            }
-        )
-        projected = dict(metadata or {})
-        projected.setdefault("visual_review", {"normalized": True})
-        return projected, reviewer or "coder"
-
-    monkeypatch.setattr(
-        "hermes_cli.visual_review.prepare_review_handoff",
-        _prepare_review_handoff,
-    )
-    return calls
-
-
 def _task(conn, *, title: str = "T", body: str = "B", created_by: str = "creator") -> str:
     return kb.create_task(
         conn,
@@ -104,8 +79,8 @@ def _last_run_metadata(conn, tid: str) -> dict:
     return json.loads(run["metadata"])
 
 
-def test_absent_plugin_keeps_visual_handoff_and_uses_lazy_has_hook(
-    review_handoff_validators, fake_visual_handoff, kanban_home
+def test_absent_plugin_preserves_handoff_without_legacy_visual_policy(
+    review_handoff_validators, kanban_home
 ):
     callbacks, has_hook_calls = review_handoff_validators
     conn = kb.connect()
@@ -114,15 +89,14 @@ def test_absent_plugin_keeps_visual_handoff_and_uses_lazy_has_hook(
         assert callbacks == []
         assert kb.request_review(conn, tid, summary="ready", metadata={"x": 1}) is True
         assert _status(conn, tid) == "review"
-        assert fake_visual_handoff[0]["metadata"] == {"x": 1}
-        assert _last_run_metadata(conn, tid)["visual_review"] == {"normalized": True}
+        assert _last_run_metadata(conn, tid) == {"x": 1}
         assert has_hook_calls == ["validate_kanban_review_handoff"]
     finally:
         conn.close()
 
 
 def test_direct_request_review_projects_metadata_reviewer_and_context(
-    review_handoff_validators, fake_visual_handoff, kanban_home
+    review_handoff_validators, kanban_home
 ):
     callbacks, _ = review_handoff_validators
     seen = []
@@ -146,7 +120,6 @@ def test_direct_request_review_projects_metadata_reviewer_and_context(
     try:
         tid = _task(conn, title="Visible title", body="Visible body", created_by="alice")
         assert kb.request_review(conn, tid, summary="ready", metadata={"base": True}) is True
-        assert fake_visual_handoff == []
         assert _last_run_metadata(conn, tid)["validator"] == {
             "task_id": tid,
             "title": "Visible title",
@@ -165,7 +138,7 @@ def test_direct_request_review_projects_metadata_reviewer_and_context(
 
 
 def test_metadata_is_redacted_before_plugin_boundary(
-    review_handoff_validators, fake_visual_handoff, kanban_home, monkeypatch
+    review_handoff_validators, kanban_home, monkeypatch
 ):
     callbacks, _ = review_handoff_validators
     seen = []
@@ -196,7 +169,7 @@ def test_metadata_is_redacted_before_plugin_boundary(
 
 
 def test_veto_error_malformed_and_exception_fail_closed(
-    review_handoff_validators, fake_visual_handoff, kanban_home
+    review_handoff_validators, kanban_home
 ):
     callbacks, _ = review_handoff_validators
     conn = kb.connect()
@@ -218,7 +191,7 @@ def test_veto_error_malformed_and_exception_fail_closed(
 
 
 def test_reentrant_request_review_poisons_outer_validation_fail_closed(
-    review_handoff_validators, fake_visual_handoff, kanban_home
+    review_handoff_validators, kanban_home
 ):
     callbacks, _ = review_handoff_validators
     conn = kb.connect()
@@ -247,7 +220,7 @@ def test_reentrant_request_review_poisons_outer_validation_fail_closed(
 
 
 def test_tool_path_invokes_validator_exactly_once_with_tool_source(
-    review_handoff_validators, fake_visual_handoff, kanban_home, monkeypatch
+    review_handoff_validators, kanban_home, monkeypatch
 ):
     callbacks, _ = review_handoff_validators
     seen = []
@@ -262,11 +235,10 @@ def test_tool_path_invokes_validator_exactly_once_with_tool_source(
     payload = json.loads(_handle_request_review({"summary": "ready"}))
     assert payload["ok"] is True
     assert seen == ["tool"]
-    assert fake_visual_handoff == []
 
 
 def test_cli_path_invokes_validator_exactly_once_with_cli_source(
-    review_handoff_validators, fake_visual_handoff, kanban_home
+    review_handoff_validators, kanban_home
 ):
     callbacks, _ = review_handoff_validators
     seen = []
@@ -286,24 +258,15 @@ def test_cli_path_invokes_validator_exactly_once_with_cli_source(
     )
     assert _cmd_request_review(args) == 0
     assert seen == ["cli"]
-    assert fake_visual_handoff == []
 
 
-def test_plugin_allow_bypasses_legacy_visual_handoff_rejection(
-    review_handoff_validators, kanban_home, monkeypatch
+def test_plugin_absent_does_not_apply_legacy_visual_handoff_rejection(
+    review_handoff_validators, kanban_home
 ):
     callbacks, _ = review_handoff_validators
-    callbacks.append(lambda context: {"action": "allow"})
-
-    def legacy_rejects(**_kwargs):
-        raise ValueError("capture absente ou vide: /tmp/desktop-only.png")
-
-    monkeypatch.setattr(
-        "hermes_cli.visual_review.prepare_review_handoff",
-        legacy_rejects,
-    )
     conn = kb.connect()
     try:
+        assert callbacks == []
         tid = _task(conn, title="web visual task", body="[NO-VISUAL] shadow plugin")
         ok, reason = kb.request_review(
             conn,
@@ -324,7 +287,7 @@ def test_plugin_allow_bypasses_legacy_visual_handoff_rejection(
 
 
 def test_plugin_allow_preserves_prior_reviewer_on_rereview(
-    review_handoff_validators, fake_visual_handoff, kanban_home
+    review_handoff_validators, kanban_home
 ):
     callbacks, _ = review_handoff_validators
     callbacks.append(lambda context: {"action": "allow"})
@@ -361,13 +324,12 @@ def test_plugin_allow_preserves_prior_reviewer_on_rereview(
         task = kb.get_task(conn, tid)
         assert task is not None
         assert task.assignee == "reviewer one"
-        assert fake_visual_handoff == []
     finally:
         conn.close()
 
 
 def test_live_claim_diagnostic_remains_when_plugin_absent(
-    review_handoff_validators, fake_visual_handoff, kanban_home
+    review_handoff_validators, kanban_home
 ):
     conn = kb.connect()
     try:
@@ -376,13 +338,12 @@ def test_live_claim_diagnostic_remains_when_plugin_absent(
         ok, reason = kb.request_review(conn, tid, summary="ready", with_reason=True)
         assert ok is False
         assert "live claim" in reason
-        assert len(fake_visual_handoff) == 1
     finally:
         conn.close()
 
 
 def test_active_reviewer_diagnostic_remains_when_plugin_absent(
-    review_handoff_validators, fake_visual_handoff, kanban_home
+    review_handoff_validators, kanban_home
 ):
     conn = kb.connect()
     try:
@@ -406,7 +367,7 @@ def test_active_reviewer_diagnostic_remains_when_plugin_absent(
     ],
 )
 def test_race_sensitive_fields_are_revalidated_after_external_projection(
-    review_handoff_validators, fake_visual_handoff, kanban_home, field, value
+    review_handoff_validators, kanban_home, field, value
 ):
     callbacks, _ = review_handoff_validators
     conn = kb.connect()

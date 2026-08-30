@@ -6215,10 +6215,6 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-class VisualReviewGateError(ValueError):
-    """Raised when a web/UI card lacks its two-stage visual proof."""
-
-
 class CompletionValidationError(ValueError):
     """Raised when a plugin completion validator vetoes completion."""
 
@@ -6226,163 +6222,6 @@ class CompletionValidationError(ValueError):
         self.reason = reason
         self.code = code
         super().__init__(reason)
-
-
-def _latest_review_handoff_metadata(
-    conn: sqlite3.Connection, task_id: str,
-) -> Optional[dict[str, Any]]:
-    row = conn.execute(
-        "SELECT metadata FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'review_requested' "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    try:
-        metadata = json.loads(row["metadata"] or "{}") if row else {}
-    except (TypeError, json.JSONDecodeError):
-        metadata = {}
-    return metadata if isinstance(metadata, dict) else None
-
-
-def _active_review_run_facts(
-    conn: sqlite3.Connection, task_id: str,
-) -> tuple[Optional[int], Optional[str], set[str]]:
-    """Return active review run id/profile and native screenshot hashes."""
-    task_row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if not task_row or task_row["current_run_id"] is None:
-        return None, None, set()
-    run_id = int(task_row["current_run_id"])
-    run = conn.execute(
-        "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
-        (run_id, task_id),
-    ).fetchone()
-    claimed = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id, run_id),
-    ).fetchone()
-    try:
-        claimed_payload = json.loads(claimed["payload"] or "{}") if claimed else {}
-    except (TypeError, json.JSONDecodeError):
-        claimed_payload = {}
-    if not isinstance(claimed_payload, dict) or claimed_payload.get("source_status") != "review":
-        return run_id, run["profile"] if run else None, set()
-    rows = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND run_id = ? AND kind = 'visual_checked' "
-        "ORDER BY id ASC",
-        (task_id, run_id),
-    ).fetchall()
-    hashes: set[str] = set()
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if (
-            isinstance(payload, dict)
-            and payload.get("engine") == "native"
-            and isinstance(payload.get("sha256"), str)
-        ):
-            hashes.add(payload["sha256"].lower())
-    return run_id, run["profile"] if run else None, hashes
-
-
-def visual_completion_projection(
-    conn: sqlite3.Connection,
-    task_id: str,
-    metadata: Optional[dict[str, Any]],
-) -> tuple[Optional[str], Optional[dict[str, Any]]]:
-    """Project the visual completion gate without mutating Kanban state."""
-    task = conn.execute(
-        "SELECT title, body, created_by FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if task is None:
-        return "task not found", metadata
-    handoff = _latest_review_handoff_metadata(conn, task_id)
-    try:
-        from hermes_cli.visual_review import (
-            VisualReviewError,
-            is_capture_only_delivery,
-            is_visual_web_task,
-            requires_production_proof,
-            validate_final_review,
-            validate_production_proof,
-        )
-
-        # A historical handoff may carry visual_review.required=True because
-        # an older classifier routed a read-only screenshot-delivery card into
-        # review.  Do not let that generated flag permanently strand the card:
-        # the card's explicit no-change contract plus the absence of changed
-        # files on BOTH handoff and completion is stronger evidence that no
-        # implementation candidate exists to review.
-        if (
-            is_capture_only_delivery(
-                task["title"] or "", task["body"] or "", handoff,
-            )
-            and is_capture_only_delivery(
-                task["title"] or "", task["body"] or "", metadata,
-            )
-        ):
-            return None, metadata
-        required = is_visual_web_task(
-            task["title"] or "",
-            task["body"] or "",
-            handoff or metadata,
-        ) or is_visual_web_task(
-            task["title"] or "",
-            task["body"] or "",
-            metadata,
-        )
-        if not required:
-            return None, metadata
-        if not handoff:
-            return (
-                "web visual task must use kanban_request_review with desktop/mobile screenshots before completion",
-                metadata,
-            )
-        _run_id, reviewer_profile, native_hashes = _active_review_run_facts(conn, task_id)
-        normalized = validate_final_review(
-            task_id=task_id,
-            handoff_metadata=handoff,
-            completion_metadata=metadata,
-            reviewer_profile=reviewer_profile,
-            native_checked_hashes=native_hashes,
-        )
-        projected = dict(metadata or {})
-        projected["visual_review"] = normalized
-        final_route = normalized.get("final_route")
-        final_label = "GPT fallback" if final_route == "gpt_fallback" else "Gemini"
-        projected.setdefault(
-            "evidence",
-            {
-                "kind": "visual",
-                "detail": (
-                    f"Coder native PASS + {final_label} final OK on matching "
-                    "desktop/mobile captures"
-                ),
-            },
-        )
-        # Root-cause guard for a landing-page card validated on screenshots
-        # that were never actually deployed (incident t_9fbb7396): a render
-        # change cannot close on visual review alone unless the card carries
-        # Sébastien's explicit [NO-PROD-PROOF] exemption.
-        if requires_production_proof(
-            task["title"] or "", task["body"] or "", handoff or metadata,
-            created_by=task["created_by"],
-        ) or requires_production_proof(
-            task["title"] or "", task["body"] or "", metadata,
-            created_by=task["created_by"],
-        ):
-            projected["production_proof"] = validate_production_proof(
-                task_id=task_id, metadata=metadata,
-            )
-        return None, projected
-    except VisualReviewError as exc:
-        return str(exc), metadata
 
 
 def _completion_validation_projection_result(
@@ -6574,9 +6413,6 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    visual_error, metadata = visual_completion_projection(conn, task_id, metadata)
-    if visual_error is not None:
-        raise VisualReviewGateError(visual_error)
     validation_error, metadata = _completion_validation_projection_result(
         conn,
         task_id,
@@ -6702,22 +6538,14 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
-        _verified = False
-        try:
-            from hermes_cli.closure_evidence import classify_closure_evidence
-
-            closure_evidence = classify_closure_evidence(
-                prior_status=prior_status,
-                metadata=metadata if isinstance(metadata, dict) else None,
-            )
-            if closure_evidence.satisfied:
-                _verified = True
-                completed_payload["evidence"] = {
-                    "kind": closure_evidence.kind,
-                    "detail": closure_evidence.detail,
-                }
-        except Exception:
-            pass
+        completed_payload["evidence"] = (
+            metadata.get("evidence")
+            if isinstance(metadata, dict) and isinstance(metadata.get("evidence"), dict)
+            else None
+        )
+        _verified = completed_payload["evidence"] is not None
+        if completed_payload["evidence"] is None:
+            completed_payload.pop("evidence")
         _completion_meta = metadata if isinstance(metadata, dict) else {}
         _integrated = any(
             _completion_meta.get(key)
@@ -7924,15 +7752,6 @@ def _review_handoff_projection_result(
             )
             return None, projected_metadata, reviewer, row
 
-        from hermes_cli.visual_review import prepare_review_handoff
-
-        metadata, reviewer = prepare_review_handoff(
-            task_id=task_id,
-            title=row["title"] or "",
-            body=row["body"] or "",
-            metadata=metadata if isinstance(metadata, dict) else None,
-            reviewer=reviewer,
-        )
         if reviewer is None:
             prior_reviewer, prior_error = _prior_reviewer_from_latest_changes(conn, task_id)
             if prior_error is not None:

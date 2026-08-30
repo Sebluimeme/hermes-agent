@@ -24,7 +24,6 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_cli import closure_evidence
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
 
@@ -2492,56 +2491,24 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            visual_rejection, projected_metadata = kb.visual_completion_projection(
-                conn, tid, metadata,
-            )
-            if visual_rejection is not None:
-                print(
-                    f"kanban: {tid}: visual review gate not ready — {visual_rejection}",
-                    file=sys.stderr,
-                )
-                failed.append(tid)
-                continue
-
-            # LOT 4 — a card cannot become 'done' on bare assertion. See
-            # hermes_cli/closure_evidence.py for the accepted evidence kinds.
-            closure_rejection = closure_evidence.closure_gate(
-                prior_status=getattr(task, "status", None),
-                metadata=projected_metadata,
-            )
-            if closure_rejection is not None:
-                print(f"kanban: {tid}: {closure_rejection}", file=sys.stderr)
-                failed.append(tid)
-                continue
-
-            visual_gate_failed = False
             try:
                 completed = kb.complete_task(
                     conn, tid,
                     result=args.result,
                     summary=summary,
-                    metadata=projected_metadata,
+                    metadata=metadata,
                     expected_run_id=_worker_run_id_for(tid),
                     completion_validation_source="cli",
                 )
-            except kb.VisualReviewGateError as exc:
-                completed = False
-                visual_gate_failed = True
-                print(
-                    f"kanban: {tid}: visual review gate not ready — {exc}",
-                    file=sys.stderr,
-                )
             except kb.CompletionValidationError as exc:
                 completed = False
-                visual_gate_failed = True
                 print(
                     f"kanban: {tid}: completion validator rejected handoff — {exc}",
                     file=sys.stderr,
                 )
             if not completed:
                 failed.append(tid)
-                if not visual_gate_failed:
-                    print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1

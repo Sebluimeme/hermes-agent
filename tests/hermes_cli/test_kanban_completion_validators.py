@@ -76,7 +76,7 @@ def _status(conn, tid: str) -> str:
     return task.status
 
 
-def test_absent_plugin_accepts_and_uses_public_lazy_has_hook(
+def test_absent_plugin_accepts_without_legacy_closure_or_visual_policy(
     kanban_home, completion_validators
 ):
     callbacks, has_hook_calls = completion_validators
@@ -84,7 +84,7 @@ def test_absent_plugin_accepts_and_uses_public_lazy_has_hook(
     try:
         tid = _task(conn)
         assert callbacks == []
-        assert kb.complete_task(conn, tid, summary="ok", metadata=_evidence()) is True
+        assert kb.complete_task(conn, tid, summary="ok", metadata={}) is True
         assert _status(conn, tid) == "done"
         assert has_hook_calls == ["validate_kanban_completion"]
     finally:
