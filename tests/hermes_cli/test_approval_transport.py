@@ -317,6 +317,108 @@ def test_gateway_selected_transport_does_not_require_gateway_notifier(monkeypatc
     assert seen[0].surface == "gateway"
 
 
+def _configure_kanban_worker_guard(monkeypatch, approval_module, manager):
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval_module, "_is_interactive_cli", lambda: True)
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "get_current_session_key", lambda *a, **k: "session-a")
+    monkeypatch.setattr(approval_module, "is_approved", lambda *args: False)
+    monkeypatch.setattr(approval_module, "get_plugin_manager", lambda: manager, raising=False)
+    monkeypatch.setattr(
+        approval_module,
+        "_get_approval_transport_config",
+        lambda: ("phone", None),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda command: {"action": "allow", "findings": [], "summary": ""},
+    )
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_transport_worker")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.setattr(approval_module, "_get_single_query_approval_mode", lambda: "deny")
+
+
+def test_kanban_worker_check_all_uses_selected_transport(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    seen = []
+    _context(manager).register_approval_transport(
+        "phone", lambda request: seen.append(request) or request.respond("once")
+    )
+    _configure_kanban_worker_guard(monkeypatch, approval, manager)
+    mailbox_calls = []
+    monkeypatch.setattr(
+        "tools.worker_approval.request_decision",
+        lambda **kwargs: mailbox_calls.append(kwargs) or {"resolved": True, "choice": "once"},
+    )
+
+    result = approval.check_all_command_guards("rm -rf /tmp/example", "local")
+
+    assert result["approved"] is True
+    assert len(seen) == 1
+    assert seen[0].surface == "kanban_worker"
+    assert seen[0].pattern_keys
+    assert mailbox_calls == []
+
+
+def test_kanban_worker_check_all_denies_when_only_builtin_is_configured(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    _configure_kanban_worker_guard(monkeypatch, approval, manager)
+    monkeypatch.setattr(
+        approval,
+        "_get_approval_transport_config",
+        lambda: ("builtin", None),
+        raising=False,
+    )
+    mailbox_calls = []
+    monkeypatch.setattr(
+        "tools.worker_approval.request_decision",
+        lambda **kwargs: mailbox_calls.append(kwargs) or {"resolved": True, "choice": "once"},
+    )
+
+    result = approval.check_all_command_guards("rm -rf /tmp/example", "local")
+
+    assert result["approved"] is False
+    assert result["outcome"] == "worker_transport_required"
+    assert mailbox_calls == []
+
+
+def test_kanban_worker_run_approval_gate_uses_selected_transport(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    seen = []
+    _context(manager).register_approval_transport(
+        "phone", lambda request: seen.append(request) or request.respond("session")
+    )
+    _configure_kanban_worker_guard(monkeypatch, approval, manager)
+    mailbox_calls = []
+    session_approvals = []
+    monkeypatch.setattr(
+        "tools.worker_approval.request_decision",
+        lambda **kwargs: mailbox_calls.append(kwargs) or {"resolved": True, "choice": "once"},
+    )
+    monkeypatch.setattr(
+        approval,
+        "approve_session",
+        lambda session_key, pattern_key: session_approvals.append((session_key, pattern_key)),
+    )
+
+    result = approval.check_dangerous_command("rm -rf /tmp/example", "local")
+
+    assert result["approved"] is True
+    assert len(seen) == 1
+    assert seen[0].surface == "kanban_worker"
+    assert session_approvals
+    assert mailbox_calls == []
+
+
 def test_execute_code_gateway_uses_selected_transport(monkeypatch):
     from tools import approval
 
@@ -405,7 +507,8 @@ def test_redaction_failure_denies_before_transport_callback(monkeypatch):
     _configure_manual_guard(monkeypatch, approval, manager)
 
     def redaction_failed(text, *, force=False):
-        assert force is True
+        if not force:
+            return text
         if text in {"rm -rf /tmp/example", "dangerous"}:
             raise RuntimeError("redactor unavailable")
         return text

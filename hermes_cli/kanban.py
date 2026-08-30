@@ -2522,12 +2522,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     summary=summary,
                     metadata=projected_metadata,
                     expected_run_id=_worker_run_id_for(tid),
+                    completion_validation_source="cli",
                 )
             except kb.VisualReviewGateError as exc:
                 completed = False
                 visual_gate_failed = True
                 print(
                     f"kanban: {tid}: visual review gate not ready — {exc}",
+                    file=sys.stderr,
+                )
+            except kb.CompletionValidationError as exc:
+                completed = False
+                visual_gate_failed = True
+                print(
+                    f"kanban: {tid}: completion validator rejected handoff — {exc}",
                     file=sys.stderr,
                 )
             if not completed:
