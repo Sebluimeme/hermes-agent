@@ -146,7 +146,7 @@ def test_direct_request_review_projects_metadata_reviewer_and_context(
     try:
         tid = _task(conn, title="Visible title", body="Visible body", created_by="alice")
         assert kb.request_review(conn, tid, summary="ready", metadata={"base": True}) is True
-        assert len(fake_visual_handoff) == 1
+        assert fake_visual_handoff == []
         assert _last_run_metadata(conn, tid)["validator"] == {
             "task_id": tid,
             "title": "Visible title",
@@ -154,7 +154,7 @@ def test_direct_request_review_projects_metadata_reviewer_and_context(
             "created_by": "alice",
             "source": "core",
             "surface": "core",
-            "reviewer": "coder",
+            "reviewer": None,
         }
         task = kb.get_task(conn, tid)
         assert task is not None
@@ -262,7 +262,7 @@ def test_tool_path_invokes_validator_exactly_once_with_tool_source(
     payload = json.loads(_handle_request_review({"summary": "ready"}))
     assert payload["ok"] is True
     assert seen == ["tool"]
-    assert len(fake_visual_handoff) == 1
+    assert fake_visual_handoff == []
 
 
 def test_cli_path_invokes_validator_exactly_once_with_cli_source(
@@ -286,7 +286,84 @@ def test_cli_path_invokes_validator_exactly_once_with_cli_source(
     )
     assert _cmd_request_review(args) == 0
     assert seen == ["cli"]
-    assert len(fake_visual_handoff) == 1
+    assert fake_visual_handoff == []
+
+
+def test_plugin_allow_bypasses_legacy_visual_handoff_rejection(
+    review_handoff_validators, kanban_home, monkeypatch
+):
+    callbacks, _ = review_handoff_validators
+    callbacks.append(lambda context: {"action": "allow"})
+
+    def legacy_rejects(**_kwargs):
+        raise ValueError("capture absente ou vide: /tmp/desktop-only.png")
+
+    monkeypatch.setattr(
+        "hermes_cli.visual_review.prepare_review_handoff",
+        legacy_rejects,
+    )
+    conn = kb.connect()
+    try:
+        tid = _task(conn, title="web visual task", body="[NO-VISUAL] shadow plugin")
+        ok, reason = kb.request_review(
+            conn,
+            tid,
+            summary="ready",
+            metadata={
+                "visual_review": {
+                    "screenshots": {"desktop": "/tmp/desktop-only.png"},
+                }
+            },
+            with_reason=True,
+        )
+        assert ok is True
+        assert reason is None
+        assert _status(conn, tid) == "review"
+    finally:
+        conn.close()
+
+
+def test_plugin_allow_preserves_prior_reviewer_on_rereview(
+    review_handoff_validators, fake_visual_handoff, kanban_home
+):
+    callbacks, _ = review_handoff_validators
+    callbacks.append(lambda context: {"action": "allow"})
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="rereview", assignee="builder")
+        first = kb.claim_task(conn, tid)
+        assert first is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="v1",
+            reviewer="Reviewer One",
+            expected_run_id=first.current_run_id,
+        ) is True
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.request_changes(
+            conn,
+            tid,
+            reason="fix it",
+            expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+        retry = kb.claim_task(conn, tid, claimer="builder:retry")
+        assert retry is not None
+
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="v2",
+            expected_run_id=retry.current_run_id,
+        ) is True
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.assignee == "reviewer one"
+        assert fake_visual_handoff == []
+    finally:
+        conn.close()
 
 
 def test_live_claim_diagnostic_remains_when_plugin_absent(

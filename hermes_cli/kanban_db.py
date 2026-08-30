@@ -7887,22 +7887,6 @@ def _review_handoff_projection_result(
     if row is None:
         return "task not found", metadata, reviewer, None
     try:
-        from hermes_cli.visual_review import prepare_review_handoff
-
-        metadata, reviewer = prepare_review_handoff(
-            task_id=task_id,
-            title=row["title"] or "",
-            body=row["body"] or "",
-            metadata=metadata if isinstance(metadata, dict) else None,
-            reviewer=reviewer,
-        )
-        if reviewer is None:
-            prior_reviewer, prior_error = _prior_reviewer_from_latest_changes(conn, task_id)
-            if prior_error is not None:
-                return prior_error, metadata, reviewer, row
-            reviewer = prior_reviewer
-        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
-
         from hermes_cli.kanban_review_handoff_validators import (
             KanbanReviewHandoffContext,
             KanbanReviewHandoffValidationError as _PluginReviewHandoffError,
@@ -7926,8 +7910,36 @@ def _review_handoff_projection_result(
                 surface=source,
             )
         )
-        reviewer = _canonical_assignee(projected_reviewer) if projected_reviewer is not None else None
-        return None, projected_metadata, reviewer, row
+
+        if _outcomes:
+            if projected_reviewer is None:
+                prior_reviewer, prior_error = _prior_reviewer_from_latest_changes(conn, task_id)
+                if prior_error is not None:
+                    return prior_error, projected_metadata, projected_reviewer, row
+                projected_reviewer = prior_reviewer
+            reviewer = (
+                _canonical_assignee(projected_reviewer)
+                if projected_reviewer is not None
+                else None
+            )
+            return None, projected_metadata, reviewer, row
+
+        from hermes_cli.visual_review import prepare_review_handoff
+
+        metadata, reviewer = prepare_review_handoff(
+            task_id=task_id,
+            title=row["title"] or "",
+            body=row["body"] or "",
+            metadata=metadata if isinstance(metadata, dict) else None,
+            reviewer=reviewer,
+        )
+        if reviewer is None:
+            prior_reviewer, prior_error = _prior_reviewer_from_latest_changes(conn, task_id)
+            if prior_error is not None:
+                return prior_error, metadata, reviewer, row
+            reviewer = prior_reviewer
+        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        return None, metadata, reviewer, row
     except ValueError as exc:
         return exc, metadata, reviewer, row
     except Exception as exc:
