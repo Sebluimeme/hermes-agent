@@ -56,6 +56,13 @@ def test_visual_classifier_supports_heuristic_marker_and_opt_out() -> None:
     assert vr.is_visual_web_task("Refactor", metadata={"changed_files": ["src/Card.tsx"]})
 
 
+def test_visual_classifier_tolerates_non_string_legacy_values() -> None:
+    assert not vr.is_visual_web_task(object(), object())
+    assert vr.is_visual_web_task(
+        object(), metadata={"changed_files": ["src/Card.tsx"]}
+    )
+
+
 def test_google_ads_configuration_is_not_misclassified_as_web_visual() -> None:
     body = (
         "Rendre principales les conversions « Calls from ads » et "

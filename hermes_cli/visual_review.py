@@ -148,7 +148,12 @@ def is_capture_only_delivery(
     metadata: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Return whether the card only delivers views of unchanged rendering."""
-    text = f"{title or ''}\n{body or ''}".lower()
+    # DB adapters and partially mocked legacy callers can supply a non-string
+    # sentinel. Classification is fail-closed to the declared changed files;
+    # never pass such an object into a regex or let completion crash.
+    title_text = title if isinstance(title, str) else ""
+    body_text = body if isinstance(body, str) else ""
+    text = f"{title_text}\n{body_text}".lower()
     return bool(
         _CAPTURE_ONLY_RE.search(text)
         and _NO_RENDER_CHANGE_RE.search(text)
@@ -168,7 +173,9 @@ def is_visual_web_task(
     marker gives the orchestrator a deterministic escape hatch for false
     positives such as a CSS parser with no rendered output.
     """
-    text = f"{title or ''}\n{body or ''}".lower()
+    title_text = title if isinstance(title, str) else ""
+    body_text = body if isinstance(body, str) else ""
+    text = f"{title_text}\n{body_text}".lower()
     if any(marker in text for marker in _OPT_OUT_MARKERS):
         return False
     if any(marker in text for marker in _EXPLICIT_MARKERS):
@@ -183,7 +190,7 @@ def is_visual_web_task(
     # files and can strand delivery behind Gemini quota.  Require both a
     # capture intent and an explicit no-change statement, and refuse the
     # shortcut when changed files were supplied.
-    if is_capture_only_delivery(title, body, metadata):
+    if is_capture_only_delivery(title_text, body_text, metadata):
         return False
     # A Google Ads configuration card can legitimately mention UI words in
     # its acceptance text (for example an action named "Formulaire Devis",
@@ -198,8 +205,8 @@ def is_visual_web_task(
         Path(path).suffix.lower() in _VISUAL_EXTENSIONS for path in changed_files
     )
     if (
-        _ADS_CONFIGURATION_TITLE_RE.search(title or "")
-        and _ADS_CONFIGURATION_OBJECT_RE.search(title or "")
+        _ADS_CONFIGURATION_TITLE_RE.search(title_text)
+        and _ADS_CONFIGURATION_OBJECT_RE.search(title_text)
         and not has_visual_file
     ):
         return False
