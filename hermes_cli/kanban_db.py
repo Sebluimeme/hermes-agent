@@ -2950,6 +2950,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     has_task_runs = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
+    task_run_columns = (
+        {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if has_task_runs
+        else set()
+    )
     drifted_done = (
         conn.execute(
             "SELECT id,execution_status,failure_class,next_retry_at,action_required "
@@ -2998,7 +3003,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "AND (SELECT r.outcome FROM task_runs r WHERE r.task_id=t.id "
             "ORDER BY r.id DESC LIMIT 1)='review_requested'"
         ).fetchall()
-        if repair_required <= repair_columns and has_task_runs
+        if repair_required <= repair_columns and "outcome" in task_run_columns
         else []
     )
     for row in drifted_review:
@@ -3081,7 +3086,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "AND e.kind='visual_review_deferred' "
             "AND lower(e.payload) LIKE '%gemini%')"
         ).fetchall()
-        if repair_required <= repair_columns and has_task_runs
+        if repair_required <= repair_columns and "outcome" in task_run_columns
         else []
     )
     for row in legacy_gemini_deferred:
