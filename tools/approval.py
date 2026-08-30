@@ -3671,14 +3671,12 @@ def _get_single_query_approval_mode() -> str:
         return "deny"
 
 
-def _kanban_worker_approval_bridge_active() -> bool:
-    """Return whether this single-query process can reach a real operator.
+def _kanban_worker_transport_context_active() -> bool:
+    """Return whether this single-query process is a Kanban worker.
 
-    Dispatcher workers are single-query processes, but unlike cron jobs they
-    carry a durable task id and notification subscription.  The gateway can
-    therefore relay their approval request to Telegram/Discord buttons through
-    ``tools.worker_approval``.  Treating every ``-q`` process as unattended
-    used to deny these requests before that bridge ever had a chance to run.
+    Workers may request approval only through the configured approval transport
+    plugin. A missing/non-selected transport fails closed; approval.py must not
+    construct a built-in worker prompt itself.
     """
     return bool(
         _is_single_query_approval_context()
@@ -3695,19 +3693,13 @@ def _await_kanban_worker_approval(
     allow_session: bool,
     allow_permanent: bool,
 ) -> dict:
-    """Round-trip one worker approval through the durable gateway bridge."""
-    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    """Round-trip one worker approval through the selected plugin transport."""
     session_key = get_current_session_key()
-    from agent.redact import redact_sensitive_text
-
-    redacted_target = redact_sensitive_text(display_target)
-    redacted_description = redact_sensitive_text(description)
     stable_keys = sorted({str(key).strip() for key in pattern_keys if str(key).strip()})
     primary_key = stable_keys[0] if stable_keys else "kanban_worker"
 
-    # Worker approvals used to bypass the selected plugin transport entirely
-    # and jump straight to the core mailbox bridge.  A selected transport now
-    # owns the presentation round-trip for this path too; the host still owns
+    # Worker approvals must not materialize a core-owned human prompt.  The
+    # plugin transport owns presentation; the host only keeps detection,
     # redaction, timeout, correlation validation and final persistence.
     transport_attempt = _present_with_selected_transport(
         command=display_target,
@@ -3719,85 +3711,47 @@ def _await_kanban_worker_approval(
         allow_session=allow_session,
         allow_permanent=allow_permanent,
     )
-    if transport_attempt.get("selected"):
-        transport_failure = transport_attempt.get("failure")
-        if transport_failure and transport_attempt.get("fallback") == "builtin":
-            logger.warning(
-                "Approval transport %r failed (%s); using explicit builtin fallback",
-                transport_attempt.get("name"),
-                transport_failure,
-            )
-        elif transport_failure:
-            return _transport_denied_result(
-                pattern_key=primary_key,
-                description=description,
-                failure=transport_failure,
-            )
-        else:
-            choice = transport_attempt.get("choice")
-            if choice in {None, "deny", "timeout"}:
-                outcome = "denied" if choice == "deny" else "timeout"
-                detail = (
-                    "refusée par l’utilisateur"
-                    if outcome == "denied"
-                    else "expirée sans réponse"
-                )
-                return {
-                    "approved": False,
-                    "message": (
-                        f"BLOCKED: Approbation {detail} via le transport "
-                        "sélectionné. Aucun consentement n’a été donné. Ne pas "
-                        "retenter ni contourner cette action."
-                    ),
-                    "pattern_key": primary_key,
-                    "description": description,
-                    "outcome": outcome,
-                    "user_consent": False,
-                }
-            if choice == "session" and allow_session:
-                for key in stable_keys:
-                    approve_session(session_key, key)
-            elif choice == "always" and allow_permanent:
-                for key in stable_keys:
-                    approve_session(session_key, key)
-                    approve_permanent(key)
-                save_permanent_allowlist(_permanent_approved)
-            return {"approved": True, "message": None, "user_consent": True}
-
-    from tools import worker_approval
-
-    target_hash = hashlib.sha256(redacted_target.encode("utf-8")).hexdigest()[:16]
-    request_key = "command:" + ",".join(stable_keys) + ":" + target_hash
-    decision = worker_approval.request_decision(
-        task_id=task_id,
-        title="Approbation nécessaire pour reprendre la tâche",
-        description=redacted_description,
-        request_key=request_key,
-        command=redacted_target,
-        pattern_keys=stable_keys,
-        allow_session=allow_session,
-        allow_permanent=allow_permanent,
-    )
-    resolved = bool(decision.get("resolved"))
-    choice = decision.get("choice")
-    deny_reason = decision.get("reason")
-    if not resolved or choice in {None, "deny", "timeout"}:
-        outcome = "denied" if resolved and choice == "deny" else "timeout"
-        detail = "refusée par l’utilisateur" if outcome == "denied" else "expirée sans réponse"
-        reason_addendum = f' Motif : "{deny_reason}".' if deny_reason else ""
+    if not transport_attempt.get("selected"):
         return {
             "approved": False,
             "message": (
-                f"BLOCKED: Approbation {detail}.{reason_addendum} "
-                "Aucun consentement n’a été donné. Ne pas retenter ni "
-                "contourner cette action."
+                "BLOCKED: Kanban worker approval requires a selected approval "
+                "transport plugin. The core builtin approval surface is not a "
+                "worker transport."
             ),
-            "pattern_key": stable_keys[0] if stable_keys else "kanban_worker",
+            "pattern_key": primary_key,
+            "description": description,
+            "outcome": "worker_transport_required",
+            "user_consent": False,
+        }
+    transport_failure = transport_attempt.get("failure")
+    if transport_failure:
+        return _transport_denied_result(
+            pattern_key=primary_key,
+            description=description,
+            failure=transport_failure,
+        )
+
+    choice = transport_attempt.get("choice")
+    if choice in {None, "deny", "timeout"}:
+        outcome = "denied" if choice == "deny" else "timeout"
+        detail = (
+            "refusée par l’utilisateur"
+            if outcome == "denied"
+            else "expirée sans réponse"
+        )
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: Approbation {detail} via le transport "
+                "sélectionné. Aucun consentement n’a été donné. Ne pas "
+                "retenter ni contourner cette action."
+            ),
+            "pattern_key": primary_key,
             "description": description,
             "outcome": outcome,
             "user_consent": False,
         }
-
     if choice == "session" and allow_session:
         for key in stable_keys:
             approve_session(session_key, key)
@@ -4091,7 +4045,7 @@ def _run_approval_gate(
         # Single-query (-q) sessions: respect single_query_mode config
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
-                if _kanban_worker_approval_bridge_active():
+                if _kanban_worker_transport_context_active():
                     return _await_kanban_worker_approval(
                         display_target=display_target,
                         description=description,
@@ -5048,7 +5002,7 @@ def check_all_command_guards(command: str, env_type: str,
     is_cli = _is_interactive_cli()
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
-    kanban_worker_bridge = _kanban_worker_approval_bridge_active()
+    kanban_worker_transport = _kanban_worker_transport_context_active()
 
     # Single-query (-q) sessions export HERMES_INTERACTIVE=1 but have no user
     # to answer approval prompts — an unanswered prompt just waits the full
@@ -5068,7 +5022,7 @@ def check_all_command_guards(command: str, env_type: str,
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
                 is_dangerous, _pk, description = detect_dangerous_command(command)
-                if is_dangerous and not kanban_worker_bridge:
+                if is_dangerous and not kanban_worker_transport:
                     return {
                         "approved": False,
                         "message": (
@@ -5091,7 +5045,7 @@ def check_all_command_guards(command: str, env_type: str,
                     _sq_tirith = check_command_security(command)
                     if (
                         _sq_tirith.get("action") in ("block", "warn")
-                        and not kanban_worker_bridge
+                        and not kanban_worker_transport
                     ):
                         _sq_desc = _format_tirith_description(_sq_tirith)
                         return {
@@ -5120,7 +5074,7 @@ def check_all_command_guards(command: str, env_type: str,
                             _sq_fail_open = _sec.get("tirith_fail_open", True)
                     except Exception:
                         pass
-                    if not _sq_fail_open and not kanban_worker_bridge:
+                    if not _sq_fail_open and not kanban_worker_transport:
                         return {
                             "approved": False,
                             "message": (
@@ -5258,7 +5212,7 @@ def check_all_command_guards(command: str, env_type: str,
                             ),
                         }
                     # else: tirith_fail_open is True — allow as before
-        if not kanban_worker_bridge:
+        if not kanban_worker_transport:
             return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -5362,7 +5316,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
         elif verdict == "deny" and not (
-            is_cli or is_gateway or is_ask or kanban_worker_bridge
+            is_cli or is_gateway or is_ask or kanban_worker_transport
         ):
             _record_denial(session_key)
             breaker_addendum = _denial_breaker_addendum(session_key)
@@ -5398,7 +5352,7 @@ def check_all_command_guards(command: str, env_type: str,
     # session — the UI was stricter than the persistence layer.
     has_permanent_capable = any(not is_t for _, _, is_t in warnings)
 
-    if kanban_worker_bridge:
+    if kanban_worker_transport:
         return _await_kanban_worker_approval(
             display_target=command,
             description=combined_desc,
@@ -5766,7 +5720,7 @@ def check_execute_code_guard(code: str, env_type: str,
     # gateway a durable route to a real approval button.
     if _is_single_query_approval_context():
         if _get_single_query_approval_mode() == "deny":
-            if _kanban_worker_approval_bridge_active():
+            if _kanban_worker_transport_context_active():
                 return _await_kanban_worker_approval(
                     display_target=f"execute_code <<'PY'\n{code}\nPY",
                     description=description,

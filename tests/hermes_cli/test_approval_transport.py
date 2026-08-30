@@ -365,6 +365,30 @@ def test_kanban_worker_check_all_uses_selected_transport(monkeypatch):
     assert mailbox_calls == []
 
 
+def test_kanban_worker_check_all_denies_when_only_builtin_is_configured(monkeypatch):
+    from tools import approval
+
+    manager = PluginManager()
+    _configure_kanban_worker_guard(monkeypatch, approval, manager)
+    monkeypatch.setattr(
+        approval,
+        "_get_approval_transport_config",
+        lambda: ("builtin", None),
+        raising=False,
+    )
+    mailbox_calls = []
+    monkeypatch.setattr(
+        "tools.worker_approval.request_decision",
+        lambda **kwargs: mailbox_calls.append(kwargs) or {"resolved": True, "choice": "once"},
+    )
+
+    result = approval.check_all_command_guards("rm -rf /tmp/example", "local")
+
+    assert result["approved"] is False
+    assert result["outcome"] == "worker_transport_required"
+    assert mailbox_calls == []
+
+
 def test_kanban_worker_run_approval_gate_uses_selected_transport(monkeypatch):
     from tools import approval
 
