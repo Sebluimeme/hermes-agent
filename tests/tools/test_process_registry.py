@@ -1083,8 +1083,8 @@ class TestCheckpoint:
         (the process is already running), so masking is lossless."""
         checkpoint = tmp_path / "procs.json"
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
-            secret = "sk-secret1234567890"
-            command = f"curl -H 'Authorization: Bearer {secret}' http://x"
+            credential_fixture = "sk-FAKE-checkpoint-redaction-7890"
+            command = f"curl -H 'Authorization: Bearer {credential_fixture}' http://x"
             s = _make_session(sid="proc_secret", command=command)
             s.pid = 12345
             s.host_start_time = int(time.time())
@@ -1093,7 +1093,7 @@ class TestCheckpoint:
 
             data = json.loads(checkpoint.read_text())
             assert data[0]["session_id"] == "proc_secret"
-            assert secret not in data[0]["command"]
+            assert credential_fixture not in data[0]["command"]
             assert data[0]["command"] != command
 
 # =========================================================================
@@ -1608,10 +1608,10 @@ class TestHandleProcessRedaction:
     def test_poll_redacts_prefix_key(self, monkeypatch):
         pr, sess = self._setup(
             monkeypatch, "python app.py",
-            "leaked OPENAI_API_KEY sk-proj-abc123def456ghi789jkl012 here",
+            "leaked OPENAI_API_KEY sk-FAKE-prefix-key-redaction-l012 here",
         )
         out = json.loads(pr._handle_process({"action": "poll", "session_id": sess.id}))
-        assert "abc123def456" not in out["output_preview"]
+        assert "sk-FAKE-prefix-key-redaction-l012" not in out["output_preview"]
 
     def test_list_redacts_command_and_output(self, monkeypatch):
         """`process(action=list)` redacts command + output_preview — issue #77484.
@@ -1621,14 +1621,14 @@ class TestHandleProcessRedaction:
         secrets (unlike poll/log/wait/kill).
         """
         pr, sess = self._setup(
-            monkeypatch, "curl -H 'Authorization: Bearer sk-abc123def456ghi789jkl012345'",
-            "opaque token sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG output",
+            monkeypatch, "curl -H 'Authorization: Bearer sk-FAKE-command-redaction-2345'",
+            "opaque token sk-FAKE-output-redaction-GGGG output",
         )
         out = json.loads(pr._handle_process({"action": "list"}))
         assert len(out["processes"]) >= 1
         entry = out["processes"][0]
-        assert "sk-abc123def456ghi789jkl012345" not in entry["command"]
-        assert "sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG" not in entry["output_preview"]
+        assert "sk-FAKE-command-redaction-2345" not in entry["command"]
+        assert "sk-FAKE-output-redaction-GGGG" not in entry["output_preview"]
         assert "curl" in entry["command"]
 
     def test_disabled_passes_through(self, monkeypatch):
