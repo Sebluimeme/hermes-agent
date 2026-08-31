@@ -1062,12 +1062,13 @@ def _handle_block(args: dict, **kw) -> str:
         if reason_rejection is not None:
             conn.close()
             return tool_error(reason_rejection)
-        if kind in {"needs_input", "capability"} and not action:
+        if kind in {"needs_input", "capability", "deferred"} and not action:
             conn.close()
             return tool_error(
-                "action is required for needs_input/capability — state the "
-                "exact reply, choice, authorization, or operation expected "
-                "from the human"
+                "action is required for needs_input/capability/deferred — "
+                "state the exact reply, choice, authorization, or operation "
+                "expected from the human (for deferred: what explicit future "
+                "request resumes the task)"
             )
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
             conn.close()
@@ -2508,12 +2509,16 @@ KANBAN_BLOCK_SCHEMA = {
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "no agent can do), 'transient' (a flaky failure that may clear), or "
+        "'deferred' (the human already answered/decided — e.g. in a comment "
+        "— and this is a voluntary park, not an open question; it only "
+        "resumes on an explicit future request). "
         "``reason`` is shown to the human on the board. "
-        "For 'needs_input' and 'capability', ``action`` is mandatory and "
-        "must state exactly what the human should reply, choose, authorize, "
-        "or do. ``reason`` explains the cause; never hide the action at the "
-        "end of a technical diagnosis. If a task keeps "
+        "For 'needs_input', 'capability' and 'deferred', ``action`` is "
+        "mandatory and must state exactly what the human should reply, "
+        "choose, authorize, or do (for 'deferred': what explicit future "
+        "request resumes the task). ``reason`` explains the cause; never "
+        "hide the action at the end of a technical diagnosis. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
@@ -2545,11 +2550,15 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": [
+                    "dependency", "needs_input", "capability", "transient",
+                    "deferred",
+                ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "'deferred' is for a decision already made by the human "
+                    "(don't re-ask it). Omit only if none apply."
                 ),
             },
             "board": _board_schema_prop(),

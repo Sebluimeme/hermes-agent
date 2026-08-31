@@ -119,13 +119,24 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
 #   * ``transient``    — a flaky/temporary failure that may clear on retry.
+#   * ``deferred``     — the human already decided (recorded in a comment or
+#                        prior block reason): this is voluntarily parked, not
+#                        an open question. Distinct from ``needs_input`` so a
+#                        recap never re-asks for an answer that already
+#                        arrived; it only resumes on an explicit future
+#                        request, never automatically and never by a cron
+#                        unblock. Incident: t_0e1bb0fd (S11-2 Google Business
+#                        Profile) stayed ``needs_input`` after Sébastien said
+#                        "je gère ça moi-même plus tard", so every recap kept
+#                        showing "ta réponse" for a question he had already
+#                        answered.
 #
-# ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
-# for a human, and the unblock-loop breaker (see ``block_task`` /
-# ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
+# ``needs_input``, ``capability`` and ``deferred`` are "truly blocked": they go
+# to ``blocked`` for a human, and the unblock-loop breaker (see ``block_task``
+# / ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "deferred"}
 
 # A transient worker stop is a resumable yield, not a human blocker. Keep a
 # short delay so the exiting worker has time to release its process/workspace

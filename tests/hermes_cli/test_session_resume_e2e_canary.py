@@ -4,8 +4,8 @@
 
   * transient block -> unblock -> respawn reuses the *exact* worker session
     (same session id, real message continuity in the real session store).
-  * needs_input / capability blocks -> unblock -> respawn always start a
-    fresh session (no --resume, no env leak, no continuity).
+  * needs_input / capability / deferred blocks -> unblock -> respawn always
+    start a fresh session (no --resume, no env leak, no continuity).
   * a crash never resumes either, even when a *prior* transient block left
     ``block_kind="transient"`` on the row (the crashed run's outcome is
     ``"crashed"``, not ``"blocked"`` — the exact guard in
@@ -222,7 +222,7 @@ class TestTransientResumeRealCanary:
 
 
 class TestNonResumingBlocksRealCanary:
-    @pytest.mark.parametrize("kind", ["needs_input", "capability"])
+    @pytest.mark.parametrize("kind", ["needs_input", "capability", "deferred"])
     def test_human_or_capability_block_starts_fresh_session(
         self, kind, canary_env, monkeypatch, tmp_path
     ):
@@ -234,12 +234,17 @@ class TestNonResumingBlocksRealCanary:
         original_session_id = _seed_original_session(profile_home)
         count_before = _message_count(state_db_path, original_session_id)
 
+        reasons = {
+            "needs_input": "needs a human decision",
+            "capability": "missing capability",
+            "deferred": "human already decided, parked until explicit resume",
+        }
         with kb.connect() as conn:
             tid = kb.create_task(conn, title=f"canary {kind}", assignee="elias")
             kb.claim_task(conn, tid)
             kb.block_task(
                 conn, tid,
-                reason="needs a human decision" if kind == "needs_input" else "missing capability",
+                reason=reasons[kind],
                 kind=kind,
                 # A worker calling kanban_block would still stamp this for
                 # needs_input/capability too (only kind="transient" is
