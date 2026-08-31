@@ -9550,8 +9550,9 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
 
     * ``claude1`` / ``claude2`` -- the same cached quota-routing snapshot
       ``quota_dispatch_guard`` reads (``state/ai-quota-routing.json``,
-      refreshed for free by ``quota_preflight.py``). Not green unless the
-      cache holds a fresh ``dispatch_allowed`` record.
+      refreshed for free by ``quota_preflight.py``). Only a measured active
+      cooldown is red; absent, stale, or failed telemetry lets the real worker
+      attempt establish availability.
     * ``spark`` / ``coder`` -- the OpenAI Codex lanes. They fail OPEN
       (ok=True) unless a
       local cache explicitly records it as cooling down, so "no live GPT
@@ -9747,7 +9748,13 @@ def resolve_parallel_routes(
 
 
 def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None) -> Optional[str]:
-    """Fail closed for Claude until a fresh quota preflight explicitly allows it."""
+    """Block Claude only when telemetry proves an active provider cooldown.
+
+    Missing, stale, or failed quota telemetry is advisory: the real worker
+    attempt is the authoritative availability probe.  If that attempt reaches
+    a provider quota wall, the worker exits with the rate-limit sentinel and
+    the normal fallback chain advances with concrete provider evidence.
+    """
     if assignee not in {"claude1", "claude2"}:
         return None
     path = Path(os.environ.get("HERMES_KANBAN_QUOTA_ROUTING_PATH", "").strip() or (kanban_home() / QUOTA_ROUTING_STATE_PATH))
@@ -9755,9 +9762,9 @@ def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None
         payload = json.loads(path.read_text(encoding="utf-8"))
         record = (payload.get("agent_cooldowns") or {}).get(assignee)
     except (OSError, json.JSONDecodeError, AttributeError):
-        return "quota_measurement_unknown"
+        return None
     if not isinstance(record, dict):
-        return "quota_measurement_unknown"
+        return None
     if record.get("dispatch_allowed") is True and record.get("preflight_required") is False:
         return None
     raw_deadline = record.get("cooldown_until")
@@ -9765,12 +9772,13 @@ def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None
         try:
             deadline = __import__("datetime").datetime.fromisoformat(raw_deadline.replace("Z", "+00:00")).timestamp()
         except ValueError:
-            return "quota_measurement_unknown"
+            return None
         if (time.time() if now is None else now) < deadline:
             return "provider_cooldown"
-    # Reaching the deadline is not an implicit retry: quota_preflight must
-    # publish a fresh successful read before this profile can be used.
-    return "quota_preflight_required"
+    # A failed refresh or an expired measurement is not provider evidence.
+    # Let the real task attempt establish availability instead of parking the
+    # queue forever behind a telemetry collector failure.
+    return None
 
 
 # --- Paid OAuth canary, gated to transitions only (t_b0bc4445 LOT 2) ------

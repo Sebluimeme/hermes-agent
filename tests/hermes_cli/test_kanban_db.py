@@ -667,15 +667,10 @@ def test_respawn_guard_does_not_transfer_rate_limit_to_new_profile(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
-def test_dispatch_fails_closed_for_claude_cooldown_unknown_and_expired_preflight(
+def test_dispatch_blocks_only_proven_claude_cooldown(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """Claude tasks need fresh provider proof, never an optimistic retry.
-
-    The dispatcher must defer a sourced cooldown through its extra five-minute
-    margin, defer a missing measurement, and still require a fresh successful
-    preflight after expiry. Only that explicit preflight may release work.
-    """
+    """Unknown or expired telemetry must not strand executable work."""
     routing = kanban_home / "state" / "ai-quota-routing.json"
     routing.parent.mkdir(parents=True)
     monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
@@ -702,7 +697,8 @@ def test_dispatch_fails_closed_for_claude_cooldown_unknown_and_expired_preflight
 
         routing.unlink()
         unknown = kb.dispatch_once(conn, dry_run=True)
-        assert (task_id, "quota_measurement_unknown") in unknown.respawn_guarded
+        assert task_id in [row[0] for row in unknown.spawned]
+        assert unknown.respawn_guarded == []
 
         write_record({
             "dispatch_allowed": False,
@@ -710,7 +706,8 @@ def test_dispatch_fails_closed_for_claude_cooldown_unknown_and_expired_preflight
             "cooldown_until": "1970-01-01T02:46:40+00:00",
         })
         expired = kb.dispatch_once(conn, dry_run=True)
-        assert (task_id, "quota_preflight_required") in expired.respawn_guarded
+        assert task_id in [row[0] for row in expired.spawned]
+        assert expired.respawn_guarded == []
 
         write_record({"dispatch_allowed": True, "preflight_required": False})
         allowed = kb.dispatch_once(conn, dry_run=True)
@@ -763,24 +760,18 @@ def test_dispatch_once_reroutes_already_assigned_card_off_dead_quota(
 
 
 @pytest.mark.parametrize(
-    "quota_reason, record",
+    "record",
     [
-        (
-            "quota_measurement_unknown",
-            None,
-        ),
-        (
-            "quota_preflight_required",
-            {
-                "dispatch_allowed": False,
-                "preflight_required": True,
-                "cooldown_until": "1970-01-01T02:46:40+00:00",
-            },
-        ),
+        None,
+        {
+            "dispatch_allowed": False,
+            "preflight_required": True,
+            "cooldown_until": "1970-01-01T02:46:40+00:00",
+        },
     ],
 )
-def test_dispatch_unknown_claude_quota_never_opens_coder(
-    kanban_home, all_assignees_spawnable, monkeypatch, quota_reason, record,
+def test_dispatch_unknown_claude_quota_attempts_requested_lane(
+    kanban_home, all_assignees_spawnable, monkeypatch, record,
 ):
     routing = kanban_home / "state" / "ai-quota-routing.json"
     routing.parent.mkdir(parents=True)
@@ -790,7 +781,7 @@ def test_dispatch_unknown_claude_quota_never_opens_coder(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="keep requested Claude", assignee="claude1")
         monkeypatch.setattr(kb.time, "time", lambda: 10_000.0)
-        result = kb.dispatch_once(conn, dry_run=False)
+        result = kb.dispatch_once(conn, dry_run=True)
         row = conn.execute(
             "SELECT assignee, last_failure_error FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -799,7 +790,8 @@ def test_dispatch_unknown_claude_quota_never_opens_coder(
             (task_id,),
         ).fetchone()
 
-    assert (task_id, quota_reason) in result.respawn_guarded
+    assert task_id in [row[0] for row in result.spawned]
+    assert result.respawn_guarded == []
     assert row["assignee"] == "claude1"
     assert row["last_failure_error"] is None
     assert fallback is None
@@ -852,10 +844,9 @@ def test_route_preflight_ok_reads_claude_from_quota_cache(kanban_home, monkeypat
     routing.parent.mkdir(parents=True)
     monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
 
-    # No cache at all -> claude routes fail closed (quota_measurement_unknown).
+    # No cache at all: the real worker attempt is the availability probe.
     ok, reason = kb.route_preflight_ok("claude2")
-    assert ok is False
-    assert reason == "quota_measurement_unknown"
+    assert (ok, reason) == (True, "fresh_available")
 
     routing.write_text(json.dumps({"agent_cooldowns": {
         "claude2": {"dispatch_allowed": True, "preflight_required": False},
@@ -868,7 +859,7 @@ def test_route_preflight_ok_reads_claude_from_quota_cache(kanban_home, monkeypat
                      "cooldown_until": "1970-01-01T02:50:01+00:00"},
     }}))
     ok, reason = kb.route_preflight_ok("claude2", now=10_000.0)
-    assert ok is False
+    assert (ok, reason) == (False, "provider_cooldown")
 
 
 def test_route_preflight_ok_coder_fails_open_by_default(kanban_home, monkeypatch):
