@@ -12583,24 +12583,12 @@ MEMORY_GUARD_MB_PER_WORKER = 512
 # more fan-out on big iron should say so explicitly in config).
 DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
-
-# Every live Kanban worker is placed in its own transient systemd scope.  The
-# cap is deliberately high enough for one CPU Whisper-base transcription on
-# the reference 15-GiB workstation, but low enough to stop an accidental
-# aggregate scan before it can consume the host and kill the gateway.
 KANBAN_WORKER_MEMORY_DEFAULT_MB = 6144
 KANBAN_WORKER_MEMORY_MIN_MB = 512
 KANBAN_WORKER_MEMORY_MAX_MB = 8192
 
-
-def _kanban_worker_memory_max_bytes() -> int:
-    """Resolve the finite per-Kanban-worker cgroup limit.
-
-    ``kanban.worker_memory_max_mb`` is operator-configurable but cannot exceed
-    8 GiB or half of physical RAM.  On small machines the physical bound wins,
-    while the 512-MiB floor keeps the unit startable for ordinary workers.
-    """
-    configured: Any = None
+def _configured_kanban_worker_memory_max_mb() -> Any:
+    """Return the operator's optional ``kanban.worker_memory_max_mb`` value."""
     try:
         from hermes_cli.config import load_config_readonly
         configured = (load_config_readonly() or {}).get("kanban", {}).get(
@@ -12608,25 +12596,16 @@ def _kanban_worker_memory_max_bytes() -> int:
         )
     except Exception:
         configured = None
+    if configured is None:
+        return KANBAN_WORKER_MEMORY_DEFAULT_MB
     try:
-        requested_mb = int(configured)
+        parsed = int(configured)
     except (TypeError, ValueError):
-        requested_mb = KANBAN_WORKER_MEMORY_DEFAULT_MB
-    requested_mb = max(
+        return KANBAN_WORKER_MEMORY_DEFAULT_MB
+    return max(
         KANBAN_WORKER_MEMORY_MIN_MB,
-        min(requested_mb, KANBAN_WORKER_MEMORY_MAX_MB),
+        min(parsed, KANBAN_WORKER_MEMORY_MAX_MB),
     )
-    try:
-        physical_mb = (
-            int(os.sysconf("SC_PHYS_PAGES"))
-            * int(os.sysconf("SC_PAGE_SIZE"))
-            // (1024 * 1024)
-        )
-        host_bound_mb = max(KANBAN_WORKER_MEMORY_MIN_MB, physical_mb // 2)
-        requested_mb = min(requested_mb, host_bound_mb)
-    except (OSError, ValueError, TypeError):
-        pass
-    return requested_mb * 1024 * 1024
 
 
 def _bounded_kanban_worker_argv(
@@ -12639,6 +12618,7 @@ def _bounded_kanban_worker_argv(
         from tools.process_registry import (
             _build_systemd_scope_argv,
             _systemd_run_user_scope_available,
+            _worker_memory_max_bytes,
         )
 
         if not _systemd_run_user_scope_available():
@@ -12653,7 +12633,10 @@ def _bounded_kanban_worker_argv(
         argv = _build_systemd_scope_argv(
             cmd,
             unit_suffix=suffix,
-            memory_max_bytes=_kanban_worker_memory_max_bytes(),
+            memory_max_bytes=_worker_memory_max_bytes(
+                configured_max_mb=_configured_kanban_worker_memory_max_mb(),
+                cap_bytes=KANBAN_WORKER_MEMORY_MAX_MB * 1024 * 1024,
+            ),
         )
         return argv, f"hermes-worker-{suffix}.scope"
     except Exception as exc:
