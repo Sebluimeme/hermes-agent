@@ -122,6 +122,30 @@ def _symlink_file_or_skip(link: Path, target: Path) -> None:
 # ---------------------------------------------------------------------------
 
 class TestShouldExclude:
+    def test_backup_policy_is_loaded_from_installed_scripts_not_dev_worktrees(self, monkeypatch):
+        import hermes_cli.backup as backup_mod
+
+        monkeypatch.delenv("HERMES_BACKUP_POLICY_SCRIPT", raising=False)
+        candidate_text = "\n".join(str(path) for path in backup_mod._backup_policy_candidates())
+        assert ".worktrees" not in candidate_text
+        assert "hermes-backup-policy" not in candidate_text
+        assert str(Path(os.environ["HERMES_HOME"]) / "scripts" / "hermes_backup_policy.py") in candidate_text
+
+    def test_runtime_exclusion_policy_delegates_to_installed_script(self):
+        import hermes_cli.backup as backup_mod
+
+        script = backup_mod._load_backup_policy_module()
+        examples = [
+            Path("hermes-agent/run_agent.py"),
+            Path("workspace/ecobloc/.worktrees/t_123/app.py"),
+            Path("telegram-bot-api/data/tqueue.binlog"),
+            Path("state.db-wal"),
+            Path("workspace/site/src/app.py"),
+        ]
+        assert [backup_mod._should_exclude(path) for path in examples] == [
+            script.should_exclude(path) for path in examples
+        ]
+
     def test_excludes_hermes_agent(self):
         from hermes_cli.backup import _should_exclude
         assert _should_exclude(Path("hermes-agent/run_agent.py"))

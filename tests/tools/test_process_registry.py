@@ -17,6 +17,8 @@ from tools.process_registry import (
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
+    _MIN_WORKER_MEMORY_MAX_BYTES,
+    _worker_memory_max_bytes,
 )
 
 
@@ -68,6 +70,51 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, "-c", f"import time; time.sleep({seconds})"],
     )
+
+
+def test_worker_memory_max_accepts_configured_tightening_bound(monkeypatch):
+    """Kanban can pass its memory knob without duplicating MemoryMax logic."""
+    monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+
+    assert _worker_memory_max_bytes(configured_max_mb="128") == 128 * 1024 * 1024
+
+
+def test_worker_memory_max_allows_domain_cap_without_changing_default(monkeypatch):
+    """Kanban's 6-GiB policy reuses the registry math without inheriting 4 GiB."""
+    monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+    monkeypatch.setattr(
+        "tools.process_registry._current_cgroup_memory_max_bytes", lambda: None
+    )
+    monkeypatch.setattr(os, "sysconf", lambda name: 3932160 if name == "SC_PHYS_PAGES" else 4096)
+
+    assert _worker_memory_max_bytes(configured_max_mb="6144") == 4 * 1024 * 1024 * 1024
+    assert _worker_memory_max_bytes(
+        configured_max_mb="6144",
+        cap_bytes=8 * 1024 * 1024 * 1024,
+    ) == 6144 * 1024 * 1024
+
+
+def test_worker_memory_max_keeps_tighter_cgroup_bound(monkeypatch):
+    monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+    monkeypatch.setattr(
+        "tools.process_registry._current_cgroup_memory_max_bytes",
+        lambda: 768 * 1024 * 1024,
+    )
+    monkeypatch.setattr(os, "sysconf", lambda name: 3932160 if name == "SC_PHYS_PAGES" else 4096)
+
+    assert _worker_memory_max_bytes(
+        configured_max_mb="6144",
+        cap_bytes=8 * 1024 * 1024 * 1024,
+    ) == 768 * 1024 * 1024
+
+
+def test_worker_memory_max_ignores_invalid_configured_bound(monkeypatch):
+    monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+    monkeypatch.setattr(
+        "tools.process_registry._current_cgroup_memory_max_bytes", lambda: None
+    )
+
+    assert _worker_memory_max_bytes(configured_max_mb="not-an-int") >= 64 * 1024 * 1024
 
 
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
@@ -1036,8 +1083,8 @@ class TestCheckpoint:
         (the process is already running), so masking is lossless."""
         checkpoint = tmp_path / "procs.json"
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
-            secret = "sk-secret1234567890"
-            command = f"curl -H 'Authorization: Bearer {secret}' http://x"
+            credential_fixture = "sk-FAKE-checkpoint-redaction-7890"
+            command = f"curl -H 'Authorization: Bearer {credential_fixture}' http://x"
             s = _make_session(sid="proc_secret", command=command)
             s.pid = 12345
             s.host_start_time = int(time.time())
@@ -1046,7 +1093,7 @@ class TestCheckpoint:
 
             data = json.loads(checkpoint.read_text())
             assert data[0]["session_id"] == "proc_secret"
-            assert secret not in data[0]["command"]
+            assert credential_fixture not in data[0]["command"]
             assert data[0]["command"] != command
 
 # =========================================================================
@@ -1561,10 +1608,10 @@ class TestHandleProcessRedaction:
     def test_poll_redacts_prefix_key(self, monkeypatch):
         pr, sess = self._setup(
             monkeypatch, "python app.py",
-            "leaked OPENAI_API_KEY sk-proj-abc123def456ghi789jkl012 here",
+            "leaked OPENAI_API_KEY sk-FAKE-prefix-key-redaction-l012 here",
         )
         out = json.loads(pr._handle_process({"action": "poll", "session_id": sess.id}))
-        assert "abc123def456" not in out["output_preview"]
+        assert "sk-FAKE-prefix-key-redaction-l012" not in out["output_preview"]
 
     def test_list_redacts_command_and_output(self, monkeypatch):
         """`process(action=list)` redacts command + output_preview — issue #77484.
@@ -1574,14 +1621,14 @@ class TestHandleProcessRedaction:
         secrets (unlike poll/log/wait/kill).
         """
         pr, sess = self._setup(
-            monkeypatch, "curl -H 'Authorization: Bearer sk-abc123def456ghi789jkl012345'",
-            "opaque token sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG output",
+            monkeypatch, "curl -H 'Authorization: Bearer sk-FAKE-command-redaction-2345'",
+            "opaque token sk-FAKE-output-redaction-GGGG output",
         )
         out = json.loads(pr._handle_process({"action": "list"}))
         assert len(out["processes"]) >= 1
         entry = out["processes"][0]
-        assert "sk-abc123def456ghi789jkl012345" not in entry["command"]
-        assert "sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG" not in entry["output_preview"]
+        assert "sk-FAKE-command-redaction-2345" not in entry["command"]
+        assert "sk-FAKE-output-redaction-GGGG" not in entry["output_preview"]
         assert "curl" in entry["command"]
 
     def test_disabled_passes_through(self, monkeypatch):

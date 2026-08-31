@@ -84,15 +84,7 @@ def test_claude2_unavailable_uses_claude1_without_notification():
     assert agent.base_url == "http://fake-claude1:18765"
     assert agent.model == "claude-sonnet-5"
     assert emitted == []
-    assert agent._fallback_trace == [{
-        "from_model": "claude-sonnet-5",
-        "from_provider": "custom",
-        "to_model": "claude-sonnet-5",
-        "to_provider": "custom",
-        "resolved_model": "claude-sonnet-5",
-        "resolved_provider": "custom",
-        "reason": "rate_limit",
-    }]
+    assert not hasattr(agent, "_fallback_trace")
 
 
 def test_both_claude_lanes_unavailable_uses_gpt_and_notifies_once():
@@ -107,12 +99,7 @@ def test_both_claude_lanes_unavailable_uses_gpt_and_notifies_once():
     assert agent.model == "gpt-5.5"
     assert emitted == [NOTICE]
     assert agent._pending_fallback_notice is None
-    assert [step["to_model"] for step in agent._fallback_trace] == [
-        "claude-sonnet-5",
-        "gpt-5.5",
-    ]
-    assert agent._fallback_trace[-1]["resolved_model"] == "gpt-5.5"
-    assert agent._fallback_trace[-1]["resolved_provider"] == "openai-codex"
+    assert not hasattr(agent, "_fallback_trace")
 
 
 def test_non_quota_error_does_not_try_another_provider():

@@ -96,7 +96,10 @@ def test_default_spawn_isolates_live_gateway_worker_in_memory_scope(
     profile = root / "profiles" / "elias"
     profile.mkdir(parents=True)
     profile.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
-    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text(
+        "kanban:\n  worker_memory_max_mb: 128\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
 
@@ -127,11 +130,29 @@ def test_default_spawn_isolates_live_gateway_worker_in_memory_scope(
     assert captured["cmd"][0] == "/usr/bin/systemd-run"
     assert "--scope" in captured["cmd"]
     memory_prop = next(x for x in captured["cmd"] if x.startswith("MemoryMax="))
-    assert 512 * 1024 * 1024 <= int(memory_prop.split("=", 1)[1]) <= 8 * 1024 * 1024 * 1024
+    assert memory_prop == "MemoryMax=536870912"
     assert captured["env"]["HERMES_KANBAN_SYSTEMD_UNIT"].startswith(
         "hermes-worker-kanban-t_spawn_tools-"
     )
     assert "hermes" in captured["cmd"][captured["cmd"].index("--") + 1:]
+
+
+def test_kanban_worker_memory_config_preserves_legacy_clamps(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    cases = [
+        ("{}\n", 6144),
+        ("kanban:\n  worker_memory_max_mb: not-an-int\n", 6144),
+        ("kanban:\n  worker_memory_max_mb: 128\n", 512),
+        ("kanban:\n  worker_memory_max_mb: 99999\n", 8192),
+    ]
+    for content, expected in cases:
+        root.joinpath("config.yaml").write_text(content, encoding="utf-8")
+        assert kb._configured_kanban_worker_memory_max_mb() == expected
 
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
@@ -232,6 +253,7 @@ def test_default_spawn_resumes_only_unblocked_transient_worker(monkeypatch, tmp_
 
 def test_default_spawn_keeps_human_block_fresh_and_resumes_crash(monkeypatch, tmp_path):
     """Human decisions start fresh; transient crashes resume the checkpoint."""
+    monkeypatch.delenv("HERMES_KANBAN_RESUME_SESSION_ID", raising=False)
     root = tmp_path / ".hermes"
     (root / "profiles" / "elias").mkdir(parents=True)
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
