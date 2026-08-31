@@ -4,6 +4,45 @@ from __future__ import annotations
 
 import pytest
 
+from hermes_cli import kanban_db as kb
+
+# Kanban handoff routes are config-driven (t_d2bd22a1/R7): production no
+# longer ships a hardcoded Spark/Claude/Coder chain, so any test that
+# exercises chain-dependent behavior (resolve_ordered_route,
+# fallback_simple_route, the OAuth dispatch guard's reroute path, ...)
+# must configure its own chain instead of relying on an implicit default.
+# This fixture provides the same chain the pre-externalization code used
+# to hardcode, purely as test fixture data -- it must never be imported
+# back into production code (see hermes_cli.kanban_db._configured_handoff_routes).
+TEST_SPARK_MODEL_OVERRIDE = "gpt-5.3-codex-spark"
+TEST_HANDOFF_ROUTES = {
+    kb.ROUTING_TIER_SIMPLE: (
+        ("spark", TEST_SPARK_MODEL_OVERRIDE),
+        ("claude2", None),
+        ("claude1", None),
+        ("coder", None),
+    ),
+    kb.ROUTING_TIER_COMPLEX: (
+        ("claude2", None),
+        ("claude1", None),
+        ("coder", None),
+    ),
+}
+
+
+@pytest.fixture
+def configured_handoff_routes(monkeypatch):
+    """Arm the test handoff-route chain for tests that need one configured.
+
+    Without this, ``kanban.handoff_routes`` is empty (the portable default)
+    and every chain-dependent helper fails closed: no reroute, no fallback
+    hop, no OAuth-canary reroute. Tests asserting that a proven provider
+    failure DOES advance a card along a chain need this fixture; tests
+    asserting the fail-closed/no-config contract should not use it.
+    """
+    monkeypatch.setattr(kb, "_configured_handoff_routes", lambda: TEST_HANDOFF_ROUTES)
+    return TEST_HANDOFF_ROUTES
+
 
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):

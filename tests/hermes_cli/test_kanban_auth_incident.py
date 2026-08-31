@@ -134,7 +134,7 @@ def test_unrecovered_auth_blocks_with_action_but_quota_never_does(
 
 
 def test_respawn_guard_does_not_apply_previous_profile_failure(
-    kanban_home, all_assignees_spawnable, monkeypatch,
+    kanban_home, all_assignees_spawnable, configured_handoff_routes, monkeypatch,
 ):
     now = 5_000_000
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
