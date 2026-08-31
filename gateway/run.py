@@ -21397,7 +21397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # before the existing incomplete-response recovery and before any
             # normal final delivery.
             from hermes_cli.output_validation import (
-                SAFE_UNVERIFIED_RESPONSE,
+                apply_output_validation_fallback,
                 output_validation_recovery_prompt,
                 requests_output_validation_retry,
                 verified_kanban_completion_message,
@@ -21434,26 +21434,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_type=MessageType.TEXT,
                 )
                 agent_result["output_validation_recovery_attempted"] = True
-                # Re-read durable state after the recovery. When this is a
-                # delivered Kanban fan-in, code owns the final wording: the
-                # model cannot weaken, embellish or ambiguate its proof.
-                _verified_fallback = await asyncio.to_thread(
-                    verified_kanban_completion_message,
+                # Re-read durable state after the single repair turn. The
+                # helper owns the only core fallbacks: structured Kanban fan-in
+                # or the neutral safe message. Detection stays in the external
+                # transform_llm_output hook.
+                await asyncio.to_thread(
+                    apply_output_validation_fallback,
+                    agent_result,
                     _original_inbound,
                 )
-                if _verified_fallback:
-                    agent_result["final_response"] = _verified_fallback
-                    agent_result["output_validation_retry"] = False
-                    agent_result["response_transformed"] = True
-                    agent_result["output_validation_structured_fallback"] = True
-                elif requests_output_validation_retry(agent_result):
-                    # Never loop or leak an internal refusal when no durable
-                    # completion proof exists after the single repair turn.
-                    agent_result["final_response"] = (
-                        SAFE_UNVERIFIED_RESPONSE
-                    )
-                    agent_result["output_validation_retry"] = False
-                    agent_result["response_transformed"] = True
             # One code-driven recovery turn for hidden-reasoning exhaustion.
             # Run it synchronously in the SAME session before finalisation;
             # queuing here is too late for _run_agent's pending-message drain

@@ -140,6 +140,38 @@ def verified_kanban_completion_message(
     )
 
 
+def apply_output_validation_fallback(
+    result: dict[str, Any],
+    inbound_text: str | None,
+    *,
+    db_path: Path | None = None,
+) -> bool:
+    """Apply the only runtime-owned output-validation fallbacks.
+
+    The detector itself lives outside core as a ``transform_llm_output`` hook.
+    Core only consumes its private retry flag: after one repair turn, either a
+    delivered Kanban mission can be rendered from structured state, or the user
+    receives the neutral safe fallback. No lexical validation happens here.
+    """
+    verified_fallback = (
+        verified_kanban_completion_message(inbound_text, db_path=db_path)
+        if db_path is not None
+        else verified_kanban_completion_message(inbound_text)
+    )
+    if verified_fallback:
+        result["final_response"] = verified_fallback
+        result["output_validation_retry"] = False
+        result["response_transformed"] = True
+        result["output_validation_structured_fallback"] = True
+        return True
+    if requests_output_validation_retry(result):
+        result["final_response"] = SAFE_UNVERIFIED_RESPONSE
+        result["output_validation_retry"] = False
+        result["response_transformed"] = True
+        return True
+    return False
+
+
 def output_validation_recovery_prompt(
     *,
     rejected_response: str | None,
