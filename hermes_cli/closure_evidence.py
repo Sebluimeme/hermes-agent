@@ -1,109 +1,71 @@
-"""Closure evidence gate — LOT 4 (authority & closure proof).
+"""Compatibility helpers for external Kanban closure-proof detectors.
 
-A Kanban card must not become ``done`` on bare assertion. Every completion
-attempt routed through the CLI (`hermes kanban complete`) or the
-`kanban_complete` tool must carry at least one *structured* evidence kind:
-
-- ``review``   — the card was sitting in the ``review`` lane (reached via
-                  :func:`hermes_cli.kanban_db.request_review`) and is now
-                  being approved. Landing in ``review`` already required a
-                  worker-authored summary describing verification; a human
-                  or reviewer profile closing it from there IS the proof.
-- ``artifact`` — ``metadata["artifacts"]`` is a non-empty list of real
-                  paths (the same field `kanban_complete` already uploads
-                  as native attachments — see tools/kanban_tools.py).
-- ``test``     — ``metadata["evidence"] == {"kind": "test", "detail": ...}``,
-                  naming the concrete test command/run and its outcome.
-- ``canary``   — ``metadata["evidence"] == {"kind": "canary", "detail": ...}``,
-                  naming a live probe result (e.g. the LOT 2 OAuth canary).
-- ``visual``   — ``metadata["evidence"] == {"kind": "visual", "detail": ...}``,
-                  naming the hash-bound Coder + Gemini visual gate result.
-
-Deliberately NOT accepted as evidence: free-form ``summary``/``result``
-prose. Sniffing prose for words like "tests passed" is exactly the silent,
-unverifiable shortcut this gate exists to close off — every claim must be
-backed by a structured field the next reader (human or worker) can check
-without re-deriving trust from adjectives.
-
-Pure functions only: no DB access, no I/O. The caller (``hermes_cli.kanban``
-/ ``tools.kanban_tools``) is responsible for reading the card's current
-status before the completion write lands and passing it in as
-``prior_status``.
+Core Kanban completion policy now lives in plugin validators.  This module is a
+small read-only classifier kept for external ``transform_llm_output`` guards
+that need to recognize already-completed Kanban runs carrying structured proof.
+It does not veto completion and does not contain any textual output gate.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
-
-# Ordered for messages only; every kind here is equally sufficient.
-STRUCTURED_EVIDENCE_KINDS = ("review", "artifact", "test", "canary", "visual")
-
-# metadata["evidence"]["kind"] values accepted in addition to the
-# artifact/review shortcuts above.
-_FREEFORM_EVIDENCE_KINDS = ("test", "canary", "visual")
-
-REJECTION_MESSAGE = (
-    "no structured closure evidence found — a card can only become 'done' "
-    "with one of: metadata.evidence={{'kind': 'test'|'canary'|'visual', 'detail': "
-    "'<concrete proof>'}}, a non-empty metadata.artifacts=[...], or by being "
-    "approved from the review lane (kanban_request_review, then "
-    "kanban_complete). Provide one, or call kanban_request_review / "
-    "kanban_block instead of asserting completion."
-)
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
 class ClosureEvidence:
-    """The evidence kind found for a completion attempt, if any."""
+    """Normalized, read-only closure proof classification."""
 
-    kind: Optional[str]
-    detail: Optional[str] = None
-
-    @property
-    def satisfied(self) -> bool:
-        return self.kind is not None
+    satisfied: bool
+    kind: str = ""
+    detail: str = ""
 
 
 def classify_closure_evidence(
     *,
-    prior_status: Optional[str],
-    metadata: Optional[dict[str, Any]],
+    prior_status: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> ClosureEvidence:
-    """Determine what structured evidence (if any) backs this completion.
+    """Classify durable completion evidence without enforcing a gate.
 
-    ``prior_status`` is the card's status *before* this completion call
-    (fetched by the caller via ``kb.get_task`` prior to ``kb.complete_task``).
+    ``prior_status`` is accepted for source compatibility with the former
+    runtime gate API.  The current implementation only reads metadata already
+    attached to a completed run: explicit ``metadata.evidence`` first, then
+    durable artifacts, then review handoff facts.
     """
-    if prior_status == "review":
-        return ClosureEvidence(kind="review", detail="approved from the review lane")
+    data = metadata if isinstance(metadata, Mapping) else {}
+    evidence = data.get("evidence")
+    if isinstance(evidence, Mapping):
+        detail = _clean(evidence.get("detail"))
+        kind = _clean(evidence.get("kind")) or "evidence"
+        if detail:
+            return ClosureEvidence(True, kind=kind, detail=detail)
 
-    meta = metadata if isinstance(metadata, dict) else {}
+    artifacts = data.get("artifacts")
+    if isinstance(artifacts, (list, tuple)) and artifacts:
+        return ClosureEvidence(
+            True,
+            kind="artifacts",
+            detail=f"{len(artifacts)} artifact(s) declared",
+        )
 
-    artifacts = meta.get("artifacts")
-    if isinstance(artifacts, (list, tuple)):
-        real = [str(a).strip() for a in artifacts if str(a).strip()]
-        if real:
+    review = data.get("review")
+    if isinstance(review, Mapping):
+        detail = _clean(review.get("summary") or review.get("detail"))
+        if detail:
+            return ClosureEvidence(True, kind="review", detail=detail)
+
+    visual = data.get("visual_review")
+    if isinstance(visual, Mapping):
+        screenshots = visual.get("screenshots")
+        if isinstance(screenshots, Mapping) and screenshots:
             return ClosureEvidence(
-                kind="artifact", detail=f"{len(real)} artifact(s): {', '.join(real[:3])}"
+                True,
+                kind="visual_review",
+                detail=f"{len(screenshots)} screenshot(s) declared",
             )
 
-    evidence = meta.get("evidence")
-    if isinstance(evidence, dict):
-        kind = evidence.get("kind")
-        detail = evidence.get("detail")
-        if kind in _FREEFORM_EVIDENCE_KINDS and isinstance(detail, str) and detail.strip():
-            return ClosureEvidence(kind=kind, detail=detail.strip())
-
-    return ClosureEvidence(kind=None, detail=None)
+    return ClosureEvidence(False)
 
 
-def closure_gate(
-    *,
-    prior_status: Optional[str],
-    metadata: Optional[dict[str, Any]],
-) -> Optional[str]:
-    """Return a rejection message, or ``None`` if completion may proceed."""
-    evidence = classify_closure_evidence(prior_status=prior_status, metadata=metadata)
-    if evidence.satisfied:
-        return None
-    return REJECTION_MESSAGE
+def _clean(value: object) -> str:
+    return " ".join(str(value or "").split())

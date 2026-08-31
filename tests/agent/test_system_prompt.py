@@ -119,6 +119,73 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+GOAL_ALREADY_MET_PROFILE_RULE = """
+**Revérifier l'état avant de corriger, surtout après un blocage** (portée
+depuis `hermes-agent/agent/prompt_builder.py`, cf. `t_49d3ae31`). Avant de
+relancer, contourner un blocage ou démarrer une nouvelle tentative de
+correction — en particulier juste après un cycle blocage/déblocage — relire
+l'état externe dont dépend réellement l'objectif explicite de la carte, pas
+seulement les événements Kanban. Si cet état montre déjà l'objectif atteint,
+y compris par un autre chemin (un humain, une carte parallèle, une exécution
+précédente), s'arrêter : ne pas lancer un nouveau contournement.
+
+Consigner la preuve vérifiée par `kanban_comment`, puis clôturer par l'action
+terminale normale : `kanban_complete` si l'objectif propre à la tâche est
+satisfait, ou `kanban_block(reason=...)` pour laisser la carte en observation
+si une décision humaine reste nécessaire sur l'intérêt de poursuivre le
+mécanisme d'origine. Ne pas continuer à chercher un contournement une fois
+l'objectif déjà réel.
+"""
+
+
+class TestGoalAlreadyMetRuleFromProfile:
+    """The goal-already-met contract is synchronized profile guidance, not core.
+
+    R4 portability consumes the accepted root-rule text from t_49d3ae31 as an
+    isolated profile-identity copy. A worker prompt must still carry both the
+    normal kanban lifecycle and the profile rule that says to re-read external
+    state and close when the goal is already real.
+    """
+
+    def test_worker_prompt_preserves_synchronized_profile_rule(self, monkeypatch, tmp_path):
+        root = tmp_path / ".hermes"
+        profile_home = root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        (profile_home / "SOUL.md").write_text(
+            GOAL_ALREADY_MET_PROFILE_RULE, encoding="utf-8"
+        )
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        agent = _make_agent(
+            load_soul_identity=True,
+            valid_tool_names=["kanban_show", "kanban_complete", "kanban_block"],
+            _kanban_worker_guidance=KANBAN_GUIDANCE,
+        )
+        with (
+            patch("agent.coding_context._coding_mode", return_value="off"),
+            patch("run_agent.build_environment_hints", return_value=""),
+        ):
+            prompt = build_system_prompt(agent)
+
+        normalized = " ".join(prompt.split())
+        assert "Kanban task execution protocol" in prompt
+        assert (
+            "relire l'état externe dont dépend réellement l'objectif explicite "
+            "de la carte"
+        ) in normalized
+        assert "Si cet état montre déjà l'objectif atteint" in normalized
+        assert "s'arrêter : ne pas lancer un nouveau contournement" in normalized
+        assert "l'action terminale normale" in normalized
+        assert "l'objectif propre à la tâche" in normalized
+        assert "laisser la carte en observation" in normalized
+        assert "une fois l'objectif déjà réel" in normalized
+
+
 class TestExecutionGuidanceInjection:
     """Injection gate for OPENAI_MODEL_EXECUTION_GUIDANCE via
     ``agent.execution_guidance`` (auto/true/false/list).

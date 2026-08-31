@@ -2,6 +2,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.output_validation import (
     OUTPUT_VALIDATION_RETRY_SIGNAL,
     SAFE_UNVERIFIED_RESPONSE,
+    apply_output_validation_fallback,
     completed_kanban_task_id,
     output_validation_recovery_prompt,
     requests_output_validation_retry,
@@ -112,6 +113,37 @@ def test_recovery_prompt_is_private_and_carries_durable_proof():
     assert prompt.startswith("[HERMES_RECOVERY_OUTPUT_VALIDATION]")
     assert proof in prompt
     assert "Ne mentionne jamais le garde interne" in prompt
+
+
+def test_apply_output_validation_fallback_uses_structured_kanban_state(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(conn, title="corriger")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="Correctif fonctionnel",
+            metadata={"evidence": {"kind": "test", "detail": "Ran 7 tests, OK"}},
+        )
+        assert kb.mark_task_delivered(conn, task_id)
+
+    result = {"output_validation_retry": True, "final_response": "safe"}
+
+    assert apply_output_validation_fallback(
+        result, f"[kanban] Task {task_id} completed.", db_path=db_path
+    )
+    assert result["output_validation_retry"] is False
+    assert result["output_validation_structured_fallback"] is True
+    assert "Correctif fonctionnel" in result["final_response"]
+    assert "Ran 7 tests, OK" in result["final_response"]
+
+
+def test_apply_output_validation_fallback_stops_after_unproven_repair():
+    result = {"output_validation_retry": True, "final_response": "C'est fini."}
+
+    assert apply_output_validation_fallback(result, "message ordinaire")
+    assert result["output_validation_retry"] is False
+    assert result["final_response"] == SAFE_UNVERIFIED_RESPONSE
 
 
 def test_completed_task_id_only_accepts_internal_notification_shape():

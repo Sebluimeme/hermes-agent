@@ -124,37 +124,27 @@ _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 
 
-def _worker_memory_max_bytes() -> int:
-    """Return a finite per-worker cgroup limit without widening host risk.
+def _configured_memory_bound_bytes(value: Any) -> Optional[int]:
+    """Return a valid configured worker MemoryMax bound, or ``None``.
 
-    The proposed local-memory-guard environment override is honored when it
-    tightens the safe bound, so this isolation composes with PR #57121 instead
-    of inventing a second knob.  An oversized override cannot widen host risk.
-    Otherwise retain the tighter of the gateway's current cgroup-v2
-    ``memory.max`` and half of physical RAM, capped at 4 GiB.  This keeps the
-    sibling worker outside the gateway cgroup while ensuring the worker cannot
-    consume memory up to the enclosing user slice or host limit.
+    A configured value is intentionally only a tightening bound. Invalid or
+    too-small values are ignored by the caller so they cannot accidentally
+    widen worker memory beyond the runtime-derived safe bound.
     """
-    override_bound: Optional[int] = None
-    override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
-    if override:
-        override_valid = False
-        try:
-            parsed = int(override) * 1024 * 1024
-            if parsed >= _MIN_WORKER_MEMORY_MAX_BYTES:
-                override_bound = parsed
-                override_valid = True
-        except ValueError:
-            pass
-        if not override_valid:
-            logger.warning(
-                "Ignoring invalid TERMINAL_LOCAL_MEMORY_MAX_MB=%r; "
-                "expected an integer representing at least %d MiB",
-                override,
-                _MIN_WORKER_MEMORY_MAX_BYTES // (1024 * 1024),
-            )
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = int(raw) * 1024 * 1024
+    except ValueError:
+        return None
+    return parsed if parsed >= _MIN_WORKER_MEMORY_MAX_BYTES else None
 
-    candidates: List[int] = []
+
+def _current_cgroup_memory_max_bytes() -> Optional[int]:
+    """Best-effort current cgroup-v2 memory.max limit."""
     try:
         for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
             if line.startswith("0::"):
@@ -165,17 +155,57 @@ def _worker_memory_max_bytes() -> int:
                 if raw_limit.isdigit():
                     cgroup_limit = int(raw_limit)
                     if cgroup_limit >= _MIN_WORKER_MEMORY_MAX_BYTES:
-                        candidates.append(cgroup_limit)
+                        return cgroup_limit
                 break
     except (OSError, ValueError):
         pass
+    return None
+
+
+def _worker_memory_max_bytes(
+    configured_max_mb: Any = None,
+    *,
+    cap_bytes: Optional[int] = None,
+) -> int:
+    """Return a finite per-worker cgroup limit without widening host risk.
+
+    The proposed local-memory-guard environment override and callers' optional
+    ``configured_max_mb`` are honored only when they tighten the runtime bound,
+    so this isolation composes with higher-level policy knobs instead of
+    duplicating cgroup math.  The default cap remains 4 GiB for ordinary local
+    background executors; callers with a narrower domain policy may pass a
+    higher or lower ``cap_bytes`` while still remaining bounded by the current
+    cgroup and half of physical RAM.
+    """
+    configured_bound = _configured_memory_bound_bytes(configured_max_mb)
+    override_bound: Optional[int] = None
+    override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
+    if override:
+        override_bound = _configured_memory_bound_bytes(override)
+        if override_bound is None:
+            logger.warning(
+                "Ignoring invalid TERMINAL_LOCAL_MEMORY_MAX_MB=%r; "
+                "expected an integer representing at least %d MiB",
+                override,
+                _MIN_WORKER_MEMORY_MAX_BYTES // (1024 * 1024),
+            )
+
+    candidates: List[int] = []
+    cgroup_limit = _current_cgroup_memory_max_bytes()
+    if cgroup_limit is not None:
+        candidates.append(cgroup_limit)
 
     try:
         physical_bytes = int(os.sysconf("SC_PHYS_PAGES")) * int(
             os.sysconf("SC_PAGE_SIZE")
         )
+        effective_cap = (
+            _WORKER_MEMORY_MAX_CAP_BYTES
+            if cap_bytes is None
+            else max(_MIN_WORKER_MEMORY_MAX_BYTES, int(cap_bytes))
+        )
         physical_bound = min(
-            _WORKER_MEMORY_MAX_CAP_BYTES,
+            effective_cap,
             max(_MIN_WORKER_MEMORY_MAX_BYTES, physical_bytes // 2),
         )
         candidates.append(physical_bound)
@@ -183,7 +213,12 @@ def _worker_memory_max_bytes() -> int:
         pass
 
     safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
-    return min(override_bound, safe_bound) if override_bound else safe_bound
+    bounds = [safe_bound]
+    if override_bound is not None:
+        bounds.append(override_bound)
+    if configured_bound is not None:
+        bounds.append(configured_bound)
+    return min(bounds)
 
 
 def _systemd_run_user_scope_available() -> bool:

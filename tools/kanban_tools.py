@@ -34,7 +34,6 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli import closure_evidence
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -882,30 +881,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and keep this task alive."
                 )
 
-            visual_rejection, metadata = kb.visual_completion_projection(
-                conn, tid, metadata,
-            )
-            if visual_rejection is not None:
-                return tool_error(
-                    "kanban_complete: visual review gate not ready — "
-                    f"{visual_rejection}"
-                )
-
-            # LOT 4 — a card cannot become 'done' on bare assertion. See
-            # hermes_cli/closure_evidence.py for the accepted evidence kinds.
-            closure_rejection = closure_evidence.closure_gate(
-                prior_status=getattr(task, "status", None),
-                metadata=metadata,
-            )
-            if closure_rejection is not None:
-                return tool_error(f"kanban_complete: {closure_rejection}")
-
             try:
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    completion_validation_source="tool",
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -914,9 +896,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
-            except kb.VisualReviewGateError as visual_err:
+            except kb.CompletionValidationError as validation_err:
                 return tool_error(
-                    f"kanban_complete: visual review gate not ready — {visual_err}"
+                    "kanban_complete: completion validator rejected handoff — "
+                    f"{validation_err}"
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -981,48 +964,40 @@ def _handle_completion_ready(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
-            visual_rejection, metadata = kb.visual_completion_projection(
-                conn, tid, metadata,
-            )
-            evidence = closure_evidence.classify_closure_evidence(
-                prior_status=task.status,
-                metadata=metadata,
+            validator_rejection, metadata = kb.completion_validation_projection(
+                conn,
+                tid,
+                metadata,
+                summary=args.get("summary"),
+                result=args.get("result"),
+                created_cards=args.get("created_cards"),
+                source="tool",
+                dry_run=True,
             )
             missing: list[str] = []
             if task.status not in {"running", "ready", "blocked", "review"}:
                 missing.append(
                     "task must be running, ready, blocked, or in review"
                 )
-            if not evidence.satisfied:
-                missing.append(
-                    "structured evidence: metadata.evidence test/canary/visual, "
-                    "a real artifact, or approval from review"
-                )
-            if visual_rejection is not None:
-                missing.append(f"visual review: {visual_rejection}")
+            if validator_rejection is not None:
+                missing.append(f"completion validator: {validator_rejection}")
             if task.status != "review" and not (args.get("summary") or args.get("result")):
                 missing.append("summary or result")
+            evidence = (
+                metadata.get("evidence")
+                if isinstance(metadata, dict) and isinstance(metadata.get("evidence"), dict)
+                else None
+            )
             return json.dumps({
                 "ok": True,
                 "task_id": tid,
                 "ready": not missing,
-                "evidence": {
-                    "kind": evidence.kind,
-                    "detail": evidence.detail,
-                },
+                "evidence": evidence,
                 "missing": missing,
                 "next": (
                     "call kanban_complete once with the same metadata/artifacts"
                     if not missing else
                     "collect the listed evidence before calling kanban_complete"
-                ),
-                "example_metadata": (
-                    None if evidence.satisfied else {
-                        "evidence": {
-                            "kind": "test",
-                            "detail": "<exact command and successful result>",
-                        }
-                    }
                 ),
             })
         finally:
@@ -1197,6 +1172,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 reviewer=reviewer,
                 expected_run_id=_worker_run_id(tid),
                 with_reason=True,
+                review_handoff_source="tool",
             )
             if not ok:
                 detail = fail_reason or "unknown id or not in running/ready"

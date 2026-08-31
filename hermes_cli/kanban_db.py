@@ -6226,165 +6226,89 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-class VisualReviewGateError(ValueError):
-    """Raised when a web/UI card lacks its two-stage visual proof."""
+class CompletionValidationError(ValueError):
+    """Raised when a plugin completion validator vetoes completion."""
+
+    def __init__(self, reason: str, *, code: str = "validator_rejected"):
+        self.reason = reason
+        self.code = code
+        super().__init__(reason)
 
 
-def _latest_review_handoff_metadata(
-    conn: sqlite3.Connection, task_id: str,
-) -> Optional[dict[str, Any]]:
-    row = conn.execute(
-        "SELECT metadata FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'review_requested' "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    try:
-        metadata = json.loads(row["metadata"] or "{}") if row else {}
-    except (TypeError, json.JSONDecodeError):
-        metadata = {}
-    return metadata if isinstance(metadata, dict) else None
-
-
-def _active_review_run_facts(
-    conn: sqlite3.Connection, task_id: str,
-) -> tuple[Optional[int], Optional[str], set[str]]:
-    """Return active review run id/profile and native screenshot hashes."""
-    task_row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if not task_row or task_row["current_run_id"] is None:
-        return None, None, set()
-    run_id = int(task_row["current_run_id"])
-    run = conn.execute(
-        "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
-        (run_id, task_id),
-    ).fetchone()
-    claimed = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id, run_id),
-    ).fetchone()
-    try:
-        claimed_payload = json.loads(claimed["payload"] or "{}") if claimed else {}
-    except (TypeError, json.JSONDecodeError):
-        claimed_payload = {}
-    if not isinstance(claimed_payload, dict) or claimed_payload.get("source_status") != "review":
-        return run_id, run["profile"] if run else None, set()
-    rows = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND run_id = ? AND kind = 'visual_checked' "
-        "ORDER BY id ASC",
-        (task_id, run_id),
-    ).fetchall()
-    hashes: set[str] = set()
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if (
-            isinstance(payload, dict)
-            and payload.get("engine") == "native"
-            and isinstance(payload.get("sha256"), str)
-        ):
-            hashes.add(payload["sha256"].lower())
-    return run_id, run["profile"] if run else None, hashes
-
-
-def visual_completion_projection(
+def _completion_validation_projection_result(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: Optional[dict[str, Any]],
-) -> tuple[Optional[str], Optional[dict[str, Any]]]:
-    """Project the visual completion gate without mutating Kanban state."""
-    task = conn.execute(
-        "SELECT title, body, created_by FROM tasks WHERE id = ?", (task_id,)
+    *,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    source: str = "core",
+    dry_run: bool = False,
+) -> tuple[str | Exception | None, Optional[dict[str, Any]]]:
+    """Project plugin completion validators without mutating Kanban state."""
+    row = conn.execute(
+        "SELECT title, body, created_by, status, assignee, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
-    if task is None:
+    if row is None:
         return "task not found", metadata
-    handoff = _latest_review_handoff_metadata(conn, task_id)
     try:
-        from hermes_cli.visual_review import (
-            VisualReviewError,
-            is_capture_only_delivery,
-            is_visual_web_task,
-            requires_production_proof,
-            validate_final_review,
-            validate_production_proof,
+        from hermes_cli.kanban_completion_validators import (
+            KanbanCompletionValidationContext,
+            KanbanCompletionValidationError as _PluginValidationError,
+            project_kanban_completion_validation,
         )
 
-        # A historical handoff may carry visual_review.required=True because
-        # an older classifier routed a read-only screenshot-delivery card into
-        # review.  Do not let that generated flag permanently strand the card:
-        # the card's explicit no-change contract plus the absence of changed
-        # files on BOTH handoff and completion is stronger evidence that no
-        # implementation candidate exists to review.
-        if (
-            is_capture_only_delivery(
-                task["title"] or "", task["body"] or "", handoff,
+        projected, _outcomes = project_kanban_completion_validation(
+            KanbanCompletionValidationContext(
+                task_id=task_id,
+                title=row["title"],
+                body=row["body"],
+                created_by=row["created_by"],
+                board=get_current_board(),
+                prior_status=row["status"],
+                assignee=row["assignee"],
+                run_id=row["current_run_id"],
+                summary=summary,
+                result=result,
+                metadata=dict(metadata or {}),
+                created_cards=tuple(str(c) for c in (created_cards or ())),
+                source=source,
+                surface=source,
+                dry_run=dry_run,
             )
-            and is_capture_only_delivery(
-                task["title"] or "", task["body"] or "", metadata,
-            )
-        ):
-            return None, metadata
-        required = is_visual_web_task(
-            task["title"] or "",
-            task["body"] or "",
-            handoff or metadata,
-        ) or is_visual_web_task(
-            task["title"] or "",
-            task["body"] or "",
-            metadata,
         )
-        if not required:
-            return None, metadata
-        if not handoff:
-            return (
-                "web visual task must use kanban_request_review with desktop/mobile screenshots before completion",
-                metadata,
-            )
-        _run_id, reviewer_profile, native_hashes = _active_review_run_facts(conn, task_id)
-        normalized = validate_final_review(
-            task_id=task_id,
-            handoff_metadata=handoff,
-            completion_metadata=metadata,
-            reviewer_profile=reviewer_profile,
-            native_checked_hashes=native_hashes,
-        )
-        projected = dict(metadata or {})
-        projected["visual_review"] = normalized
-        final_route = normalized.get("final_route")
-        final_label = "GPT fallback" if final_route == "gpt_fallback" else "Gemini"
-        projected.setdefault(
-            "evidence",
-            {
-                "kind": "visual",
-                "detail": (
-                    f"Coder native PASS + {final_label} final OK on matching "
-                    "desktop/mobile captures"
-                ),
-            },
-        )
-        # Root-cause guard for a landing-page card validated on screenshots
-        # that were never actually deployed (incident t_9fbb7396): a render
-        # change cannot close on visual review alone unless the card carries
-        # Sébastien's explicit [NO-PROD-PROOF] exemption.
-        if requires_production_proof(
-            task["title"] or "", task["body"] or "", handoff or metadata,
-            created_by=task["created_by"],
-        ) or requires_production_proof(
-            task["title"] or "", task["body"] or "", metadata,
-            created_by=task["created_by"],
-        ):
-            projected["production_proof"] = validate_production_proof(
-                task_id=task_id, metadata=metadata,
-            )
         return None, projected
-    except VisualReviewError as exc:
-        return str(exc), metadata
+    except _PluginValidationError as exc:
+        return exc, metadata
+
+
+def completion_validation_projection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict[str, Any]],
+    *,
+    summary: Optional[str] = None,
+    result: Optional[str] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    source: str = "core",
+    dry_run: bool = False,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Project plugin completion validators without mutating Kanban state."""
+    rejection, projected = _completion_validation_projection_result(
+        conn,
+        task_id,
+        metadata,
+        summary=summary,
+        result=result,
+        created_cards=created_cards,
+        source=source,
+        dry_run=dry_run,
+    )
+    if rejection is None:
+        return None, projected
+    return str(rejection), projected
 
 
 def record_visual_check(
@@ -6429,6 +6353,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    completion_validation_source: str = "core",
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -6463,6 +6388,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    created_cards_tuple = tuple(str(c) for c in (created_cards or ()))
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -6473,9 +6399,9 @@ def complete_task(
     # tiny dedicated txn, then raise. The caller is responsible for
     # surfacing HallucinatedCardsError to the worker; this function
     # never mutates task state on a phantom-card rejection.
-    if created_cards:
+    if created_cards_tuple:
         verified_cards, phantom_cards = _verify_created_cards(
-            conn, task_id, created_cards
+            conn, task_id, created_cards_tuple
         )
         if phantom_cards:
             with write_txn(conn):
@@ -6498,9 +6424,21 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    visual_error, metadata = visual_completion_projection(conn, task_id, metadata)
-    if visual_error is not None:
-        raise VisualReviewGateError(visual_error)
+    validation_error, metadata = _completion_validation_projection_result(
+        conn,
+        task_id,
+        metadata,
+        summary=summary,
+        result=result,
+        created_cards=created_cards_tuple,
+        source=completion_validation_source,
+        dry_run=False,
+    )
+    if validation_error is not None:
+        raise CompletionValidationError(
+            str(validation_error),
+            code=getattr(validation_error, "code", "validator_rejected"),
+        )
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -6611,22 +6549,14 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
-        _verified = False
-        try:
-            from hermes_cli.closure_evidence import classify_closure_evidence
-
-            closure_evidence = classify_closure_evidence(
-                prior_status=prior_status,
-                metadata=metadata if isinstance(metadata, dict) else None,
-            )
-            if closure_evidence.satisfied:
-                _verified = True
-                completed_payload["evidence"] = {
-                    "kind": closure_evidence.kind,
-                    "detail": closure_evidence.detail,
-                }
-        except Exception:
-            pass
+        completed_payload["evidence"] = (
+            metadata.get("evidence")
+            if isinstance(metadata, dict) and isinstance(metadata.get("evidence"), dict)
+            else None
+        )
+        _verified = completed_payload["evidence"] is not None
+        if completed_payload["evidence"] is None:
+            completed_payload.pop("evidence")
         _completion_meta = metadata if isinstance(metadata, dict) else {}
         _integrated = any(
             _completion_meta.get(key)
@@ -7729,6 +7659,123 @@ def redact_review_value(value: Any) -> Any:
     return value
 
 
+def _prior_reviewer_from_latest_changes(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return reviewer provenance from the latest changes_requested boundary."""
+    changes_run = conn.execute(
+        "SELECT id FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'changes_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    changes_event = None
+    if changes_run is not None:
+        changes_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'changes_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(changes_run["id"])),
+        ).fetchone()
+    try:
+        changes_payload = (
+            json.loads(changes_event["payload"])
+            if changes_event and changes_event["payload"]
+            else {}
+        )
+    except (json.JSONDecodeError, TypeError):
+        changes_payload = {}
+    prior_reviewer = (
+        changes_payload.get("reviewer")
+        if isinstance(changes_payload, dict)
+        else None
+    )
+    if changes_run is None:
+        return None, None
+    if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
+        return None, (
+            "re-review has no durable reviewer provenance (the "
+            "latest changes_requested event is missing or "
+            "malformed); pass reviewer= explicitly"
+        )
+    return prior_reviewer, None
+
+
+def _review_handoff_projection_result(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict[str, Any]],
+    reviewer: Optional[str],
+    *,
+    summary: Optional[str] = None,
+    source: str = "core",
+) -> tuple[str | Exception | None, Optional[dict[str, Any]], Optional[str], Optional[sqlite3.Row]]:
+    """Project review handoff plugins before any request_review mutation.
+
+    This deliberately runs outside ``write_txn``. Recursive callbacks must be
+    detected by the seam itself, not masked by SQLite's nested-transaction
+    guard and then laundered into an apparent allow.
+    """
+    row = conn.execute(
+        "SELECT title, body, created_by, assignee, status, claim_lock, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return "task not found", metadata, reviewer, None
+    try:
+        from hermes_cli.kanban_review_handoff_validators import (
+            KanbanReviewHandoffContext,
+            KanbanReviewHandoffValidationError as _PluginReviewHandoffError,
+            project_kanban_review_handoff,
+        )
+
+        projected_metadata, projected_reviewer, _outcomes = project_kanban_review_handoff(
+            KanbanReviewHandoffContext(
+                task_id=task_id,
+                title=row["title"],
+                body=row["body"],
+                created_by=row["created_by"],
+                board=get_current_board(),
+                prior_status=row["status"],
+                assignee=row["assignee"],
+                run_id=row["current_run_id"],
+                summary=summary,
+                metadata=dict(metadata or {}),
+                reviewer=reviewer,
+                source=source,
+                surface=source,
+            )
+        )
+
+        if _outcomes:
+            if projected_reviewer is None:
+                prior_reviewer, prior_error = _prior_reviewer_from_latest_changes(conn, task_id)
+                if prior_error is not None:
+                    return prior_error, projected_metadata, projected_reviewer, row
+                projected_reviewer = prior_reviewer
+            reviewer = (
+                _canonical_assignee(projected_reviewer)
+                if projected_reviewer is not None
+                else None
+            )
+            return None, projected_metadata, reviewer, row
+
+        if reviewer is None:
+            prior_reviewer, prior_error = _prior_reviewer_from_latest_changes(conn, task_id)
+            if prior_error is not None:
+                return prior_error, metadata, reviewer, row
+            reviewer = prior_reviewer
+        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        return None, metadata, reviewer, row
+    except ValueError as exc:
+        return exc, metadata, reviewer, row
+    except Exception as exc:
+        return exc, metadata, reviewer, row
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7739,6 +7786,7 @@ def request_review(
     expected_run_id: Optional[int] = None,
     force: bool = False,
     with_reason: bool = False,
+    review_handoff_source: str = "core",
 ):
     """Transition implementation work into the first-class review phase.
 
@@ -7764,15 +7812,44 @@ def request_review(
         return (ok, reason) if with_reason else ok
 
     summary = redact_review_value(summary)
+    if not _parents_satisfied(conn, task_id):
+        return _ret(False, "parent dependencies are not satisfied")
+    metadata = redact_review_value(metadata if isinstance(metadata, dict) else None)
+    projection_error, metadata, reviewer, projected_row = _review_handoff_projection_result(
+        conn,
+        task_id,
+        metadata if isinstance(metadata, dict) else None,
+        reviewer,
+        summary=summary,
+        source=review_handoff_source,
+    )
+    if projection_error is not None:
+        prefix = "visual review handoff rejected"
+        if getattr(projection_error, "code", None) is not None:
+            prefix = "review handoff validator rejected handoff"
+        return _ret(False, f"{prefix}: {projection_error}")
+    metadata = redact_review_value(metadata)
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT title, body, assignee, status, claim_lock, current_run_id "
+            "SELECT title, body, created_by, assignee, status, claim_lock, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        if projected_row is not None and (
+            trow["status"] != projected_row["status"]
+            or trow["assignee"] != projected_row["assignee"]
+            or trow["claim_lock"] != projected_row["claim_lock"]
+            or trow["current_run_id"] != projected_row["current_run_id"]
+            or trow["title"] != projected_row["title"]
+            or trow["body"] != projected_row["body"]
+        ):
+            return _ret(
+                False,
+                "task changed while projecting review handoff; retry request_review",
+            )
         if (
             trow["status"] == "running"
             and trow["current_run_id"] is not None
@@ -7787,23 +7864,6 @@ def request_review(
                 "or defer a transient visual dependency with "
                 "kanban_defer_review instead of requesting another review",
             )
-        # Web/UI candidates always enter the independent Coder review lane.
-        # The handoff is normalised here (the domain boundary shared by CLI,
-        # dashboard and model tools), so a caller cannot bypass desktop/mobile
-        # screenshot hashing by choosing another control surface.
-        try:
-            from hermes_cli.visual_review import prepare_review_handoff
-
-            metadata, reviewer = prepare_review_handoff(
-                task_id=task_id,
-                title=trow["title"] or "",
-                body=trow["body"] or "",
-                metadata=metadata if isinstance(metadata, dict) else None,
-                reviewer=reviewer,
-            )
-        except ValueError as exc:
-            return _ret(False, f"visual review handoff rejected: {exc}")
-        metadata = redact_review_value(metadata)
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -7819,45 +7879,6 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
-        if reviewer is None:
-            changes_run = conn.execute(
-                "SELECT id FROM task_runs "
-                "WHERE task_id = ? AND outcome = 'changes_requested' "
-                "ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            changes_event = None
-            if changes_run is not None:
-                changes_event = conn.execute(
-                    "SELECT payload FROM task_events "
-                    "WHERE task_id = ? AND run_id = ? "
-                    "AND kind = 'changes_requested' "
-                    "ORDER BY id DESC LIMIT 1",
-                    (task_id, int(changes_run["id"])),
-                ).fetchone()
-            try:
-                changes_payload = (
-                    json.loads(changes_event["payload"])
-                    if changes_event and changes_event["payload"]
-                    else {}
-                )
-            except (json.JSONDecodeError, TypeError):
-                changes_payload = {}
-            prior_reviewer = (
-                changes_payload.get("reviewer")
-                if isinstance(changes_payload, dict)
-                else None
-            )
-            if changes_run is not None:
-                if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
-                    return _ret(
-                        False,
-                        "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
-                    )
-                reviewer = prior_reviewer
-        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
@@ -7936,16 +7957,7 @@ def request_review(
 
 
 def _review_reason_is_internal_closure_failure(reason: str) -> bool:
-    """Return whether a positive verdict is being misrouted as rework.
-
-    Reviewers sometimes correctly accept the implementation, then encounter
-    an unrelated completion-guard failure (for example a legacy card pointing
-    at the wrong/global workspace).  That is an orchestration incident, not an
-    implementation defect, so it must never start another implementation run.
-    Deliberately require both a positive verdict and an explicit foreign or
-    incorrect-workspace marker: ordinary dirty files left by the implementer
-    still remain valid rework.
-    """
+    """Return whether an accepted review is being misrouted as rework."""
     normalized = " ".join(str(reason or "").casefold().split())
     accepted = bool(re.search(
         r"\b(?:implementation|travail|correctif|preuves?)\b.{0,100}"
@@ -7987,11 +7999,9 @@ def request_changes(
     if _review_reason_is_internal_closure_failure(reason):
         return (
             False,
-            "the implementation was accepted and the reported failure is an "
-            "internal workspace/completion-guard incident, not an "
-            "implementation defect; preserve this review, repair the card "
-            "workspace/baseline and retry kanban_complete (or use "
-            "kanban_block kind=transient if that repair is outside this run)",
+            "review verdict already accepted the implementation; use "
+            "kanban_complete for approval instead of returning it to the "
+            "implementer as rework",
         )
 
     with write_txn(conn):
@@ -9507,11 +9517,6 @@ VALID_ROUTING_TIERS = {ROUTING_TIER_SIMPLE, ROUTING_TIER_COMPLEX}
 # capable route, never the cheaper one.
 DEFAULT_ROUTING_TIER = ROUTING_TIER_COMPLEX
 
-# Spark is a distinct bounded-work profile. Coder is the third durable
-# executor, resolving gpt-5.5 through openai-codex. `default` remains the
-# conversational orchestrator and must never be auto-selected as a writer.
-SPARK_MODEL_OVERRIDE = "gpt-5.3-codex-spark"
-CODER_MODEL_OVERRIDE = None
 CLAUDE_OPUS_MODEL = "claude-opus-5"
 
 
@@ -9600,48 +9605,91 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
             # still fails open.
             return (False, reason)
         return (True, "fail_open_last_resort")
+    if route in _configured_handoff_profile_names():
+        return (True, "configured_fail_open")
     return (False, f"unknown_route:{route}")
+
+
+def _configured_handoff_routes() -> dict[str, tuple[tuple[str, Optional[str]], ...]]:
+    """Load explicit Kanban profile handoff routes from config.
+
+    This intentionally does not infer profiles from native provider/model
+    fallback settings: those describe calls inside one process, while a Kanban
+    handoff needs a real profile identity the dispatcher can spawn.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("handoff_routes")
+    except Exception:
+        raw = None
+    if not isinstance(raw, Mapping):
+        return {}
+    configured: dict[str, tuple[tuple[str, Optional[str]], ...]] = {}
+    for tier in (ROUTING_TIER_SIMPLE, ROUTING_TIER_COMPLEX):
+        entries = raw.get(tier)
+        if not isinstance(entries, list):
+            continue
+        route: list[tuple[str, Optional[str]]] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if isinstance(entry, str):
+                profile = entry.strip()
+                model = None
+            elif isinstance(entry, Mapping):
+                profile = str(entry.get("profile") or "").strip()
+                raw_model = entry.get("model_override")
+                model = str(raw_model).strip() if raw_model else None
+            else:
+                route = []
+                break
+            if not profile or profile in seen:
+                route = []
+                break
+            seen.add(profile)
+            route.append((profile, model or None))
+        if route:
+            configured[tier] = tuple(route)
+    return configured
+
+
+def _configured_handoff_profile_names() -> set[str]:
+    names: set[str] = set()
+    for route in _configured_handoff_routes().values():
+        names.update(profile for profile, _model in route)
+    return names
+
+
+def _configured_route_for_tier(tier_value: Optional[str]) -> tuple[tuple[str, Optional[str]], ...]:
+    return _configured_handoff_routes().get(normalize_routing_tier(tier_value), ())
 
 
 def resolve_ordered_route(
     routing_tier: Optional[str],
     *,
     preflight_fn: Callable[[str], "tuple[bool, str]"] = route_preflight_ok,
-) -> "tuple[str, Optional[str], list[dict]]":
+) -> "tuple[Optional[str], Optional[str], list[dict]]":
     """Pick the actual ``(assignee, model_override)`` for an auto-routed task.
 
-    Bounded ``simple`` cards are explicitly allowed to use Spark first, then
-    Claude 2, Claude 1, and Coder last. ``complex`` (including an absent or invalid
-    tier) never uses Spark: it keeps the capable Claude 2 -> Claude 1 -> Coder
-    order. This makes the low-risk optimisation opt-in and fail-safe: no
-    ambiguous/legacy card can silently be downgraded to Spark.
+    Routes are explicit ``kanban.handoff_routes`` profile chains. Missing or
+    invalid config returns ``(None, None, [])`` so callers can leave native
+    assignment/default-assignee dispatch untouched instead of inventing a
+    local profile chain.
 
     The walk stops at the first green route; both Codex variants fail open
     unless the local cooldown cache explicitly blocks them (see
-    ``route_preflight_ok``), so this function always returns a route -- it
-    never leaves a task unrouted.
+    ``route_preflight_ok``). If every configured lane is explicitly refused,
+    return the final configured profile as the terminal fallback.
 
     Returns ``(assignee, model_override, trace)``. ``trace`` records every
     attempt as ``{"route", "model_override", "ok", "reason"}`` for
     observability and tests; it is descriptive only, never part of the
     decision itself.
     """
-    tier = normalize_routing_tier(routing_tier)
-    if tier == ROUTING_TIER_SIMPLE:
-        chain: list[tuple[str, str, Optional[str]]] = [
-            ("spark", "spark", SPARK_MODEL_OVERRIDE),
-            ("claude2", "claude2", None),
-            ("claude1", "claude1", None),
-            ("coder", "coder", CODER_MODEL_OVERRIDE),
-        ]
-    else:
-        chain = [
-            ("claude2", "claude2", None),
-            ("claude1", "claude1", None),
-            ("coder", "coder", CODER_MODEL_OVERRIDE),
-        ]
+    chain = _configured_route_for_tier(routing_tier)
     trace: list[dict] = []
-    for route, chain_assignee, chain_model in chain:
+    for chain_assignee, chain_model in chain:
+        route = chain_assignee
         ok, reason = preflight_fn(route)
         trace.append({
             "route": route,
@@ -9656,9 +9704,11 @@ def resolve_ordered_route(
         eligible = ok or reason in {"quota_measurement_unknown", "quota_preflight_required"}
         if eligible:
             return chain_assignee, chain_model, trace
-    # Unreachable in practice -- Coder fails open above -- but kept
-    # as an explicit, honest terminal state instead of an implicit default.
-    _, last_assignee, last_model = chain[-1]
+    # Every configured lane refused. Return the terminal configured profile
+    # without assuming any hardcoded tuple shape.
+    if not chain:
+        return None, None, trace
+    last_assignee, last_model = chain[-1]
     return last_assignee, last_model, trace
 
 
@@ -9670,34 +9720,29 @@ def resolve_parallel_routes(
 ) -> "tuple[list[tuple[str, Optional[str]]], list[dict]]":
     """Select distinct workers for one independent wave of work.
 
-    Coder is selected as a third complex lane only when a third independent
-    task exists; otherwise it remains preserved as the Claude fallback.
+    Missing/invalid config yields no routes. If every configured lane is
+    explicitly refused, use the final configured profile as the terminal route.
     """
     if task_count <= 0:
         return [], []
-    tier = normalize_routing_tier(routing_tier)
-    roles = (
-        ("spark", "claude2", "claude1", "coder")
-        if tier == ROUTING_TIER_SIMPLE
-        else ("claude2", "claude1", "coder")
-    )
+    roles = _configured_route_for_tier(routing_tier)
     selected: list[tuple[str, Optional[str]]] = []
     trace: list[dict] = []
-    for role in roles:
+    for role, model_override in roles:
         ok, reason = preflight_fn(role)
         trace.append({"route": role, "ok": ok, "reason": reason})
         eligible = ok or reason in {"quota_measurement_unknown", "quota_preflight_required"}
         if eligible:
             selected.append((
                 role,
-                SPARK_MODEL_OVERRIDE if role == "spark" else (
-                    CODER_MODEL_OVERRIDE if role == "coder" else None
-                ),
+                model_override,
             ))
         if len(selected) >= min(task_count, 3):
             break
+    if not selected and roles:
+        selected = [roles[-1]]
     if not selected:
-        selected = [("coder", CODER_MODEL_OVERRIDE)]
+        return [], trace
     return [selected[i % len(selected)] for i in range(task_count)], trace
 
 
@@ -11030,65 +11075,21 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-# --- fallback_simple_route's chain tables (t_e95f706b) ---------------------
-# Logical role -> real profile names. Each route resolves dynamically so an
-# absent profile blocks visibly instead of creating a permanently ready card.
-_ROUTE_ROLE_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "spark": ("spark",),
-    "claude2": ("claude2",),
-    "claude1": ("claude1",),
-    "coder": ("coder",),
-}
-_ROUTE_ROLE_LABEL = {"spark": "Spark", "claude2": "Claude 2", "claude1": "Claude 1", "coder": "Coder"}
-
-# Ordered fallback chain per normalized routing tier. 'simple' bounded work is
-# explicitly allowed to try Spark first; every other tier -- including an
-# absent/invalid one, which ``normalize_routing_tier`` fail-safes to
-# 'complex' -- never uses Spark and starts at Claude 2. Both chains end at
-# Coder (gpt-5.5/openai-codex), never default: Claude 2 -> Claude 1 -> Coder.
-_ROUTE_CHAIN_BY_TIER: dict[str, tuple[str, ...]] = {
-    ROUTING_TIER_SIMPLE: ("spark", "claude2", "claude1", "coder"),
-    ROUTING_TIER_COMPLEX: ("claude2", "claude1", "coder"),
-}
-
-
 def _route_role_for_assignment(
     assignee: Optional[str], model_override: Optional[str]
 ) -> Optional[str]:
-    """Identify which chain role an (assignee, model_override) pair currently
-    occupies a current profile name."""
-    if assignee == "spark":
-        return "spark"
-    if assignee == "claude2":
-        return "claude2"
-    if assignee == "claude1":
-        return "claude1"
-    if assignee == "coder":
-        return "coder"
-    return None
+    """Compatibility label for API-evidence capture: returns the profile name."""
+    return assignee or None
 
 
-def _resolve_route_profile(role: str) -> Optional["tuple[str, Optional[str]]"]:
-    """Resolve a logical chain role to a real, currently-existing profile.
-
-    Returns ``(assignee, model_override)`` for the first candidate in
-    ``_ROUTE_ROLE_CANDIDATES[role]`` that ``profile_exists()`` confirms is
-    real. Returns ``None`` when every candidate has been renamed/removed --
-    the caller must treat that as a broken chain (block explicitly), never
-    dispatch to a dead profile name (t_47dc2bf0 defect #1).
-    """
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        profile_exists = None  # type: ignore[assignment]
-    for name in _ROUTE_ROLE_CANDIDATES.get(role, ()):
-        if profile_exists is not None and not profile_exists(name):
-            continue
-        model = None
-        if role == "spark":
-            model = SPARK_MODEL_OVERRIDE
-        return name, model
-    return None
+def _route_label(profile: str) -> str:
+    if profile.startswith("claude") and profile[-1:].isdigit():
+        return f"Claude {profile[-1]}"
+    if profile == "spark":
+        return "Spark"
+    if profile == "coder":
+        return "Coder"
+    return profile
 
 
 _PROVIDER_STATUS_RE = re.compile(r"\b(?:http\s*(?:status)?|status(?:_code)?)[\s:=]+(\d{3})\b", re.I)
@@ -11374,23 +11375,14 @@ def fallback_simple_route(
 
     Only proven provider unavailability may advance a card. Local worker,
     proxy, workspace and protocol failures remain incidents on their existing
-    lane: no silent fallback. A proven card advances through Spark -> Claude 2
-    -> Claude 1 -> Coder for ``simple`` work, or Claude 2 -> Claude 1 ->
-    Coder for ``complex`` work.
-    A card already on the last hop, or whose current assignee doesn't match a
-    recognized chain role (e.g. a hand-assigned control-plane lane), is left
-    untouched: this only ever moves a card ALONG its own chain, never onto
-    one it was never on.
+    lane: no silent fallback. A proven card advances only along the explicit
+    ``kanban.handoff_routes`` chain configured for its normalized routing tier.
 
-    Each hop's actual profile name is resolved dynamically via
-    ``_resolve_route_profile`` instead of a hardcoded literal, so a future
-    profile rename can't silently strand the chain on a dead name the way
-    the hardcoded ``codex-worker`` entry did after the 2026-08-22 Spark
-    rename (t_47dc2bf0 defect #1). If NO candidate for the next hop resolves,
-    the card is blocked explicitly (``block_kind='capability'``) instead of
-    being left in ``ready`` with an unspawnable assignee -- the same silent
-    symptom as the 2026-08-22 orphan cards (defect #1's consequence, and the
-    general failure mode defect #2's fix must not reintroduce).
+    Missing or invalid ``handoff_routes`` means no Kanban handoff is armed. A
+    card already on the last configured hop, parked outside the configured
+    chain, or pointing at a next profile that does not exist is left untouched:
+    the official cooldown/sentinel path remains authoritative and no human
+    action is manufactured by this helper.
 
     Each newly selected writer gets a fresh retry budget. ``conn`` must
     already be inside the worker-exit transaction: this function only issues
@@ -11406,55 +11398,37 @@ def fallback_simple_route(
     ).fetchone()
     if row is None:
         return False
-    tier = normalize_routing_tier(row["routing_tier"])
-    chain = _ROUTE_CHAIN_BY_TIER.get(tier)
-    if chain is None:
+    chain = _configured_route_for_tier(row["routing_tier"])
+    if not chain:
         return False
-    current_role = _route_role_for_assignment(row["assignee"], row["model_override"])
-    if current_role is None or current_role not in chain:
+    current_index = None
+    for idx, (profile, _model) in enumerate(chain):
+        if row["assignee"] == profile:
+            current_index = idx
+            break
+    if current_index is None:
         return False
     # The provider observation must precede every transition to a different
     # writer, so a final Coder relay can only cite the Claude attempt that failed.
+    current_role = chain[current_index][0]
     capture_claude_provider_reset(conn, task_id, error)
-    idx = chain.index(current_role)
+    idx = current_index
     is_opus = bool(row["model_override"] and "opus" in row["model_override"].casefold())
     if is_opus and current_role == "claude1":
         return False  # an explicit Opus task may not degrade to Coder/Sonnet
     if idx + 1 >= len(chain):
         return False  # already on the last hop (Coder) -- nothing further to try
-    next_role = chain[idx + 1]
-    from_route = _ROUTE_ROLE_LABEL.get(current_role, current_role)
-    to_route = _ROUTE_ROLE_LABEL.get(next_role, next_role)
-    resolved = _resolve_route_profile(next_role)
-    if resolved is None:
-        # Every candidate profile for the next hop is gone. Routing there
-        # anyway would just reproduce the exact silent-ready bug this
-        # function exists to fix -- block explicitly so a human sees it.
-        reason = (
-            f"{from_route} failed and no real profile resolves the next hop "
-            f"({to_route}): {safe_error}"
-        )[:500]
-        conn.execute(
-            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, block_kind = 'capability', "
-            "last_failure_error = ? WHERE id = ?",
-            (reason, task_id),
-        )
-        _append_event(
-            conn,
-            task_id,
-            "route_fallback_broken",
-            {
-                "from_route": from_route,
-                "attempted_to_route": to_route,
-                "from_assignee": row["assignee"],
-                "reason": safe_error,
-            },
-        )
-        return True
-    next_assignee, next_model = resolved
+    next_assignee, next_model = chain[idx + 1]
+    from_route = _route_label(current_role)
+    to_route = _route_label(next_assignee)
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+    if profile_exists is not None and not profile_exists(next_assignee):
+        return False
     if is_opus:
-        if next_role != "claude1":
+        if next_assignee != "claude1":
             return False
         next_model = row["model_override"]
     conn.execute(
@@ -11477,7 +11451,7 @@ def fallback_simple_route(
             "reason": safe_error,
         },
     )
-    if next_role == "coder":
+    if next_assignee == "coder":
         already_relayed = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'relayed_to_coder' LIMIT 1",
             (task_id,),
@@ -12573,24 +12547,12 @@ MEMORY_GUARD_MB_PER_WORKER = 512
 # more fan-out on big iron should say so explicitly in config).
 DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
-
-# Every live Kanban worker is placed in its own transient systemd scope.  The
-# cap is deliberately high enough for one CPU Whisper-base transcription on
-# the reference 15-GiB workstation, but low enough to stop an accidental
-# aggregate scan before it can consume the host and kill the gateway.
 KANBAN_WORKER_MEMORY_DEFAULT_MB = 6144
 KANBAN_WORKER_MEMORY_MIN_MB = 512
 KANBAN_WORKER_MEMORY_MAX_MB = 8192
 
-
-def _kanban_worker_memory_max_bytes() -> int:
-    """Resolve the finite per-Kanban-worker cgroup limit.
-
-    ``kanban.worker_memory_max_mb`` is operator-configurable but cannot exceed
-    8 GiB or half of physical RAM.  On small machines the physical bound wins,
-    while the 512-MiB floor keeps the unit startable for ordinary workers.
-    """
-    configured: Any = None
+def _configured_kanban_worker_memory_max_mb() -> Any:
+    """Return the operator's optional ``kanban.worker_memory_max_mb`` value."""
     try:
         from hermes_cli.config import load_config_readonly
         configured = (load_config_readonly() or {}).get("kanban", {}).get(
@@ -12598,25 +12560,16 @@ def _kanban_worker_memory_max_bytes() -> int:
         )
     except Exception:
         configured = None
+    if configured is None:
+        return KANBAN_WORKER_MEMORY_DEFAULT_MB
     try:
-        requested_mb = int(configured)
+        parsed = int(configured)
     except (TypeError, ValueError):
-        requested_mb = KANBAN_WORKER_MEMORY_DEFAULT_MB
-    requested_mb = max(
+        return KANBAN_WORKER_MEMORY_DEFAULT_MB
+    return max(
         KANBAN_WORKER_MEMORY_MIN_MB,
-        min(requested_mb, KANBAN_WORKER_MEMORY_MAX_MB),
+        min(parsed, KANBAN_WORKER_MEMORY_MAX_MB),
     )
-    try:
-        physical_mb = (
-            int(os.sysconf("SC_PHYS_PAGES"))
-            * int(os.sysconf("SC_PAGE_SIZE"))
-            // (1024 * 1024)
-        )
-        host_bound_mb = max(KANBAN_WORKER_MEMORY_MIN_MB, physical_mb // 2)
-        requested_mb = min(requested_mb, host_bound_mb)
-    except (OSError, ValueError, TypeError):
-        pass
-    return requested_mb * 1024 * 1024
 
 
 def _bounded_kanban_worker_argv(
@@ -12629,6 +12582,7 @@ def _bounded_kanban_worker_argv(
         from tools.process_registry import (
             _build_systemd_scope_argv,
             _systemd_run_user_scope_available,
+            _worker_memory_max_bytes,
         )
 
         if not _systemd_run_user_scope_available():
@@ -12643,7 +12597,10 @@ def _bounded_kanban_worker_argv(
         argv = _build_systemd_scope_argv(
             cmd,
             unit_suffix=suffix,
-            memory_max_bytes=_kanban_worker_memory_max_bytes(),
+            memory_max_bytes=_worker_memory_max_bytes(
+                configured_max_mb=_configured_kanban_worker_memory_max_mb(),
+                cap_bytes=KANBAN_WORKER_MEMORY_MAX_MB * 1024 * 1024,
+            ),
         )
         return argv, f"hermes-worker-{suffix}.scope"
     except Exception as exc:
@@ -12819,22 +12776,12 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
 def _workspace_occupancy_key(
     workspace_kind: Optional[str], workspace_path: Optional[str],
 ) -> Optional[str]:
-    """Return the nearest writable Git checkout, or the exact path.
+    """Return the real writable Git root for a workspace, or its exact path.
 
-    A new ``worktree`` card initially stores its repository anchor; different
-    task ids must still be allowed to materialize distinct linked worktrees
-    from that shared anchor. Once the path points inside ``.worktrees`` it is
-    exact and must be serialized like ``dir`` and ``scratch`` workspaces.
-
-    ``dir`` cards can point at sibling-looking subdirectories that are not
-    independent writers. For example ``repo/youtube`` belongs to the parent
-    checkout while ``repo/ecobloc/tasks`` belongs to a nested Git checkout.
-    The parent checkout observes the nested repository as a dirty gitlink, so
-    letting both cards run concurrently lets the parent worker reset or commit
-    the nested worker's pointer. Resolve each existing path to its nearest
-    ``.git`` ancestor; :func:`_workspace_occupancy_conflict` then treats
-    ancestor/descendant checkout scopes as overlapping while still allowing
-    two independent nested sibling repositories to run in parallel.
+    New ``worktree`` cards initially store their source repository; do not lock
+    that shared source until the task path has resolved to its own linked
+    worktree. Managed scratch spaces are private control-plane directories, so
+    their exact path is the only collision scope.
     """
     if not workspace_path:
         return None
@@ -12867,15 +12814,11 @@ def _workspace_occupancy_key(
 
 
 def _workspace_occupancy_conflict(left: str, right: str) -> bool:
-    """Return whether two exact/repository scopes can affect one another.
+    """Return whether two exact or Git-root scopes overlap.
 
-    Equality covers the historical same-directory guard. Ancestor overlap is
-    normally a collision because Git parent checkouts can track nested
-    repositories as gitlinks.  A nested checkout explicitly ignored by the
-    parent is the safe exception: parent-wide status/add operations cannot see
-    it, so serializing a long parent-owned subdirectory job against that
-    independent project only strands an otherwise usable worker lane. Sibling
-    nested repositories remain independent.
+    Equality covers the same workspace. Ancestor/descendant Git roots are also
+    serialized because a parent checkout can observe a nested repository. Two
+    sibling nested repositories remain independent.
     """
     try:
         left_path = Path(left).expanduser().resolve()
@@ -12886,45 +12829,10 @@ def _workspace_occupancy_conflict(left: str, right: str) -> bool:
     if left_path == right_path:
         return True
     if left_path in right_path.parents:
-        return not _parent_ignores_nested_checkout(left_path, right_path)
+        return True
     if right_path in left_path.parents:
-        return not _parent_ignores_nested_checkout(right_path, left_path)
+        return True
     return False
-
-
-def _parent_ignores_nested_checkout(parent: Path, nested: Path) -> bool:
-    """Return whether ``nested`` is a Git checkout ignored by ``parent``.
-
-    Fail closed on every ambiguity. A tracked gitlink, a normal tracked path,
-    an unignored nested repository, or a Git command failure keeps the
-    ancestor/descendant serialization contract. Only an existing nested
-    ``.git`` marker plus a positive ``git check-ignore`` result is independent.
-    """
-    try:
-        if not (parent / ".git").exists() or not (nested / ".git").exists():
-            return False
-        relative = nested.relative_to(parent)
-        if not relative.parts:
-            return False
-        tracked = subprocess.run(
-            ["git", "-C", str(parent), "ls-files", "--stage", "--", str(relative)],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        if tracked.returncode != 0 or tracked.stdout.strip():
-            return False
-        ignored = subprocess.run(
-            ["git", "-C", str(parent), "check-ignore", "-q", "--", str(relative)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-            check=False,
-        )
-        return ignored.returncode == 0
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return False
 
 
 def _occupied_workspace_owner(
@@ -13388,22 +13296,23 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
-    # Bounded work: Spark -> Claude 2 -> Claude 1 -> Coder; all other work
-    # retains Claude 2 -> Claude 1 -> Coder routing.
-    # Enabled by default: it only ever engages for tasks with NO explicit
-    # assignee, and it only supersedes a ``kanban.default_assignee`` config
-    # that itself points at one of the four routes this chain already
-    # covers (unset, or spark/claude1/claude2/coder) -- an operator-chosen
-    # default pointing at some other lane (e.g. a control-plane terminal)
-    # is left completely untouched. Off switch: kanban.tiered_routing_enabled.
+    # Optional config-driven handoff routing for unassigned ready tasks. Empty
+    # or invalid config disables only the multi-profile chain: the native
+    # default_assignee path below remains available.
+    _configured_routes = _configured_handoff_routes()
     try:
         from hermes_cli.config import load_config as _load_kanban_cfg
         _tiered_cfg = (_load_kanban_cfg().get("kanban", {}) or {})
         _tiered_routing_enabled = bool(_tiered_cfg.get("tiered_routing_enabled", True))
     except Exception:
         _tiered_routing_enabled = True
-    _tiered_routing_applies = _tiered_routing_enabled and (
-        _default_assignee is None or _default_assignee in ("spark", "claude1", "claude2", "coder")
+    _configured_route_profiles = {
+        profile
+        for route in _configured_routes.values()
+        for profile, _model in route
+    }
+    _tiered_routing_applies = bool(_configured_routes) and _tiered_routing_enabled and (
+        _default_assignee is None or _default_assignee in _configured_route_profiles
     )
 
     # Route a whole ready wave as a wave, not as N unrelated first choices.
@@ -13470,6 +13379,9 @@ def _dispatch_once_locked(
                         if "routing_tier" in row.keys() else None
                     ),
                 )
+                if not _tier_assignee:
+                    result.skipped_unassigned.append(row["id"])
+                    continue
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.

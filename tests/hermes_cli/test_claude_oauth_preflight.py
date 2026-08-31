@@ -87,7 +87,7 @@ def test_dispatch_blocks_claude2_before_worker_spawn_on_expired_oauth(
 
 
 def test_noncredential_canary_failure_reroutes_without_human_block(
-    kanban_home, all_assignees_spawnable, monkeypatch,
+    kanban_home, all_assignees_spawnable, configured_handoff_routes, monkeypatch,
 ):
     routing = kanban_home / "state" / "ai-quota-routing.json"
     routing.parent.mkdir(parents=True)
