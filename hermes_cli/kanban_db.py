@@ -7946,16 +7946,7 @@ def request_review(
 
 
 def _review_reason_is_internal_closure_failure(reason: str) -> bool:
-    """Return whether a positive verdict is being misrouted as rework.
-
-    Reviewers sometimes correctly accept the implementation, then encounter
-    an unrelated completion-guard failure (for example a legacy card pointing
-    at the wrong/global workspace).  That is an orchestration incident, not an
-    implementation defect, so it must never start another implementation run.
-    Deliberately require both a positive verdict and an explicit foreign or
-    incorrect-workspace marker: ordinary dirty files left by the implementer
-    still remain valid rework.
-    """
+    """Return whether an accepted review is being misrouted as rework."""
     normalized = " ".join(str(reason or "").casefold().split())
     accepted = bool(re.search(
         r"\b(?:implementation|travail|correctif|preuves?)\b.{0,100}"
@@ -7997,11 +7988,9 @@ def request_changes(
     if _review_reason_is_internal_closure_failure(reason):
         return (
             False,
-            "the implementation was accepted and the reported failure is an "
-            "internal workspace/completion-guard incident, not an "
-            "implementation defect; preserve this review, repair the card "
-            "workspace/baseline and retry kanban_complete (or use "
-            "kanban_block kind=transient if that repair is outside this run)",
+            "review verdict already accepted the implementation; use "
+            "kanban_complete for approval instead of returning it to the "
+            "implementer as rework",
         )
 
     with write_txn(conn):
@@ -12776,22 +12765,12 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
 def _workspace_occupancy_key(
     workspace_kind: Optional[str], workspace_path: Optional[str],
 ) -> Optional[str]:
-    """Return the nearest writable Git checkout, or the exact path.
+    """Return the real writable Git root for a workspace, or its exact path.
 
-    A new ``worktree`` card initially stores its repository anchor; different
-    task ids must still be allowed to materialize distinct linked worktrees
-    from that shared anchor. Once the path points inside ``.worktrees`` it is
-    exact and must be serialized like ``dir`` and ``scratch`` workspaces.
-
-    ``dir`` cards can point at sibling-looking subdirectories that are not
-    independent writers. For example ``repo/youtube`` belongs to the parent
-    checkout while ``repo/ecobloc/tasks`` belongs to a nested Git checkout.
-    The parent checkout observes the nested repository as a dirty gitlink, so
-    letting both cards run concurrently lets the parent worker reset or commit
-    the nested worker's pointer. Resolve each existing path to its nearest
-    ``.git`` ancestor; :func:`_workspace_occupancy_conflict` then treats
-    ancestor/descendant checkout scopes as overlapping while still allowing
-    two independent nested sibling repositories to run in parallel.
+    New ``worktree`` cards initially store their source repository; do not lock
+    that shared source until the task path has resolved to its own linked
+    worktree. Managed scratch spaces are private control-plane directories, so
+    their exact path is the only collision scope.
     """
     if not workspace_path:
         return None
@@ -12824,15 +12803,11 @@ def _workspace_occupancy_key(
 
 
 def _workspace_occupancy_conflict(left: str, right: str) -> bool:
-    """Return whether two exact/repository scopes can affect one another.
+    """Return whether two exact or Git-root scopes overlap.
 
-    Equality covers the historical same-directory guard. Ancestor overlap is
-    normally a collision because Git parent checkouts can track nested
-    repositories as gitlinks.  A nested checkout explicitly ignored by the
-    parent is the safe exception: parent-wide status/add operations cannot see
-    it, so serializing a long parent-owned subdirectory job against that
-    independent project only strands an otherwise usable worker lane. Sibling
-    nested repositories remain independent.
+    Equality covers the same workspace. Ancestor/descendant Git roots are also
+    serialized because a parent checkout can observe a nested repository. Two
+    sibling nested repositories remain independent.
     """
     try:
         left_path = Path(left).expanduser().resolve()
@@ -12843,45 +12818,10 @@ def _workspace_occupancy_conflict(left: str, right: str) -> bool:
     if left_path == right_path:
         return True
     if left_path in right_path.parents:
-        return not _parent_ignores_nested_checkout(left_path, right_path)
+        return True
     if right_path in left_path.parents:
-        return not _parent_ignores_nested_checkout(right_path, left_path)
+        return True
     return False
-
-
-def _parent_ignores_nested_checkout(parent: Path, nested: Path) -> bool:
-    """Return whether ``nested`` is a Git checkout ignored by ``parent``.
-
-    Fail closed on every ambiguity. A tracked gitlink, a normal tracked path,
-    an unignored nested repository, or a Git command failure keeps the
-    ancestor/descendant serialization contract. Only an existing nested
-    ``.git`` marker plus a positive ``git check-ignore`` result is independent.
-    """
-    try:
-        if not (parent / ".git").exists() or not (nested / ".git").exists():
-            return False
-        relative = nested.relative_to(parent)
-        if not relative.parts:
-            return False
-        tracked = subprocess.run(
-            ["git", "-C", str(parent), "ls-files", "--stage", "--", str(relative)],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        if tracked.returncode != 0 or tracked.stdout.strip():
-            return False
-        ignored = subprocess.run(
-            ["git", "-C", str(parent), "check-ignore", "-q", "--", str(relative)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-            check=False,
-        )
-        return ignored.returncode == 0
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return False
 
 
 def _occupied_workspace_owner(

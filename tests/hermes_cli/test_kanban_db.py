@@ -1313,10 +1313,10 @@ def test_dispatch_keeps_nested_sibling_repositories_parallel(
     assert len(spawned) == 2
 
 
-def test_dispatch_allows_parent_and_explicitly_ignored_nested_repository(
+def test_dispatch_serializes_parent_and_ignored_nested_repository(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """An ignored independent checkout must not be a global parent lock."""
+    """Only Git-root overlap matters; ignore rules do not bypass the lock."""
     monkeypatch.setattr(kb, "_memory_pressure_level", lambda *_args: "ok")
     repository = kanban_home / "repository"
     _init_git_repo(repository)
@@ -1344,12 +1344,11 @@ def test_dispatch_allows_parent_and_explicitly_ignored_nested_repository(
         )
         result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
 
-    assert result.skipped_workspace_busy == []
-    assert {task_id for task_id, _assignee, _workspace in result.spawned} == {
-        parent,
-        nested,
-    }
-    assert len(spawned) == 2
+    assert result.spawned == [(parent, "researcher", str(parent_workspace.resolve()))]
+    assert result.skipped_workspace_busy == [
+        (nested, str(nested_repository.resolve()), parent),
+    ]
+    assert spawned == [(parent, str(parent_workspace.resolve()))]
 
 
 def test_dispatch_waits_one_tick_for_terminal_worker_exit_barrier(
