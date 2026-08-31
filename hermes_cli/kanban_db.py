@@ -9517,11 +9517,6 @@ VALID_ROUTING_TIERS = {ROUTING_TIER_SIMPLE, ROUTING_TIER_COMPLEX}
 # capable route, never the cheaper one.
 DEFAULT_ROUTING_TIER = ROUTING_TIER_COMPLEX
 
-# Spark is a distinct bounded-work profile. Coder is the third durable
-# executor, resolving gpt-5.5 through openai-codex. `default` remains the
-# conversational orchestrator and must never be auto-selected as a writer.
-SPARK_MODEL_OVERRIDE = "gpt-5.3-codex-spark"
-CODER_MODEL_OVERRIDE = None
 CLAUDE_OPUS_MODEL = "claude-opus-5"
 
 
@@ -9613,45 +9608,79 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
     return (False, f"unknown_route:{route}")
 
 
+def _configured_handoff_routes() -> dict[str, tuple[tuple[str, Optional[str]], ...]]:
+    """Load explicit Kanban profile handoff routes from config.
+
+    This intentionally does not infer profiles from native provider/model
+    fallback settings: those describe calls inside one process, while a Kanban
+    handoff needs a real profile identity the dispatcher can spawn.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("handoff_routes")
+    except Exception:
+        raw = None
+    if not isinstance(raw, Mapping):
+        return {}
+    configured: dict[str, tuple[tuple[str, Optional[str]], ...]] = {}
+    for tier in (ROUTING_TIER_SIMPLE, ROUTING_TIER_COMPLEX):
+        entries = raw.get(tier)
+        if not isinstance(entries, list):
+            continue
+        route: list[tuple[str, Optional[str]]] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if isinstance(entry, str):
+                profile = entry.strip()
+                model = None
+            elif isinstance(entry, Mapping):
+                profile = str(entry.get("profile") or "").strip()
+                raw_model = entry.get("model_override")
+                model = str(raw_model).strip() if raw_model else None
+            else:
+                route = []
+                break
+            if not profile or profile in seen:
+                route = []
+                break
+            seen.add(profile)
+            route.append((profile, model or None))
+        if route:
+            configured[tier] = tuple(route)
+    return configured
+
+
+def _configured_route_for_tier(tier_value: Optional[str]) -> tuple[tuple[str, Optional[str]], ...]:
+    return _configured_handoff_routes().get(normalize_routing_tier(tier_value), ())
+
+
 def resolve_ordered_route(
     routing_tier: Optional[str],
     *,
     preflight_fn: Callable[[str], "tuple[bool, str]"] = route_preflight_ok,
-) -> "tuple[str, Optional[str], list[dict]]":
+) -> "tuple[Optional[str], Optional[str], list[dict]]":
     """Pick the actual ``(assignee, model_override)`` for an auto-routed task.
 
-    Bounded ``simple`` cards are explicitly allowed to use Spark first, then
-    Claude 2, Claude 1, and Coder last. ``complex`` (including an absent or invalid
-    tier) never uses Spark: it keeps the capable Claude 2 -> Claude 1 -> Coder
-    order. This makes the low-risk optimisation opt-in and fail-safe: no
-    ambiguous/legacy card can silently be downgraded to Spark.
+    Routes are explicit ``kanban.handoff_routes`` profile chains. Missing or
+    invalid config returns ``(None, None, [])`` so callers can leave native
+    assignment/default-assignee dispatch untouched instead of inventing a
+    local profile chain.
 
     The walk stops at the first green route; both Codex variants fail open
     unless the local cooldown cache explicitly blocks them (see
-    ``route_preflight_ok``), so this function always returns a route -- it
-    never leaves a task unrouted.
+    ``route_preflight_ok``). If every configured lane is explicitly refused,
+    return the final configured profile as the terminal fallback.
 
     Returns ``(assignee, model_override, trace)``. ``trace`` records every
     attempt as ``{"route", "model_override", "ok", "reason"}`` for
     observability and tests; it is descriptive only, never part of the
     decision itself.
     """
-    tier = normalize_routing_tier(routing_tier)
-    if tier == ROUTING_TIER_SIMPLE:
-        chain: list[tuple[str, str, Optional[str]]] = [
-            ("spark", "spark", SPARK_MODEL_OVERRIDE),
-            ("claude2", "claude2", None),
-            ("claude1", "claude1", None),
-            ("coder", "coder", CODER_MODEL_OVERRIDE),
-        ]
-    else:
-        chain = [
-            ("claude2", "claude2", None),
-            ("claude1", "claude1", None),
-            ("coder", "coder", CODER_MODEL_OVERRIDE),
-        ]
+    chain = _configured_route_for_tier(routing_tier)
     trace: list[dict] = []
-    for route, chain_assignee, chain_model in chain:
+    for chain_assignee, chain_model in chain:
+        route = chain_assignee
         ok, reason = preflight_fn(route)
         trace.append({
             "route": route,
@@ -9666,9 +9695,11 @@ def resolve_ordered_route(
         eligible = ok or reason in {"quota_measurement_unknown", "quota_preflight_required"}
         if eligible:
             return chain_assignee, chain_model, trace
-    # Unreachable in practice -- Coder fails open above -- but kept
-    # as an explicit, honest terminal state instead of an implicit default.
-    _, last_assignee, last_model = chain[-1]
+    # Every configured lane refused. Return the terminal configured profile
+    # without assuming any hardcoded tuple shape.
+    if not chain:
+        return None, None, trace
+    last_assignee, last_model = chain[-1]
     return last_assignee, last_model, trace
 
 
@@ -9680,34 +9711,29 @@ def resolve_parallel_routes(
 ) -> "tuple[list[tuple[str, Optional[str]]], list[dict]]":
     """Select distinct workers for one independent wave of work.
 
-    Coder is selected as a third complex lane only when a third independent
-    task exists; otherwise it remains preserved as the Claude fallback.
+    Missing/invalid config yields no routes. If every configured lane is
+    explicitly refused, use the final configured profile as the terminal route.
     """
     if task_count <= 0:
         return [], []
-    tier = normalize_routing_tier(routing_tier)
-    roles = (
-        ("spark", "claude2", "claude1", "coder")
-        if tier == ROUTING_TIER_SIMPLE
-        else ("claude2", "claude1", "coder")
-    )
+    roles = _configured_route_for_tier(routing_tier)
     selected: list[tuple[str, Optional[str]]] = []
     trace: list[dict] = []
-    for role in roles:
+    for role, model_override in roles:
         ok, reason = preflight_fn(role)
         trace.append({"route": role, "ok": ok, "reason": reason})
         eligible = ok or reason in {"quota_measurement_unknown", "quota_preflight_required"}
         if eligible:
             selected.append((
                 role,
-                SPARK_MODEL_OVERRIDE if role == "spark" else (
-                    CODER_MODEL_OVERRIDE if role == "coder" else None
-                ),
+                model_override,
             ))
         if len(selected) >= min(task_count, 3):
             break
+    if not selected and roles:
+        selected = [roles[-1]]
     if not selected:
-        selected = [("coder", CODER_MODEL_OVERRIDE)]
+        return [], trace
     return [selected[i % len(selected)] for i in range(task_count)], trace
 
 
@@ -11040,65 +11066,21 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-# --- fallback_simple_route's chain tables (t_e95f706b) ---------------------
-# Logical role -> real profile names. Each route resolves dynamically so an
-# absent profile blocks visibly instead of creating a permanently ready card.
-_ROUTE_ROLE_CANDIDATES: dict[str, tuple[str, ...]] = {
-    "spark": ("spark",),
-    "claude2": ("claude2",),
-    "claude1": ("claude1",),
-    "coder": ("coder",),
-}
-_ROUTE_ROLE_LABEL = {"spark": "Spark", "claude2": "Claude 2", "claude1": "Claude 1", "coder": "Coder"}
-
-# Ordered fallback chain per normalized routing tier. 'simple' bounded work is
-# explicitly allowed to try Spark first; every other tier -- including an
-# absent/invalid one, which ``normalize_routing_tier`` fail-safes to
-# 'complex' -- never uses Spark and starts at Claude 2. Both chains end at
-# Coder (gpt-5.5/openai-codex), never default: Claude 2 -> Claude 1 -> Coder.
-_ROUTE_CHAIN_BY_TIER: dict[str, tuple[str, ...]] = {
-    ROUTING_TIER_SIMPLE: ("spark", "claude2", "claude1", "coder"),
-    ROUTING_TIER_COMPLEX: ("claude2", "claude1", "coder"),
-}
-
-
 def _route_role_for_assignment(
     assignee: Optional[str], model_override: Optional[str]
 ) -> Optional[str]:
-    """Identify which chain role an (assignee, model_override) pair currently
-    occupies a current profile name."""
-    if assignee == "spark":
-        return "spark"
-    if assignee == "claude2":
-        return "claude2"
-    if assignee == "claude1":
-        return "claude1"
-    if assignee == "coder":
-        return "coder"
-    return None
+    """Compatibility label for API-evidence capture: returns the profile name."""
+    return assignee or None
 
 
-def _resolve_route_profile(role: str) -> Optional["tuple[str, Optional[str]]"]:
-    """Resolve a logical chain role to a real, currently-existing profile.
-
-    Returns ``(assignee, model_override)`` for the first candidate in
-    ``_ROUTE_ROLE_CANDIDATES[role]`` that ``profile_exists()`` confirms is
-    real. Returns ``None`` when every candidate has been renamed/removed --
-    the caller must treat that as a broken chain (block explicitly), never
-    dispatch to a dead profile name (t_47dc2bf0 defect #1).
-    """
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        profile_exists = None  # type: ignore[assignment]
-    for name in _ROUTE_ROLE_CANDIDATES.get(role, ()):
-        if profile_exists is not None and not profile_exists(name):
-            continue
-        model = None
-        if role == "spark":
-            model = SPARK_MODEL_OVERRIDE
-        return name, model
-    return None
+def _route_label(profile: str) -> str:
+    if profile.startswith("claude") and profile[-1:].isdigit():
+        return f"Claude {profile[-1]}"
+    if profile == "spark":
+        return "Spark"
+    if profile == "coder":
+        return "Coder"
+    return profile
 
 
 _PROVIDER_STATUS_RE = re.compile(r"\b(?:http\s*(?:status)?|status(?:_code)?)[\s:=]+(\d{3})\b", re.I)
@@ -11384,23 +11366,14 @@ def fallback_simple_route(
 
     Only proven provider unavailability may advance a card. Local worker,
     proxy, workspace and protocol failures remain incidents on their existing
-    lane: no silent fallback. A proven card advances through Spark -> Claude 2
-    -> Claude 1 -> Coder for ``simple`` work, or Claude 2 -> Claude 1 ->
-    Coder for ``complex`` work.
-    A card already on the last hop, or whose current assignee doesn't match a
-    recognized chain role (e.g. a hand-assigned control-plane lane), is left
-    untouched: this only ever moves a card ALONG its own chain, never onto
-    one it was never on.
+    lane: no silent fallback. A proven card advances only along the explicit
+    ``kanban.handoff_routes`` chain configured for its normalized routing tier.
 
-    Each hop's actual profile name is resolved dynamically via
-    ``_resolve_route_profile`` instead of a hardcoded literal, so a future
-    profile rename can't silently strand the chain on a dead name the way
-    the hardcoded ``codex-worker`` entry did after the 2026-08-22 Spark
-    rename (t_47dc2bf0 defect #1). If NO candidate for the next hop resolves,
-    the card is blocked explicitly (``block_kind='capability'``) instead of
-    being left in ``ready`` with an unspawnable assignee -- the same silent
-    symptom as the 2026-08-22 orphan cards (defect #1's consequence, and the
-    general failure mode defect #2's fix must not reintroduce).
+    Missing or invalid ``handoff_routes`` means no Kanban handoff is armed. A
+    card already on the last configured hop, parked outside the configured
+    chain, or pointing at a next profile that does not exist is left untouched:
+    the official cooldown/sentinel path remains authoritative and no human
+    action is manufactured by this helper.
 
     Each newly selected writer gets a fresh retry budget. ``conn`` must
     already be inside the worker-exit transaction: this function only issues
@@ -11416,55 +11389,37 @@ def fallback_simple_route(
     ).fetchone()
     if row is None:
         return False
-    tier = normalize_routing_tier(row["routing_tier"])
-    chain = _ROUTE_CHAIN_BY_TIER.get(tier)
-    if chain is None:
+    chain = _configured_route_for_tier(row["routing_tier"])
+    if not chain:
         return False
-    current_role = _route_role_for_assignment(row["assignee"], row["model_override"])
-    if current_role is None or current_role not in chain:
+    current_index = None
+    for idx, (profile, _model) in enumerate(chain):
+        if row["assignee"] == profile:
+            current_index = idx
+            break
+    if current_index is None:
         return False
     # The provider observation must precede every transition to a different
     # writer, so a final Coder relay can only cite the Claude attempt that failed.
+    current_role = chain[current_index][0]
     capture_claude_provider_reset(conn, task_id, error)
-    idx = chain.index(current_role)
+    idx = current_index
     is_opus = bool(row["model_override"] and "opus" in row["model_override"].casefold())
     if is_opus and current_role == "claude1":
         return False  # an explicit Opus task may not degrade to Coder/Sonnet
     if idx + 1 >= len(chain):
         return False  # already on the last hop (Coder) -- nothing further to try
-    next_role = chain[idx + 1]
-    from_route = _ROUTE_ROLE_LABEL.get(current_role, current_role)
-    to_route = _ROUTE_ROLE_LABEL.get(next_role, next_role)
-    resolved = _resolve_route_profile(next_role)
-    if resolved is None:
-        # Every candidate profile for the next hop is gone. Routing there
-        # anyway would just reproduce the exact silent-ready bug this
-        # function exists to fix -- block explicitly so a human sees it.
-        reason = (
-            f"{from_route} failed and no real profile resolves the next hop "
-            f"({to_route}): {safe_error}"
-        )[:500]
-        conn.execute(
-            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, block_kind = 'capability', "
-            "last_failure_error = ? WHERE id = ?",
-            (reason, task_id),
-        )
-        _append_event(
-            conn,
-            task_id,
-            "route_fallback_broken",
-            {
-                "from_route": from_route,
-                "attempted_to_route": to_route,
-                "from_assignee": row["assignee"],
-                "reason": safe_error,
-            },
-        )
-        return True
-    next_assignee, next_model = resolved
+    next_assignee, next_model = chain[idx + 1]
+    from_route = _route_label(current_role)
+    to_route = _route_label(next_assignee)
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+    if profile_exists is not None and not profile_exists(next_assignee):
+        return False
     if is_opus:
-        if next_role != "claude1":
+        if next_assignee != "claude1":
             return False
         next_model = row["model_override"]
     conn.execute(
@@ -11487,7 +11442,7 @@ def fallback_simple_route(
             "reason": safe_error,
         },
     )
-    if next_role == "coder":
+    if next_assignee == "coder":
         already_relayed = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'relayed_to_coder' LIMIT 1",
             (task_id,),
@@ -13381,22 +13336,23 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
-    # Bounded work: Spark -> Claude 2 -> Claude 1 -> Coder; all other work
-    # retains Claude 2 -> Claude 1 -> Coder routing.
-    # Enabled by default: it only ever engages for tasks with NO explicit
-    # assignee, and it only supersedes a ``kanban.default_assignee`` config
-    # that itself points at one of the four routes this chain already
-    # covers (unset, or spark/claude1/claude2/coder) -- an operator-chosen
-    # default pointing at some other lane (e.g. a control-plane terminal)
-    # is left completely untouched. Off switch: kanban.tiered_routing_enabled.
+    # Optional config-driven handoff routing for unassigned ready tasks. Empty
+    # or invalid config disables only the multi-profile chain: the native
+    # default_assignee path below remains available.
+    _configured_routes = _configured_handoff_routes()
     try:
         from hermes_cli.config import load_config as _load_kanban_cfg
         _tiered_cfg = (_load_kanban_cfg().get("kanban", {}) or {})
         _tiered_routing_enabled = bool(_tiered_cfg.get("tiered_routing_enabled", True))
     except Exception:
         _tiered_routing_enabled = True
-    _tiered_routing_applies = _tiered_routing_enabled and (
-        _default_assignee is None or _default_assignee in ("spark", "claude1", "claude2", "coder")
+    _configured_route_profiles = {
+        profile
+        for route in _configured_routes.values()
+        for profile, _model in route
+    }
+    _tiered_routing_applies = bool(_configured_routes) and _tiered_routing_enabled and (
+        _default_assignee is None or _default_assignee in _configured_route_profiles
     )
 
     # Route a whole ready wave as a wave, not as N unrelated first choices.
@@ -13463,6 +13419,9 @@ def _dispatch_once_locked(
                         if "routing_tier" in row.keys() else None
                     ),
                 )
+                if not _tier_assignee:
+                    result.skipped_unassigned.append(row["id"])
+                    continue
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
                 # 'assigned' event so the board state matches what just happened.

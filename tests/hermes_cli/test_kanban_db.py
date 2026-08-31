@@ -20,6 +20,84 @@ import hermes_state
 from hermes_cli import kanban_db as kb
 
 
+TEST_SPARK_MODEL_OVERRIDE = "gpt-5.3-codex-spark"
+TEST_HANDOFF_ROUTES = {
+    kb.ROUTING_TIER_SIMPLE: (
+        ("spark", TEST_SPARK_MODEL_OVERRIDE),
+        ("claude2", None),
+        ("claude1", None),
+        ("coder", None),
+    ),
+    kb.ROUTING_TIER_COMPLEX: (
+        ("claude2", None),
+        ("claude1", None),
+        ("coder", None),
+    ),
+}
+
+
+@pytest.fixture
+def configured_handoff_routes(monkeypatch):
+    monkeypatch.setattr(kb, "_configured_handoff_routes", lambda: TEST_HANDOFF_ROUTES)
+    return TEST_HANDOFF_ROUTES
+
+
+def test_handoff_routes_empty_config_disables_implicit_route(monkeypatch):
+    from hermes_cli import config
+
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"handoff_routes": {}}})
+
+    assert kb._configured_handoff_routes() == {}
+    assert kb.resolve_ordered_route("simple") == (None, None, [])
+    assert kb.resolve_parallel_routes("simple", 2) == ([], [])
+
+
+def test_handoff_routes_configured_chain_picks_exact_hop(monkeypatch):
+    from hermes_cli import config
+
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"handoff_routes": {
+        "simple": [
+            {"profile": "spark", "model_override": TEST_SPARK_MODEL_OVERRIDE},
+            {"profile": "claude2"},
+        ],
+    }}})
+
+    assert kb.resolve_ordered_route(
+        "simple", preflight_fn=lambda route: (route == "claude2", "ok"),
+    )[:2] == ("claude2", None)
+
+
+def test_handoff_routes_all_refused_returns_terminal_profile_without_exception(
+    configured_handoff_routes,
+):
+    assignee, model, trace = kb.resolve_ordered_route(
+        "complex", preflight_fn=lambda _route: (False, "provider_cooldown"),
+    )
+
+    assert (assignee, model) == ("coder", None)
+    assert [entry["route"] for entry in trace] == ["claude2", "claude1", "coder"]
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [{"profile": "claude2"}, {"profile": "claude2"}],
+        [{"profile": "claude2"}, {"profile": ""}],
+        [{"profile": "claude2"}, 123],
+    ],
+)
+def test_handoff_routes_duplicate_or_invalid_entry_fails_closed(monkeypatch, entries):
+    from hermes_cli import config
+
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"handoff_routes": {
+        "complex": entries,
+    }}})
+
+    assert kb._configured_handoff_routes() == {}
+    assert kb.resolve_ordered_route("complex") == (None, None, [])
+    assert kb.resolve_parallel_routes("complex", 1) == ([], [])
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -472,7 +550,7 @@ def test_protocol_violation_elapsed_uses_current_run_start(
 
 
 def test_rate_limit_exit_immediately_falls_back_with_same_worktree(
-    kanban_home, all_assignees_spawnable, monkeypatch,
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
 ):
     """A proven quota wall advances a routed card without human input."""
     import hermes_cli.kanban_db as _kb
@@ -854,7 +932,9 @@ def test_route_preflight_ok_spark_saturation_without_cooldown_blocks(kanban_home
     assert reason == "provider_limit"
 
 
-def test_resolve_ordered_route_skips_saturated_spark_for_claude2(kanban_home, monkeypatch):
+def test_resolve_ordered_route_skips_saturated_spark_for_claude2(
+    kanban_home, monkeypatch, configured_handoff_routes,
+):
     """End-to-end regression for t_dbf31ad3's "Spark saturé -> Claude 2"
     acceptance scenario: a simple-tier card must route past an explicitly
     excluded Spark lane straight to Claude 2, never claim Spark."""
@@ -878,24 +958,26 @@ def test_resolve_ordered_route_skips_saturated_spark_for_claude2(kanban_home, mo
     "tier, green_routes, expected_assignee, expected_model",
     [
         # A bounded card explicitly classified simple gets Spark first.
-        ("simple", {"spark"}, "spark", kb.SPARK_MODEL_OVERRIDE),
+        ("simple", {"spark"}, "spark", TEST_SPARK_MODEL_OVERRIDE),
         # Bounded cards preserve Claude-first fallback after Spark.
         ("simple", {"claude2"}, "claude2", None),
         ("simple", {"claude1"}, "claude1", None),
         # Coder is the last resort for bounded cards too.
-        ("simple", {"coder"}, "coder", kb.CODER_MODEL_OVERRIDE),
+        ("simple", {"coder"}, "coder", None),
         # Complex cards never route to Spark.
         ("complex", {"claude2"}, "claude2", None),
         # Claude 2 down, Claude 1 green -> Claude 1 for complex work.
         ("complex", {"claude1"}, "claude1", None),
         # Both Claude lanes down -> Coder for complex work.
-        ("complex", set(), "coder", kb.CODER_MODEL_OVERRIDE),
+        ("complex", set(), "coder", None),
         # Unknown/missing tier fails safe to the complex Coder route.
-        (None, set(), "coder", kb.CODER_MODEL_OVERRIDE),
-        ("bogus", set(), "coder", kb.CODER_MODEL_OVERRIDE),
+        (None, set(), "coder", None),
+        ("bogus", set(), "coder", None),
     ],
 )
-def test_resolve_ordered_route_table(tier, green_routes, expected_assignee, expected_model):
+def test_resolve_ordered_route_table(
+    tier, green_routes, expected_assignee, expected_model, configured_handoff_routes,
+):
     def fake_preflight(route):
         return (route in green_routes, "ok" if route in green_routes else "down")
 
@@ -907,7 +989,9 @@ def test_resolve_ordered_route_table(tier, green_routes, expected_assignee, expe
     assert all(entry["ok"] is False for entry in trace[:-1]) or len(trace) == 1
 
 
-def test_simple_route_never_probes_a_more_capable_lane_when_spark_is_green():
+def test_simple_route_never_probes_a_more_capable_lane_when_spark_is_green(
+    configured_handoff_routes,
+):
     probed = []
 
     def fake_preflight(route):
@@ -918,7 +1002,9 @@ def test_simple_route_never_probes_a_more_capable_lane_when_spark_is_green():
     assert probed == ["spark"]
 
 
-def test_parallel_complex_routes_preserve_coder_until_third_independent_task():
+def test_parallel_complex_routes_preserve_coder_until_third_independent_task(
+    configured_handoff_routes,
+):
     green = lambda route: (True, "green")
     routes, _ = kb.resolve_parallel_routes("complex", 1, preflight_fn=green)
     assert routes == [("claude2", None)]
@@ -928,7 +1014,9 @@ def test_parallel_complex_routes_preserve_coder_until_third_independent_task():
     assert routes == [("claude2", None), ("claude1", None), ("coder", None)]
 
 
-def test_parallel_complex_routes_use_coder_when_a_claude_is_unavailable():
+def test_parallel_complex_routes_use_coder_when_a_claude_is_unavailable(
+    configured_handoff_routes,
+):
     def preflight(route):
         return (route != "claude2", "green" if route != "claude2" else "quota")
 
@@ -936,7 +1024,9 @@ def test_parallel_complex_routes_use_coder_when_a_claude_is_unavailable():
     assert routes == [("claude1", None), ("coder", None)]
 
 
-def test_unknown_claude_measurement_preserves_claude_instead_of_opening_coder():
+def test_unknown_claude_measurement_preserves_claude_instead_of_opening_coder(
+    configured_handoff_routes,
+):
     def preflight(route):
         if route == "claude2":
             return False, "provider_cooldown"
@@ -1367,7 +1457,9 @@ def test_local_claude2_failure_does_not_fallback_to_another_executor(kanban_home
     assert row["assignee"] == "claude2"
 
 
-def test_dispatch_once_applies_routing_tier_chain_to_unassigned_ready_task(kanban_home, all_assignees_spawnable, monkeypatch):
+def test_dispatch_once_applies_routing_tier_chain_to_unassigned_ready_task(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
+):
     """End-to-end: an unassigned task with a persisted tier is auto-routed
     by the dispatcher itself (decision (b): preflight runs before spawn),
     not just by calling resolve_ordered_route in isolation."""
@@ -1393,7 +1485,7 @@ def test_dispatch_once_applies_routing_tier_chain_to_unassigned_ready_task(kanba
         assert task_id in [row[0] for row in result.spawned]
         row = conn.execute("SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,)).fetchone()
         assert row["assignee"] == "spark"
-        assert row["model_override"] == kb.SPARK_MODEL_OVERRIDE
+        assert row["model_override"] == TEST_SPARK_MODEL_OVERRIDE
         events = conn.execute(
             "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind = 'assigned'",
             (task_id,),
@@ -1402,8 +1494,49 @@ def test_dispatch_once_applies_routing_tier_chain_to_unassigned_ready_task(kanba
         assert any(p.get("source") == "routing_tier_chain" for p in payloads)
 
 
-def test_fifteen_direct_tasks_finish_in_capacity_waves(
+def test_dispatch_empty_handoff_config_preserves_default_assignee_path(
     kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_configured_handoff_routes", lambda: {})
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="auto-routed", routing_tier="simple")
+        result = kb.dispatch_once(conn, dry_run=False, default_assignee="coder")
+
+        assert task_id in [row[0] for row in result.spawned]
+        assert result.skipped_unassigned == []
+        row = conn.execute(
+            "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["assignee"] == "coder"
+        assert row["model_override"] is None
+        events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'assigned'",
+            (task_id,),
+        ).fetchall()
+        payloads = [json.loads(e["payload"]) for e in events]
+        assert any(p.get("source") == "kanban.default_assignee" for p in payloads)
+
+
+def test_dispatch_handoff_routes_accept_configured_profile_names(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_configured_handoff_routes", lambda: {
+        kb.ROUTING_TIER_COMPLEX: (("writer_a", None), ("writer_b", None)),
+    })
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="auto-routed", routing_tier="complex")
+        result = kb.dispatch_once(conn, dry_run=False, default_assignee="writer_a")
+
+        assert task_id in [row[0] for row in result.spawned]
+        row = conn.execute(
+            "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["assignee"] == "writer_b"
+        assert row["model_override"] is None
+
+
+def test_fifteen_direct_tasks_finish_in_capacity_waves(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
 ):
     """Permanent load canary: direct creates use all three complex lanes."""
     routing = kanban_home / "state" / "ai-quota-routing.json"
@@ -1652,10 +1785,10 @@ def test_scheduled_time_pause_resumes_the_exact_checkpointed_session(kanban_home
     ) == "worker-session-scheduled"
 
 
-def test_failed_simple_routes_advance_spark_then_claude_then_coder(kanban_home, all_assignees_spawnable):
-    """Bounded ('simple') cards still get Spark first, then Claude 2, then
-    Claude 1, resolved to the real current profile name (t_47dc2bf0 defect
-    #1: the chain used to hardcode the removed 'codex-worker' name)."""
+def test_failed_simple_routes_advance_spark_then_claude_then_coder(
+    kanban_home, all_assignees_spawnable, configured_handoff_routes,
+):
+    """Bounded ('simple') cards follow the configured handoff chain."""
     with kb.connect() as conn:
         spark_id = kb.create_task(
             conn, title="bounded", assignee="spark",
@@ -1696,12 +1829,10 @@ def test_failed_simple_routes_advance_spark_then_claude_then_coder(kanban_home, 
         assert payload["to_route"] == "Claude 2"
 
 
-def test_fallback_route_resolves_current_profile_name_not_legacy_hardcode(
-    kanban_home, monkeypatch
+def test_fallback_route_uses_configured_profile_chain(
+    kanban_home, monkeypatch, configured_handoff_routes,
 ):
-    """Only 'spark' exists on disk (post-2026-08-22 rename); the chain must
-    resolve to it dynamically instead of the removed 'codex-worker' literal
-    (t_47dc2bf0 defect #1)."""
+    """The fallback follows explicit configured profile identities only."""
     from hermes_cli import profiles
 
     monkeypatch.setattr(profiles, "profile_exists", lambda name: name in ("spark", "claude2", "claude1", "default"))
@@ -1714,7 +1845,9 @@ def test_fallback_route_resolves_current_profile_name_not_legacy_hardcode(
         assert row["assignee"] == "claude2"
 
 
-def test_fallback_route_applies_to_complex_and_null_tier_cards(kanban_home, all_assignees_spawnable):
+def test_fallback_route_applies_to_complex_and_null_tier_cards(
+    kanban_home, all_assignees_spawnable, configured_handoff_routes,
+):
     """t_47dc2bf0 defect #2: every open card has routing_tier NULL/complex,
     so the fallback must engage for them too -- Claude 2 -> Claude 1 -> GPT
     (Terra/default), never through Spark."""
@@ -1741,7 +1874,9 @@ def test_fallback_route_applies_to_complex_and_null_tier_cards(kanban_home, all_
         assert anomalous_row["assignee"] == "spark"  # untouched
 
 
-def test_fallback_route_claude2_dead_moves_to_claude1(kanban_home, all_assignees_spawnable):
+def test_fallback_route_claude2_dead_moves_to_claude1(
+    kanban_home, all_assignees_spawnable, configured_handoff_routes,
+):
     """Non-regression (a): quota dead on Claude 2 -> the card moves to Claude 1."""
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="work", assignee="claude2")
@@ -1751,7 +1886,7 @@ def test_fallback_route_claude2_dead_moves_to_claude1(kanban_home, all_assignees
 
 
 def test_opus_fallback_preserves_model_then_stops_before_coder(
-    kanban_home, all_assignees_spawnable,
+    kanban_home, all_assignees_spawnable, configured_handoff_routes,
 ):
     with kb.connect() as conn:
         task_id = kb.create_task(
@@ -1767,7 +1902,7 @@ def test_opus_fallback_preserves_model_then_stops_before_coder(
 
 
 def test_fallback_route_both_claude_lanes_dead_moves_to_coder_with_one_event(
-    kanban_home, all_assignees_spawnable
+    kanban_home, all_assignees_spawnable, configured_handoff_routes,
 ):
     """Non-regression (b): quota dead on both Claude lanes -> Coder,
     and exactly one route event is recorded for that specific hop."""
@@ -1788,7 +1923,7 @@ def test_fallback_route_both_claude_lanes_dead_moves_to_coder_with_one_event(
 
 
 def test_claude_provider_reset_capture_and_final_coder_relay_are_api_evidence_only(
-    kanban_home, all_assignees_spawnable,
+    kanban_home, all_assignees_spawnable, configured_handoff_routes,
 ):
     """Claude 2 -> Claude 1 -> Coder retains only structured API evidence.
 
@@ -1887,10 +2022,10 @@ def test_claude_provider_reset_rejects_clock_without_valid_timezone(kanban_home)
     assert captured["reset_at"] is None
 
 
-def test_fallback_route_blocks_explicitly_when_no_profile_resolves(kanban_home, monkeypatch):
-    """Non-regression (c): every candidate profile for the next hop is gone
-    -> the card is blocked explicitly, never left silently in 'ready' with
-    an unspawnable assignee (the 2026-08-22 orphan-card symptom)."""
+def test_fallback_route_fails_closed_when_next_profile_is_missing(
+    kanban_home, monkeypatch, configured_handoff_routes,
+):
+    """Missing configured next profile leaves the task on its current lane."""
     from hermes_cli import profiles
 
     monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "claude2")
@@ -1899,21 +2034,19 @@ def test_fallback_route_blocks_explicitly_when_no_profile_resolves(kanban_home, 
         # Simulate the task having already been requeued to 'ready' by the
         # crash handler (fallback_simple_route runs after that requeue).
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
-        assert kb.fallback_simple_route(conn, task_id, "claude2 quota exhausted") is True
+        assert kb.fallback_simple_route(conn, task_id, "claude2 quota exhausted") is False
         row = conn.execute(
             "SELECT status, block_kind, assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
-        assert row["status"] == "blocked"
-        assert row["block_kind"] == "capability"
+        assert row["status"] == "ready"
+        assert row["block_kind"] is None
         # The assignee is left untouched -- never pointed at a dead profile.
         assert row["assignee"] == "claude2"
         event = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'route_fallback_broken'",
             (task_id,),
         ).fetchone()
-        assert event is not None
-        payload = json.loads(event["payload"])
-        assert payload["attempted_to_route"] == "Claude 1"
+        assert event is None
 
 
 

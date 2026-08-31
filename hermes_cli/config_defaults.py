@@ -2881,6 +2881,19 @@ DEFAULT_CONFIG = {
         "max_in_progress_per_profile": None,
         # Optional deterministic pool assignment for independent fan-out waves.
         "generalist_worker_pool_routing": False,
+        # Explicit Kanban worker handoff routes, by routing tier.  Empty by
+        # default: portable installs must opt in with real profile identities
+        # instead of inheriting a hardcoded local chain.  Shape:
+        #   handoff_routes:
+        #     simple:
+        #       - profile: spark
+        #         model_override: gpt-5.3-codex-spark
+        #       - profile: claude2
+        #     complex:
+        #       - profile: claude2
+        #       - profile: claude1
+        #       - profile: coder
+        "handoff_routes": {},
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
