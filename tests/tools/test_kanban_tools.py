@@ -162,14 +162,15 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "worker_context" in full
 
 
-def test_completion_ready_lists_missing_evidence_before_terminal_write(worker_env):
+def test_completion_ready_respects_optional_plugin_validation_before_terminal_write(worker_env):
     from tools import kanban_tools as kt
 
     missing = json.loads(kt._handle_completion_ready({
         "summary": "implemented",
     }))
-    assert missing["ready"] is False
-    assert any("structured evidence" in item for item in missing["missing"])
+    assert missing["ready"] is True
+    assert missing["missing"] == []
+    assert missing["evidence"] is None
 
     ready = json.loads(kt._handle_completion_ready({
         "summary": "implemented",

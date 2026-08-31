@@ -164,7 +164,10 @@ def test_accepted_review_cannot_be_returned_for_a_foreign_workspace_guard(conn):
     )
 
     assert not ok
-    assert "internal workspace/completion-guard incident" in str(diagnostic)
+    diagnostic_text = str(diagnostic)
+    assert "review verdict already accepted" in diagnostic_text
+    assert "kanban_complete" in diagnostic_text
+    assert "returning it to the implementer as rework" in diagnostic_text
     unchanged = kb.get_task(conn, task_id)
     assert unchanged is not None
     assert unchanged.status == "running"

@@ -17,6 +17,8 @@ from tools.process_registry import (
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
+    _MIN_WORKER_MEMORY_MAX_BYTES,
+    _worker_memory_max_bytes,
 )
 
 
@@ -68,6 +70,51 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, "-c", f"import time; time.sleep({seconds})"],
     )
+
+
+def test_worker_memory_max_accepts_configured_tightening_bound(monkeypatch):
+    """Kanban can pass its memory knob without duplicating MemoryMax logic."""
+    monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+
+    assert _worker_memory_max_bytes(configured_max_mb="128") == 128 * 1024 * 1024
+
+
+def test_worker_memory_max_allows_domain_cap_without_changing_default(monkeypatch):
+    """Kanban's 6-GiB policy reuses the registry math without inheriting 4 GiB."""
+    monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+    monkeypatch.setattr(
+        "tools.process_registry._current_cgroup_memory_max_bytes", lambda: None
+    )
+    monkeypatch.setattr(os, "sysconf", lambda name: 3932160 if name == "SC_PHYS_PAGES" else 4096)
+
+    assert _worker_memory_max_bytes(configured_max_mb="6144") == 4 * 1024 * 1024 * 1024
+    assert _worker_memory_max_bytes(
+        configured_max_mb="6144",
+        cap_bytes=8 * 1024 * 1024 * 1024,
+    ) == 6144 * 1024 * 1024
+
+
+def test_worker_memory_max_keeps_tighter_cgroup_bound(monkeypatch):
+    monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+    monkeypatch.setattr(
+        "tools.process_registry._current_cgroup_memory_max_bytes",
+        lambda: 768 * 1024 * 1024,
+    )
+    monkeypatch.setattr(os, "sysconf", lambda name: 3932160 if name == "SC_PHYS_PAGES" else 4096)
+
+    assert _worker_memory_max_bytes(
+        configured_max_mb="6144",
+        cap_bytes=8 * 1024 * 1024 * 1024,
+    ) == 768 * 1024 * 1024
+
+
+def test_worker_memory_max_ignores_invalid_configured_bound(monkeypatch):
+    monkeypatch.delenv("TERMINAL_LOCAL_MEMORY_MAX_MB", raising=False)
+    monkeypatch.setattr(
+        "tools.process_registry._current_cgroup_memory_max_bytes", lambda: None
+    )
+
+    assert _worker_memory_max_bytes(configured_max_mb="not-an-int") >= 64 * 1024 * 1024
 
 
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):

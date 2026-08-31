@@ -2940,28 +2940,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
         )
         agent._buffer_status(notice)
-        # The buffered line above is dropped on successful recovery, but a
-        # provider/model switch is a durable state change operators must see
-        # even when the fallback succeeds.  Record a one-shot notice that the
-        # success path surfaces exactly once via _emit_pending_fallback_notice
-        # (see run_agent.py); it is discarded on terminal failure since the
-        # buffered line is flushed instead.  See fallback-observability fix.
-        trace = getattr(agent, "_fallback_trace", None)
-        if not isinstance(trace, list):
-            trace = []
-            agent._fallback_trace = trace
-        trace.append({
-            "from_model": old_model,
-            "from_provider": old_provider,
-            "to_model": fb_model,
-            "to_provider": fb_provider,
-            # Keep the post-switch identity explicit for consumers that must
-            # never present a GPT-backed answer as a Claude answer.
-            "resolved_model": agent.model,
-            "resolved_provider": agent.provider,
-            "reason": getattr(reason, "value", None),
-        })
-
         transition_notice = str(fb.get("transition_notice") or "").strip()
         if transition_notice:
             # An explicit transition is operationally significant (for example
