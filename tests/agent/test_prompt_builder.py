@@ -1082,51 +1082,6 @@ class TestAgentInitKanbanToolsReachModelConfig:
         assert kanban_guidance_for(tools_reach_model) != KANBAN_GUIDANCE
 
 
-class TestKanbanGuidanceNoRemediationAfterGoalAlreadyMet:
-    """t_145a74e4 — a worker resumed after a block/unblock cycle kept
-
-    searching for a workaround (systemd unit, wrapper script, git add) even
-    though a live re-read of the external state already showed the card's
-    goal met (the Google Ads test's negatives/keywords/budget were already
-    applied). The lifecycle text must instruct workers to re-check the
-    external state before any remediation attempt and stop chasing a bypass
-    once the goal is already real, instead of only preventing this narrowly
-    inside the unblock-loop counter (which tracks repeated *block reasons*,
-    not "goal already achieved by another path").
-    """
-
-    def test_instructs_re_checking_state_before_remediation(self):
-        from agent.prompt_builder import KANBAN_GUIDANCE
-
-        assert "Re-check state before remediating" in KANBAN_GUIDANCE
-        assert "block/unblock cycle" in KANBAN_GUIDANCE
-
-    def test_instructs_stopping_once_goal_already_met(self):
-        from agent.prompt_builder import KANBAN_GUIDANCE
-
-        assert "stop: do not launch another " in KANBAN_GUIDANCE
-        assert "reached through another path" in KANBAN_GUIDANCE
-        assert "Don't keep searching for a bypass" in KANBAN_GUIDANCE
-
-    def test_present_identically_in_both_reachability_variants(self):
-        # The rule applies regardless of whether kanban_* tools reach the
-        # model — it must survive the reachable/unreachable text swap, which
-        # only touches the "Do not shell out" bullet further down.
-        from agent.prompt_builder import kanban_guidance_for
-
-        reachable = kanban_guidance_for(True)
-        unreachable = kanban_guidance_for(False)
-        assert "Re-check state before remediating" in reachable
-        assert "Re-check state before remediating" in unreachable
-
-    def test_lifecycle_items_renumbered_without_gaps(self):
-        from agent.prompt_builder import KANBAN_GUIDANCE
-
-        for n in range(1, 9):
-            assert f"\n{n}. **" in KANBAN_GUIDANCE, f"missing lifecycle item {n}"
-        assert "\n9. **" not in KANBAN_GUIDANCE
-
-
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================

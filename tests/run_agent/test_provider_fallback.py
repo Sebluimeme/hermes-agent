@@ -129,6 +129,7 @@ class TestFallbackChainAdvancement:
             "(rate limit); using glm-5.2 via zai."
         )
         assert agent._pending_fallback_notice == [expected]
+        assert not hasattr(agent, "_fallback_trace")
         assert agent._retry_status_buffer[-1] == ("status", expected)
 
     def test_records_sequential_switches_in_order(self):
@@ -157,6 +158,7 @@ class TestFallbackChainAdvancement:
             "⚠️ Model fallback: glm-5.2 via zai unavailable "
             "(provider overloaded); using deepseek-v4-flash via deepseek.",
         ]
+        assert not hasattr(agent, "_fallback_trace")
     def test_skips_unconfigured_provider_to_next(self):
         """If resolve_provider_client returns None, skip to next in chain."""
         fbs = [
