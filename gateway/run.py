@@ -442,6 +442,24 @@ async def run_codex_hygiene_compaction(
     # route already persisted its own failure cooldown in that case.
     return "failed:no-boundary"
 
+def hygiene_wait_should_extend(
+    *,
+    idle: float,
+    timeout: float,
+    waited: float,
+    ceiling: float,
+    fence_cancelled: bool = False,
+) -> bool:
+    """Whether the hygiene host should keep waiting for a slow summary.
+
+    A cancelled commit fence cannot produce a commit (#96953): extending the
+    wait up to the 600s ceiling only queues inbound messages behind a doomed
+    attempt. Stop extending immediately so the turn can continue.
+    """
+    if fence_cancelled:
+        return False
+    return idle < timeout and waited < ceiling
+
 
 def _record_hygiene_cooldown(
     gateway,
@@ -1284,6 +1302,19 @@ _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 # Override via ``config.yaml`` ``agent.gateway_startup_restore_drain_timeout``.
 _STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT = 30.0
 
+# Default bound for the boot-time turn-machinery warm-up (#99373).  On a
+# fresh boot with no resume_pending sessions ``_finish_startup_restore``
+# used to open the inbound gate almost immediately, while the agent-side
+# turn machinery (the run_agent/model_tools import graph, the tool-registry
+# check_fn probes, the prompt builder) was still completely cold.  A message
+# arriving in that window was served with a skeleton system prompt: no
+# context tier, no tool schemas (~1.7K tokens instead of ~14.6K).  The
+# warm-up runs BEFORE the gate opens so the first inbound turn starts with
+# initialized machinery; the bound keeps a wedged init from making the
+# gateway permanently unavailable.  Override via ``config.yaml``
+# ``agent.gateway_startup_warmup_timeout`` (non-positive disables warm-up).
+_STARTUP_WARMUP_TIMEOUT_SECS_DEFAULT = 20.0
+
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
     """Best-effort conversion of stored gateway timestamps to epoch seconds.
@@ -1368,6 +1399,60 @@ def _startup_restore_drain_timeout_secs() -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(_STARTUP_RESTORE_DRAIN_TIMEOUT_SECS_DEFAULT)
+
+
+def _startup_warmup_timeout_secs() -> float:
+    """Max seconds the boot warm-up may hold the inbound gate shut (#99373).
+
+    ``GatewayRunner._warm_turn_prerequisites`` initializes the agent-side
+    turn machinery BEFORE ``_finish_startup_restore`` opens the inbound
+    gate, so a message arriving seconds after boot can no longer be served
+    with a skeleton system prompt (no context tier, no tool schemas).  The
+    warm-up is bounded so a wedged import or probe can never make the
+    gateway permanently unavailable — on timeout the gate opens anyway and
+    the warm-up finishes in the background.
+
+    Reads ``HERMES_STARTUP_WARMUP_TIMEOUT`` (bridged from ``config.yaml``
+    ``agent.gateway_startup_warmup_timeout`` at gateway startup, same
+    pattern as the other ``agent.*`` knobs).  Non-positive disables the
+    warm-up entirely (restores the historical lazy-init behaviour).
+    """
+    raw = os.environ.get("HERMES_STARTUP_WARMUP_TIMEOUT")
+    if raw is None or raw == "":
+        return float(_STARTUP_WARMUP_TIMEOUT_SECS_DEFAULT)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(_STARTUP_WARMUP_TIMEOUT_SECS_DEFAULT)
+
+
+def _warm_turn_machinery_sync() -> int:
+    """Synchronously initialize the turn prerequisites a first turn needs.
+
+    Runs on an executor thread from ``_warm_turn_prerequisites``.  Covers
+    exactly the lazy init observed inside skeleton turns (#99373):
+
+    * the ``run_agent`` heavy import graph (the gateway imports it lazily
+      inside per-request handlers, so nothing else pulls it in at boot);
+    * ``model_tools.get_tool_definitions`` — materializes tool schemas and
+      primes the tool-registry ``check_fn`` TTL cache so availability
+      probes don't run (and fail cold) inside the user's first turn;
+    * the context-file tier (AGENTS.md / SOUL.md discovery + read).
+
+    Returns the number of tool schemas materialized (logged for
+    diagnosability).
+    """
+    import run_agent  # noqa: F401  # heavy import graph, cached in sys.modules
+    import model_tools
+
+    tool_defs = model_tools.get_tool_definitions(quiet_mode=True)
+    try:
+        from agent.prompt_builder import build_context_files_prompt
+
+        build_context_files_prompt()
+    except Exception:
+        logger.debug("context-file warm-up failed (non-fatal)", exc_info=True)
+    return len(tool_defs)
 
 
 def _as_thread_info(info: Any) -> Optional[Tuple[str, str]]:
@@ -2741,6 +2826,10 @@ if _config_path.exists():
             if "gateway_startup_restore_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT"] = str(
                     _agent_cfg["gateway_startup_restore_drain_timeout"]
+                )
+            if "gateway_startup_warmup_timeout" in _agent_cfg:
+                os.environ["HERMES_STARTUP_WARMUP_TIMEOUT"] = str(
+                    _agent_cfg["gateway_startup_warmup_timeout"]
                 )
         # config-authoritative knobs for the session-search index; same
         # bridge semantics as the agent settings above.
@@ -7214,6 +7303,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
+    _startup_warmup_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Legacy per-session dict adapters.  All per-session state lives in
@@ -10570,7 +10660,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             holder = await asyncio.to_thread(
                 raw_db.get_compression_lock_holder, str(session_id)
             )
-            return bool(holder)
+            # Production returns Optional[str]. Reject non-strings so a
+            # MagicMock auto-attr (or any unexpected truthy) cannot look
+            # like a held lock and skip hygiene (#96953).
+            return isinstance(holder, str) and bool(holder)
         except (AttributeError, TypeError):
             return False
         except Exception:
@@ -12383,6 +12476,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             drained += 1
         return drained
 
+    def _start_startup_warmup(self) -> None:
+        """Kick off the boot turn-machinery warm-up in the background (#99373).
+
+        Called from ``start()`` right after the startup-restore gate closes,
+        so the warm-up overlaps the (slow, network-bound) platform connects
+        instead of adding boot latency.  ``_finish_startup_restore`` awaits
+        it (bounded) before opening the inbound gate.
+        """
+        timeout = _startup_warmup_timeout_secs()
+        if timeout <= 0:
+            self._startup_warmup_task = None
+            return
+        self._startup_warmup_task = asyncio.ensure_future(
+            self._warm_turn_prerequisites()
+        )
+
+    async def _warm_turn_prerequisites(self) -> None:
+        """Initialize turn machinery off-loop before the gate opens (#99373).
+
+        Runs ``_warm_turn_machinery_sync`` (run_agent import graph, tool
+        schemas + check_fn probe cache, context-file tier) on an executor
+        thread so the event loop — platform heartbeats, connects — stays
+        responsive.  Never raises: a failed warm-up degrades to the
+        historical lazy init, it must not block startup.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            t0 = time.monotonic()
+            tool_count = await loop.run_in_executor(None, _warm_turn_machinery_sync)
+            logger.info(
+                "Turn machinery warmed in %.1fs (%d tool schema(s) materialized)",
+                time.monotonic() - t0,
+                tool_count,
+            )
+        except Exception:
+            logger.warning(
+                "Turn-machinery warm-up failed; first inbound turn will "
+                "initialize lazily",
+                exc_info=True,
+            )
+
+    async def _await_startup_warmup(self) -> None:
+        """Bounded wait for the boot warm-up before the inbound gate opens.
+
+        On timeout the gate opens anyway (availability outranks prompt
+        completeness for a WEDGED init — same principle as the bounded
+        restore-drain wait above) and the warm-up continues in the
+        background; a late failure is still logged.
+        """
+        task = getattr(self, "_startup_warmup_task", None)
+        if task is None or task.done():
+            return
+        timeout = _startup_warmup_timeout_secs()
+        if timeout <= 0:
+            return
+        done, pending = await asyncio.wait({task}, timeout=timeout)
+        if pending:
+            logger.warning(
+                "Turn-machinery warm-up still running after %.0fs; opening "
+                "inbound gate anyway — the first turn may see lazily "
+                "initialized machinery (#99373). Warm-up continues in the "
+                "background.",
+                timeout,
+            )
+            task.add_done_callback(
+                lambda t: GatewayRunner._log_late_background_failure(
+                    t,
+                    "boot turn-machinery warm-up failed after gate release",
+                    level=logging.DEBUG,
+                )
+            )
+
     async def _finish_startup_restore(self) -> None:
         """Wait (BOUNDED) for startup auto-resume, then release + drain inbound.
 
@@ -12436,6 +12601,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
         self._startup_restore_tasks = []
+        # Warm the turn machinery BEFORE the queue drains: replayed (and
+        # fresh) inbound turns must not build skeleton prompts (#99373).
+        await self._await_startup_warmup()
         drained = await self._drain_startup_restore_queue()
         self._startup_restore_in_progress = False
         if drained:
@@ -13556,6 +13724,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._startup_restore_in_progress = True
         self._startup_restore_queue = []
         self._startup_restore_tasks = []
+        # Fresh-boot readiness (#99373): with no resume_pending sessions the
+        # gate above opens almost immediately, while the agent-side turn
+        # machinery (run_agent import graph, tool schemas, check_fn probes,
+        # context tier) is still cold — a message in that window was served
+        # with a skeleton system prompt.  Start warming NOW so the work
+        # overlaps the network-bound platform connects below;
+        # _finish_startup_restore awaits it (bounded) before opening the gate.
+        self._start_startup_warmup()
 
         connected_count = 0
         enabled_platform_count = 0
@@ -18321,6 +18497,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._release_running_agent_state(_quick_key)
 
+        # #99106: durable-reaped guard.  A session whose routing row was
+        # ended in state.db (e.g. ``ws_orphan_reap`` / ``agent_close``) while
+        # the gateway stayed alive keeps its in-memory turn slot alive
+        # (``_is_session_running`` stays True).  The priority fast-path would
+        # then queue every next user message into the dead runtime instead of
+        # healing the routing via ``get_or_create_session`` → ``reopen``.
+        # This is the live-gateway variant of #54878 and the #632 detached/
+        # 405 suppressions in production.  Evict the stale slot so the next
+        # message falls through to the cold path and re-attaches or creates a
+        # fresh session; /status then correctly shows 代理运行中: 否 before the
+        # heal and a live turn after.
+        if self._is_session_running(_quick_key):
+            try:
+                _reap_store = getattr(self, "session_store", None)
+                # Use the public, lock-held accessors: peek_session_id resolves
+                # key -> session_id under the store lock, and returns a
+                # non-str on stubbed stores in bare test runners — both the
+                # isinstance() gate and the ``is True`` gate below keep this
+                # guard inert unless a real SessionStore answers.
+                _reap_peek = getattr(_reap_store, "peek_session_id", None)
+                _is_ended = getattr(_reap_store, "_is_session_ended_in_db", None)
+                _reap_sid = _reap_peek(_quick_key) if callable(_reap_peek) else None
+                if (
+                    isinstance(_reap_sid, str)
+                    and _reap_sid
+                    and callable(_is_ended)
+                    and _is_ended(_reap_sid) is True
+                ):
+                    logger.warning(
+                        "Evicting stale _running_agents entry for %s — "
+                        "durable session %s is ended (reaped) in state.db; "
+                        "healing routing on next message (#99106)",
+                        _quick_key,
+                        _reap_sid,
+                    )
+                    self._invalidate_session_run_generation(
+                        _quick_key,
+                        reason="reaped_session_eviction",
+                    )
+                    self._release_running_agent_state(_quick_key)
+            except Exception:
+                logger.debug("reaped-session staleness check failed", exc_info=True)
+
         if self._is_session_running(_quick_key):
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
@@ -20729,6 +20948,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                                 _needs_compress = False
 
+                if _needs_compress and await self._session_has_compression_in_flight(
+                    session_key
+                ):
+                    # A prior hygiene/agent compression still holds the
+                    # durable lock (typically a shielded worker left behind
+                    # by /stop or /restart). Starting another attempt waits
+                    # up to the 600s ceiling behind a commit that the fence
+                    # will refuse, while inbound messages demote to queue
+                    # (#96953).
+                    logger.info(
+                        "Session hygiene: skipping compression for %s; "
+                        "another compression is already in flight",
+                        session_entry.session_id,
+                    )
+                    _needs_compress = False
+
                 if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
@@ -20914,6 +21149,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # the turn forever.
                                         _hyg_wait_started = time.monotonic()
                                         while True:
+                                            if _hyg_commit_fence.is_cancelled:
+                                                raise asyncio.TimeoutError
                                             # #76354 S3: charge the idle budget
                                             # from the LAST PROGRESS event, not
                                             # from the start of this wait slice —
@@ -20959,6 +21196,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _slice,
                                                     max(_turn_hold_remaining, 0.005),
                                                 )
+                                            # Re-check the fence on a short poll so a
+                                            # /stop or /restart cancel is not stuck
+                                            # behind a full idle window (#96953).
+                                            _idle_left = max(
+                                                _hyg_timeout_seconds
+                                                - _hyg_commit_fence.seconds_since_progress(),
+                                                0.005,
+                                            )
+                                            _slice = min(_slice, 0.25)
                                             try:
                                                 _compressed, _ = await asyncio.wait_for(
                                                     asyncio.shield(_hyg_future),
@@ -20966,6 +21212,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 )
                                                 break
                                             except asyncio.TimeoutError:
+                                                if _hyg_commit_fence.is_cancelled:
+                                                    raise
                                                 _hyg_waited = time.monotonic() - _hyg_wait_started
                                                 _idle = _hyg_commit_fence.seconds_since_progress()
                                                 # Bounded turn-hold (#TKT-0029):
@@ -21000,19 +21248,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         f"turn-hold budget {_hyg_max_turn_hold_seconds:.1f}s "
                                                         f"elapsed after {_hyg_waited:.1f}s"
                                                     )
-                                                if (
-                                                    _idle < _hyg_timeout_seconds
-                                                    and _hyg_waited < _hyg_total_ceiling_seconds
+                                                if hygiene_wait_should_extend(
+                                                        idle=_idle,
+                                                        timeout=_hyg_timeout_seconds,
+                                                        waited=_hyg_waited,
+                                                        ceiling=_hyg_total_ceiling_seconds,
+                                                        fence_cancelled=_hyg_commit_fence.is_cancelled,
                                                 ):
-                                                    logger.info(
-                                                        "Session hygiene compression for "
-                                                        "session %s still streaming after "
-                                                        "%.0fs (last progress %.1fs ago) — "
-                                                        "extending wait (ceiling %.0fs)",
-                                                        session_entry.session_id,
-                                                        _hyg_waited, _idle,
-                                                        _hyg_total_ceiling_seconds,
-                                                    )
+                                                    if _slice >= _idle_left - 1e-9:
+                                                        logger.info(
+                                                            "Session hygiene compression for "
+                                                            "session %s still streaming after "
+                                                            "%.0fs (last progress %.1fs ago) — "
+                                                            "extending wait (ceiling %.0fs)",
+                                                            session_entry.session_id,
+                                                            _hyg_waited, _idle,
+                                                            _hyg_total_ceiling_seconds,
+                                                        )
                                                     continue
                                                 raise
                                     except HygieneTurnHoldExceeded:
@@ -21120,6 +21372,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # established release behavior for a
                                             # provider call that may never return.
                                             _hyg_commit_fence.retain_compression_lock_until_worker_done()
+                                        # Capture fence state BEFORE try_cancel
+                                        # — that call itself sets is_cancelled,
+                                        # which would mis-label a genuine idle
+                                        # timeout as a fence cancel (#96953).
+                                        _hyg_fence_cancelled = (
+                                            _hyg_commit_fence.is_cancelled
+                                        )
                                         _cancelled = None
                                         while _cancelled is None:
                                             # #76354 F1: a hung commit retains the
@@ -21159,6 +21418,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 context="session hygiene timeout",
                                             )
                                             _hyg_cleanup_deferred = True
+                                            _hyg_timeout_error = (
+                                                "session hygiene compression "
+                                                "cancelled at commit fence"
+                                                if _hyg_fence_cancelled
+                                                else (
+                                                    "session hygiene compression "
+                                                    "timed out with no output from "
+                                                    "the summary model"
+                                                )
+                                            )
                                             if _hyg_failure_cooldown_seconds >= 0:
                                                 _hyg_cooldown = await asyncio.to_thread(
                                                     _hygiene_cooldown_for_failure,
@@ -21167,12 +21436,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _hyg_failure_cooldown_seconds,
                                                 )
                                                 _timeout_reason = (
-                                                    "session hygiene compression total "
-                                                    "ceiling exhausted"
-                                                    if _hyg_total_exhausted
-                                                    else "session hygiene compression "
-                                                    "timed out with no output from the "
-                                                    "summary model"
+                                                    _hyg_timeout_error
+                                                    if _hyg_fence_cancelled
+                                                    else (
+                                                        "session hygiene compression total "
+                                                        "ceiling exhausted"
+                                                        if _hyg_total_exhausted
+                                                        else "session hygiene compression "
+                                                        "timed out with no output from the "
+                                                        "summary model"
+                                                    )
                                                 )
                                                 _record_hygiene_cooldown(
                                                     self, session_entry.session_id,
@@ -21184,59 +21457,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _stamp_hygiene_compression_provenance(
                                                 _hyg_agent,
-                                                "session hygiene compression timed out",
+                                                (
+                                                    "session hygiene compression "
+                                                    "cancelled at commit fence"
+                                                    if _hyg_fence_cancelled
+                                                    else "session hygiene compression timed out"
+                                                ),
                                                 ActivityProvenance.AGENT_COMPRESSION_TIMEOUT,
                                                 "hygiene compression timeout "
                                                 "activity stamp failed",
                                             )
-                                            _hyg_elapsed = (
-                                                time.monotonic() - _hyg_wait_started
-                                            )
-                                            if _hyg_total_exhausted:
+                                            if _hyg_fence_cancelled:
                                                 logger.warning(
-                                                    "Session hygiene compression for session %s "
-                                                    "reached its total ceiling after %.1fs "
-                                                    "(progress observed=%s); continuing without "
+                                                    "Session hygiene compression for "
+                                                    "session %s was cancelled at the "
+                                                    "commit fence; continuing without "
                                                     "compression",
                                                     session_entry.session_id,
-                                                    _hyg_elapsed,
-                                                    _hyg_commit_fence.progress_observed,
                                                 )
                                             else:
-                                                logger.warning(
-                                                    "Session hygiene compression for session %s "
-                                                    "made no progress for %.1fs (total wait "
-                                                    "%.1fs, ceiling %.1fs); continuing without "
-                                                    "compression",
-                                                    session_entry.session_id,
-                                                    _hyg_commit_fence.seconds_since_progress(),
-                                                    _hyg_elapsed,
-                                                    _hyg_total_ceiling_seconds,
+                                                _hyg_elapsed = (
+                                                    time.monotonic() - _hyg_wait_started
                                                 )
-                                            _timeout_msg = (
-                                                _hygiene_compression_timeout_message(
-                                                    total_exhausted=_hyg_total_exhausted,
-                                                    elapsed=_hyg_elapsed,
-                                                    idle_timeout=_hyg_timeout_seconds,
-                                                    progress_observed=(
-                                                        _hyg_commit_fence.progress_observed
-                                                    ),
-                                                )
-                                            )
-                                            try:
-                                                _adapter = self._adapter_for_source(source)
-                                                if _adapter and source.chat_id:
-                                                    await _adapter.send(
-                                                        source.chat_id,
-                                                        _timeout_msg,
-                                                        metadata=_hyg_meta,
+                                                if _hyg_total_exhausted:
+                                                    logger.warning(
+                                                        "Session hygiene compression for session %s "
+                                                        "reached its total ceiling after %.1fs "
+                                                        "(progress observed=%s); continuing without "
+                                                        "compression",
+                                                        session_entry.session_id,
+                                                        _hyg_elapsed,
+                                                        _hyg_commit_fence.progress_observed,
                                                     )
-                                            except Exception as _werr:
-                                                logger.warning(
-                                                    "Failed to deliver compression-timeout "
-                                                    "warning to user: %s",
-                                                    _werr,
+                                                else:
+                                                    logger.warning(
+                                                        "Session hygiene compression for session %s "
+                                                        "made no progress for %.1fs (total wait "
+                                                        "%.1fs, ceiling %.1fs); continuing without "
+                                                        "compression",
+                                                        session_entry.session_id,
+                                                        _hyg_commit_fence.seconds_since_progress(),
+                                                        _hyg_elapsed,
+                                                        _hyg_total_ceiling_seconds,
+                                                    )
+                                                _timeout_msg = (
+                                                    _hygiene_compression_timeout_message(
+                                                        total_exhausted=_hyg_total_exhausted,
+                                                        elapsed=_hyg_elapsed,
+                                                        idle_timeout=_hyg_timeout_seconds,
+                                                        progress_observed=(
+                                                            _hyg_commit_fence.progress_observed
+                                                        ),
+                                                    )
                                                 )
+                                                try:
+                                                    _adapter = self._adapter_for_source(source)
+                                                    if _adapter and source.chat_id:
+                                                        await _adapter.send(
+                                                            source.chat_id,
+                                                            _timeout_msg,
+                                                            metadata=_hyg_meta,
+                                                        )
+                                                except Exception as _werr:
+                                                    logger.warning(
+                                                        "Failed to deliver compression-timeout "
+                                                        "warning to user: %s",
+                                                        _werr,
+                                                    )
                                             raise
                                     except BaseException:
                                         # #76354 F2: non-timeout unwind while the
@@ -21255,6 +21542,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 context="session hygiene unwind",
                                             )
                                             _hyg_cleanup_deferred = True
+                                        # #96953: restart drain / task cancel used
+                                        # to re-raise with no cooldown, so the
+                                        # next turn immediately re-armed hygiene
+                                        # and waited up to 600s behind a fence
+                                        # that would refuse the commit again.
+                                        if _hyg_failure_cooldown_seconds >= 0:
+                                            try:
+                                                _hyg_cooldown = _hygiene_cooldown_for_failure(
+                                                    self,
+                                                    session_key,
+                                                    _hyg_failure_cooldown_seconds,
+                                                )
+                                                _record_hygiene_cooldown(
+                                                    self, session_entry.session_id,
+                                                    _hyg_cooldown,
+                                                    "session hygiene compression "
+                                                    "cancelled at commit fence",
+                                                )
+                                            except Exception as _cd_err:
+                                                logger.debug(
+                                                    "hygiene unwind cooldown "
+                                                    "record failed: %s",
+                                                    _cd_err,
+                                                )
                                         raise
 
                                     # _compress_context ends the old session and creates
@@ -21403,6 +21714,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_aborted = _comp is not None and getattr(
                                         _comp, "_last_compress_aborted", False
                                     )
+                                    # Fence-cancelled _compress_context returns
+                                    # the original transcript with
+                                    # _last_compress_aborted still False
+                                    # (failure_class=commit_fence_cancelled,
+                                    # chunk_count=0). Treat that no-op as an
+                                    # abort so hygiene records a cooldown
+                                    # instead of retrying into the 600s wait
+                                    # (#96953). A successful rotate/in-place
+                                    # commit is not an abort even if a later
+                                    # invalidation flipped the fence.
+                                    _hyg_fence_cancelled = bool(
+                                        _hyg_commit_fence.is_cancelled
+                                        and not _hyg_rotated
+                                        and not _hyg_in_place
+                                    )
+                                    if _hyg_fence_cancelled:
+                                        _hyg_aborted = True
                                     if not _hyg_aborted:
                                         # Recovery decision lives in the
                                         # extracted, unit-tested predicate — the
@@ -21437,8 +21765,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _record_hygiene_cooldown(
                                                 self, session_entry.session_id,
                                                 _hyg_cooldown,
-                                                getattr(
-                                                    _comp, "_last_summary_error", None
+                                                (
+                                                    "session hygiene compression "
+                                                    "cancelled at commit fence"
+                                                    if _hyg_fence_cancelled
+                                                    else getattr(
+                                                        _comp, "_last_summary_error", None
+                                                    )
                                                 ),
                                             )
                                         from agent.session_activity import (
@@ -21451,29 +21784,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             "hygiene compression abort "
                                             "activity stamp failed",
                                         )
-                                        _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
-                                        # Force-redact: provider exception text
-                                        # may contain credentials; this message
-                                        # reaches gateway users directly.
-                                        from agent.redact import redact_sensitive_text
-                                        _err = redact_sensitive_text(_err, force=True)
-                                        _warn_msg = (
-                                            "⚠️ Context compression aborted "
-                                            f"({_err}). No messages were dropped — "
-                                            "conversation is unchanged. Run /compress "
-                                            "to retry, /reset for a clean session, or "
-                                            "check your auxiliary.compression model "
-                                            "configuration."
-                                        )
-                                        try:
-                                            _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
-                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
-                                        except Exception as _werr:
-                                            logger.warning(
-                                                "Failed to deliver compression-failure warning to user: %s",
-                                                _werr,
+                                        if not _hyg_fence_cancelled:
+                                            _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
+                                            # Force-redact: provider exception text
+                                            # may contain credentials; this message
+                                            # reaches gateway users directly.
+                                            from agent.redact import redact_sensitive_text
+                                            _err = redact_sensitive_text(_err, force=True)
+                                            _warn_msg = (
+                                                "⚠️ Context compression aborted "
+                                                f"({_err}). No messages were dropped — "
+                                                "conversation is unchanged. Run /compress "
+                                                "to retry, /reset for a clean session, or "
+                                                "check your auxiliary.compression model "
+                                                "configuration."
                                             )
+                                            try:
+                                                _adapter = self._adapter_for_source(source)
+                                                if _adapter and source.chat_id:
+                                                    await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
+                                            except Exception as _werr:
+                                                logger.warning(
+                                                    "Failed to deliver compression-failure warning to user: %s",
+                                                    _werr,
+                                                )
                                     # Separately: if the user's CONFIGURED aux
                                     # model failed and we recovered by falling
                                     # back to the main model, tell them — a
