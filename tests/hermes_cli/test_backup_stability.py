@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -94,7 +95,10 @@ def test_quick_snapshot_listing_ignores_partial_directories(tmp_path) -> None:
 def test_failed_automatic_backup_preserves_previous_archive(tmp_path, monkeypatch) -> None:
     home = tmp_path / ".hermes"
     home.mkdir()
-    (home / "state.db").write_bytes(b"not-a-database")
+    with sqlite3.connect(home / "state.db") as conn:
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, content TEXT)")
+        conn.execute("INSERT INTO messages (content) VALUES (?)", ("persisted",))
+        conn.commit()
     archive = tmp_path / "automatic.zip"
     archive.write_bytes(b"previous-valid-backup")
 
