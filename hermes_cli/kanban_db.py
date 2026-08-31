@@ -9605,6 +9605,8 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
             # still fails open.
             return (False, reason)
         return (True, "fail_open_last_resort")
+    if route in _configured_handoff_profile_names():
+        return (True, "configured_fail_open")
     return (False, f"unknown_route:{route}")
 
 
@@ -9649,6 +9651,13 @@ def _configured_handoff_routes() -> dict[str, tuple[tuple[str, Optional[str]], .
         if route:
             configured[tier] = tuple(route)
     return configured
+
+
+def _configured_handoff_profile_names() -> set[str]:
+    names: set[str] = set()
+    for route in _configured_handoff_routes().values():
+        names.update(profile for profile, _model in route)
+    return names
 
 
 def _configured_route_for_tier(tier_value: Optional[str]) -> tuple[tuple[str, Optional[str]], ...]:

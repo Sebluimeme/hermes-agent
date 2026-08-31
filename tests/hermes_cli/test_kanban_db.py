@@ -718,7 +718,7 @@ def test_dispatch_fails_closed_for_claude_cooldown_unknown_and_expired_preflight
 
 
 def test_dispatch_once_reroutes_already_assigned_card_off_dead_quota(
-    kanban_home, all_assignees_spawnable, monkeypatch,
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
 ):
     """t_47dc2bf0: a card that already carries an explicit assignee (the
     normal case for every pre-existing open card, not just fresh
@@ -1523,6 +1523,8 @@ def test_dispatch_handoff_routes_accept_configured_profile_names(
     monkeypatch.setattr(kb, "_configured_handoff_routes", lambda: {
         kb.ROUTING_TIER_COMPLEX: (("writer_a", None), ("writer_b", None)),
     })
+    assert kb.route_preflight_ok("writer_a") == (True, "configured_fail_open")
+    assert kb.resolve_ordered_route("complex")[:2] == ("writer_a", None)
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="auto-routed", routing_tier="complex")
         result = kb.dispatch_once(conn, dry_run=False, default_assignee="writer_a")
@@ -1531,7 +1533,7 @@ def test_dispatch_handoff_routes_accept_configured_profile_names(
         row = conn.execute(
             "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        assert row["assignee"] == "writer_b"
+        assert row["assignee"] == "writer_a"
         assert row["model_override"] is None
 
 
