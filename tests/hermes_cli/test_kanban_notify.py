@@ -554,19 +554,26 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     # The user is notified about the abnormal event...
     fake_adapter.send.assert_called_once()
     sent_text = fake_adapter.send.call_args[0][1]
+    # AGENTS.md "Anomalie / Impact / Solution / Preuve" — a relevant anomaly
+    # must never reach Sébastien as a bare status word or raw internal
+    # jargon; it must carry the human structure so he can act without
+    # opening the card. This is the real contract; asserting the raw kind
+    # name here was incidental (it only held for "crashed" via title
+    # bleed-through and for "gave_up" via a hardcoded phrase, and broke for
+    # "timed_out"). t_07db0331 (2026-09-03) extended the same clean wording
+    # to "gave_up", which used to leak the raw task id and English
+    # ("Kanban {id} gave up after repeated spawn failures") — the no-payload
+    # shape used by this test never includes "Preuve :"/"Détail :" since no
+    # error string was recorded, so only crashed/timed_out (whose template
+    # always states a fixed cause) assert it.
+    assert "Impact :" in sent_text
+    assert "Solution :" in sent_text
     if kind in ("crashed", "timed_out"):
-        # AGENTS.md "Anomalie / Impact / Solution / Preuve" — a relevant
-        # anomaly must never reach Sébastien as a bare status word; it must
-        # carry the three-part structure so he can act without opening the
-        # card. This is the real contract; asserting the raw kind name here
-        # was incidental (it only held for "crashed" via title bleed-through
-        # and for "gave_up" via a hardcoded phrase, and broke for
-        # "timed_out" — see AGENTS.md "Anomalie / Impact / Solution / Preuve").
-        assert "Impact :" in sent_text
-        assert "Solution :" in sent_text
         assert "Preuve :" in sent_text
     else:
-        assert kind.replace('_', ' ') in sent_text
+        assert tid not in sent_text, "no raw task id in a direct chat message"
+        assert "Kanban" not in sent_text, "no internal 'Kanban' jargon"
+        assert "spawn failures" not in sent_text, "no raw English worker wording"
 
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside

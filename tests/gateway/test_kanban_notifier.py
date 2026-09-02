@@ -297,6 +297,154 @@ def test_completed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch
     assert remaining == []
 
 
+def test_crashed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):
+    """t_07db0331: `crashed` must reach Sébastien exactly once, like `completed`.
+
+    Live evidence (2026-09-02/03 session on the main Telegram topic) showed
+    the same double-message shape t_62e8c688 fixed for `completed`, still
+    present for `crashed`/`timed_out`: the raw "Impact/Solution/Preuve" ping
+    was sent directly AND the owning session was woken, producing its own
+    follow-up synthesis a moment later — two messages for one auto-retried
+    crash the dispatcher already handles without any decision from him.
+    """
+    db_path = tmp_path / "crashed-defers-to-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Worker mort en cours de route",
+            assignee="worker",
+            session_id="agent:main:telegram:group:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+        )
+        kb._append_event(conn, tid, "crashed", {})
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], (
+        f"a crashed event with an owning session must defer entirely to "
+        f"the wake synthesis, got a raw ping too: {adapter.sent}"
+    )
+    assert len(adapter.handled) == 1
+
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["crashed"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_timed_out_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):
+    """t_07db0331: same fix as `crashed`, applied to `timed_out`."""
+    db_path = tmp_path / "timedout-defers-to-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Tâche au-delà du délai",
+            assignee="worker",
+            session_id="agent:main:telegram:group:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+        )
+        kb._append_event(conn, tid, "timed_out", {"limit_seconds": 600})
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [], (
+        f"a timed_out event with an owning session must defer entirely to "
+        f"the wake synthesis, got a raw ping too: {adapter.sent}"
+    )
+    assert len(adapter.handled) == 1
+
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["timed_out"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
+
+
+def test_gave_up_ping_has_no_raw_task_id_or_english_jargon(tmp_path, monkeypatch):
+    """t_07db0331: `gave_up` keeps its guaranteed direct ping (retries are
+
+    truly exhausted here, unlike crashed/timed_out which auto-retry — a real
+    decision may be needed), but the wording must stop leaking the raw task
+    id and English internals ("Kanban t_xxx gave up after repeated spawn
+    failures") that Sébastien flagged as incomprehensible technical spam.
+    """
+    db_path = tmp_path / "gave-up-clean-ping.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Ne demarre plus",
+            assignee="worker",
+            session_id="agent:main:telegram:group:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+        )
+        kb._append_event(conn, tid, "gave_up", {"error": "spawn failed: quota"})
+        conn.commit()
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, (
+        f"gave_up must still send exactly one guaranteed human message, got: {adapter.sent}"
+    )
+    message = adapter.sent[0]["text"]
+    assert tid not in message, "no raw task id in a direct chat message"
+    assert "Kanban" not in message, "no internal 'Kanban' jargon in a direct chat message"
+    assert "spawn failures" not in message, "no raw English worker-internal wording"
+    assert "Impact :" in message
+    assert "Solution :" in message
+    # The wake self-post still fires so the creator agent stays informed.
+    assert len(adapter.handled) == 1
+
+
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     tmp_path, monkeypatch,
 ):

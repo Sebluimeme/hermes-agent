@@ -963,6 +963,13 @@ class GatewayKanbanWatchersMixin:
                     # from best-effort to the same gated rewind/retry contract
                     # `wake`-only subscriptions already use — the completion is
                     # never silently lost just because the raw ping is skipped.
+                    # 2026-09-03 (t_07db0331): the same duplicate-message shape
+                    # was confirmed live for `crashed`/`timed_out` — both are
+                    # auto-retry FYI events with no decision required, exactly
+                    # like `completed` — so they now set this flag too. Kept
+                    # under the original name to avoid touching every call
+                    # site below; it now means "a wake-deferred event was seen
+                    # in this batch", not just "completed" specifically.
                     _completed_defers_to_wake = False
                     wake_review_detail = ""
                     for ev in d["events"]:
@@ -1102,12 +1109,25 @@ class GatewayKanbanWatchersMixin:
                                     icon="⏸",
                                 )
                         elif kind == "gave_up":
+                            # Sébastien flagged this exact wording as the
+                            # "spam technique" pattern (t_07db0331): a raw
+                            # task id, the literal word "Kanban", and English
+                            # jargon ("spawn failures") leaking into a direct
+                            # chat message. Unlike crashed/timed_out below,
+                            # retries really are exhausted here — no more
+                            # automatic recovery is coming — so this stays a
+                            # guaranteed direct ping (not deferred to the
+                            # wake), but rendered in the same clean
+                            # Impact/Solution/Preuve French shape used by
+                            # blocked/crashed/timed_out, with no task id.
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                err = f"\nDétail : {str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"⚠️ {board_tag}{tag}{title}\n"
+                                "Impact : la tâche a échoué après plusieurs tentatives.\n"
+                                "Solution : aucune reprise automatique ; une décision est nécessaire."
+                                f"{err}"
                             )
                         elif kind == "crashed":
                             msg = (
@@ -1116,6 +1136,22 @@ class GatewayKanbanWatchersMixin:
                                 "Solution : relance automatique engagée.\n"
                                 "Preuve : processus de la carte absent."
                             )
+                            # Same duplicate-message fix as `completed`
+                            # (t_62e8c688), generalized here for t_07db0331:
+                            # a live session will narrate this retry in its
+                            # own words a moment later, so the raw ping is
+                            # redundant noise when a wake can deliver it
+                            # instead. Falls back to the raw ping (unchanged
+                            # behavior) when there is no session to wake.
+                            from gateway.wake import adapter_supports_push as _retry_push_ok
+                            if (
+                                wake_agent
+                                and _retry_push_ok(adapter)
+                                and task
+                                and getattr(task, "session_id", None)
+                            ):
+                                _completed_defers_to_wake = True
+                                continue
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
@@ -1126,6 +1162,18 @@ class GatewayKanbanWatchersMixin:
                                 "Solution : relance automatique engagée.\n"
                                 f"Preuve : limite de {limit}s atteinte."
                             )
+                            # Same fix as `crashed` just above — auto-retry
+                            # already in motion, no decision needed, so defer
+                            # to the wake instead of sending both messages.
+                            from gateway.wake import adapter_supports_push as _retry_push_ok2
+                            if (
+                                wake_agent
+                                and _retry_push_ok2(adapter)
+                                and task
+                                and getattr(task, "session_id", None)
+                            ):
+                                _completed_defers_to_wake = True
+                                continue
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
                             # first-class review lane. Wake the origin thread.
