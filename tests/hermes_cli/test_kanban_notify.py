@@ -1158,3 +1158,102 @@ def test_gc_archived_rows_already_removed_by_unsub(kanban_home):
         assert kb.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
+
+
+def test_orphan_needs_input_block_falls_back_to_live_operator_sub(kanban_home):
+    """Incident 2026-09-02 (t_92c52063, t_00a2817b, diagnosed by t_1848ed53):
+    a worker-created follow-up card with no parents and no mission never
+    inherits a ``kanban_notify_subs`` row, so its ``blocked`` event can never
+    reach a human — it rots silently instead of joining the sequential
+    decision flow. ``block_task`` must now borrow the most recently active
+    real operator subscription (``notify+wake``) so the question still
+    surfaces, without inventing routing details from nothing.
+    """
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        # A live operator channel: some other task the operator is actually
+        # subscribed to right now (mirrors a worker's own running Kanban task).
+        live_task = kb.create_task(conn, title="live worker task", assignee="claude2")
+        kb.add_notify_sub(
+            conn, task_id=live_task, platform="telegram", chat_id="opchat",
+            thread_id="1", user_id="5029631222", chat_type="group",
+            notifier_profile="default", delivery_mode="notify+wake",
+        )
+
+        # An orphan decision card: no parents, no mission, zero subscribers —
+        # exactly how t_92c52063 / t_00a2817b were created.
+        orphan = kb.create_task(conn, title="orphan decision card", assignee="claude2")
+        assert kb.list_notify_subs(conn, orphan) == []
+
+        ok = kb.block_task(
+            conn, orphan,
+            reason="gate:test_fallback - obstacle simulé, décision attendue",
+            kind="needs_input",
+        )
+        assert ok is True
+
+        subs = kb.list_notify_subs(conn, orphan)
+        assert len(subs) == 1
+        assert subs[0]["platform"] == "telegram"
+        assert subs[0]["chat_id"] == "opchat"
+        assert subs[0]["thread_id"] == "1"
+        assert subs[0]["delivery_mode"] == "notify+wake"
+        # Cursor starts at 0 (not "caught up") so the notifier's next tick
+        # treats the just-appended ``blocked`` event as unseen and delivers it.
+        with kb.connect_closing() as raw:
+            row = raw.execute(
+                "SELECT last_event_id FROM kanban_notify_subs WHERE task_id = ?",
+                (orphan,),
+            ).fetchone()
+        assert row["last_event_id"] == 0
+    finally:
+        conn.close()
+
+
+def test_block_with_existing_sub_is_never_overridden_by_fallback(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        kb.create_task(conn, title="unrelated live task", assignee="claude2")
+        kb.add_notify_sub(
+            conn, task_id=kb.create_task(conn, title="other live task", assignee="claude1"),
+            platform="telegram", chat_id="other-chat", delivery_mode="notify+wake",
+        )
+
+        tid = kb.create_task(conn, title="already subscribed task", assignee="claude2")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="own-chat",
+            thread_id="42", delivery_mode="notify",
+        )
+
+        assert kb.block_task(conn, tid, reason="gate:test_fallback - obstacle réel", kind="capability")
+
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["chat_id"] == "own-chat"
+        assert subs[0]["delivery_mode"] == "notify"
+    finally:
+        conn.close()
+
+
+def test_orphan_block_without_any_live_operator_sub_is_a_safe_noop(kanban_home):
+    """No subscription anywhere in the system yet (fresh install / test db):
+    the fallback must not raise and must leave the task with zero subs,
+    exactly like before this fix."""
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        orphan = kb.create_task(conn, title="orphan with no live channel at all", assignee="claude2")
+        ok = kb.block_task(
+            conn, orphan,
+            reason="gate:test_fallback - aucun canal vivant disponible",
+            kind="needs_input",
+        )
+        assert ok is True
+        assert kb.list_notify_subs(conn, orphan) == []
+    finally:
+        conn.close()

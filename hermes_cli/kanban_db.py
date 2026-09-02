@@ -7296,6 +7296,75 @@ def edit_completed_task_result(
     return True
 
 
+def _ensure_operator_notify_sub_fallback(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    created_at: Optional[int] = None,
+) -> None:
+    """Safety net for a needs_input/capability block with zero subscribers.
+
+    Incident 2026-09-02 (t_92c52063, t_00a2817b, diagnosed by t_1848ed53): a
+    worker-created follow-up card with ``parents=()`` and no ``mission_id``
+    never inherits a ``kanban_notify_subs`` row (``_inherit_notify_subs`` only
+    copies from parents). ``gateway/kanban_watchers.py`` only ever notifies
+    from that table, so such a card's ``blocked`` event can never reach a
+    human — it rots silently instead of joining the sequential decision flow,
+    even though it is exactly the kind of event a human must act on.
+
+    This does not invent a destinataire from nothing (the architecture's
+    stated invariant): it borrows the most recently active real operator
+    subscription (``delivery_mode='notify+wake'``) already present in the
+    database, on the working assumption that Hermes has exactly one live
+    decision channel at a time. It is purely additive bookkeeping — it never
+    touches ``parents``, scheduling, or ``mission_id`` — and only fires when
+    the task truly has zero subscribers, so the normal inheritance path
+    (parents/mission) always takes priority and this never overrides an
+    intentional subscription choice.
+
+    ``last_event_id`` is deliberately left at 0 (unlike the "caught up"
+    default new subs get elsewhere) so the notifier's next tick treats the
+    ``blocked`` event just appended for this task as unseen and delivers it.
+    """
+    existing = conn.execute(
+        "SELECT 1 FROM kanban_notify_subs WHERE task_id = ? LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if existing is not None:
+        return
+    fallback = conn.execute(
+        "SELECT platform, chat_id, thread_id, user_id, user_id_alt, chat_type, "
+        "notifier_profile, delivery_mode, delivery_metadata "
+        "FROM kanban_notify_subs "
+        "WHERE delivery_mode = 'notify+wake' "
+        "ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    if fallback is None:
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             created_at, last_event_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        """,
+        (
+            task_id,
+            fallback["platform"],
+            fallback["chat_id"],
+            fallback["thread_id"],
+            fallback["user_id"],
+            fallback["user_id_alt"],
+            fallback["chat_type"],
+            fallback["notifier_profile"],
+            fallback["delivery_mode"],
+            fallback["delivery_metadata"],
+            int(created_at if created_at is not None else time.time()),
+        ),
+    )
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7620,6 +7689,10 @@ def block_task(
                 },
                 run_id=run_id,
             )
+        # A blocked card with zero subscribers is invisible to the whole
+        # human decision flow (see docstring of the helper below) — close
+        # that gap right where it is created, not just at notify time.
+        _ensure_operator_notify_sub_fallback(conn, task_id)
         conn.execute(
             "INSERT INTO human_actions "
             "(mission_id, task_id, kind, prompt, status, created_at) "
