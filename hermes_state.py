@@ -8774,6 +8774,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "cache_write_tokens", "reasoning_tokens", "api_call_count",
     )
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
+    # Live gauges (current-window occupancy), never summed: on merge the
+    # newest non-None reading wins, matching plain sequential application.
+    _TOKEN_DELTA_GAUGE_FIELDS = (
+        "context_used_tokens", "context_max_tokens", "context_measured_at",
+    )
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode",
@@ -8963,6 +8968,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         # None-preserving sum: an all-None run must stay
                         # None so COALESCE keeps the stored value untouched.
                         merged[f] = (merged.get(f) or 0.0) + value
+                for f in self._TOKEN_DELTA_GAUGE_FIELDS:
+                    value = kwargs.get(f)
+                    if value is not None:
+                        merged[f] = value
             else:
                 groups.append((key, session_id, dict(kwargs)))
         return [(sid, kw) for _, sid, kw in groups]
@@ -9046,6 +9055,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        context_used_tokens: Optional[int] = None,
+        context_max_tokens: Optional[int] = None,
+        context_measured_at: Optional[float] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
@@ -9055,6 +9067,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         When *absolute* is True, values are **set directly** — use this when
         the caller already holds cumulative totals (gateway path, where the
         cached agent accumulates across messages).
+
+        ``context_used_tokens``/``context_max_tokens``/``context_measured_at``
+        are a live *gauge* (current-window occupancy), never a delta — they
+        overwrite regardless of *absolute*, and are left untouched (via
+        ``COALESCE``) when omitted so a call without a fresh measurement
+        never blanks the last known reading.
         """
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
@@ -9080,7 +9098,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = ?
+                   api_call_count = ?,
+                   context_used_tokens = COALESCE(?, context_used_tokens),
+                   context_max_tokens = COALESCE(?, context_max_tokens),
+                   context_measured_at = COALESCE(?, context_measured_at)
                    WHERE id = ?"""
         else:
             sql = """UPDATE sessions SET
@@ -9101,7 +9122,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = COALESCE(api_call_count, 0) + ?
+                   api_call_count = COALESCE(api_call_count, 0) + ?,
+                   context_used_tokens = COALESCE(?, context_used_tokens),
+                   context_max_tokens = COALESCE(?, context_max_tokens),
+                   context_measured_at = COALESCE(?, context_measured_at)
                    WHERE id = ?"""
         has_accounted_usage = bool(
             input_tokens or output_tokens or cache_read_tokens
@@ -9125,6 +9149,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             billing_mode if has_accounted_usage else None,
             model if has_accounted_usage else None,
             api_call_count,
+            context_used_tokens,
+            context_max_tokens,
+            context_measured_at,
             session_id,
         )
         # Per-model usage attribution.  ``update_token_counts`` is the single

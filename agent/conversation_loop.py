@@ -4469,6 +4469,27 @@ def run_conversation(
                             # affects 0 rows without error).
                             if not agent._session_db_created:
                                 agent._ensure_db_session()
+                            # Live context-window gauge, persisted alongside the
+                            # per-call token delta so out-of-process readers (the
+                            # Kanban agent board) can show a real "Contexte : X/Y"
+                            # reading instead of deriving one from cumulative
+                            # tokens. Same real-measurement-only rule as the
+                            # status bar (_get_status_bar_snapshot) and the TUI
+                            # gateway (_get_usage): only set when both a positive
+                            # window length and a positive last-prompt reading
+                            # exist, and clamp the post-compression -1 sentinel
+                            # to "no reading yet" rather than persist -1.
+                            _ctx_used_gauge = None
+                            _ctx_max_gauge = None
+                            _ctx_measured_gauge = None
+                            _compressor = getattr(agent, "context_compressor", None)
+                            if _compressor is not None:
+                                _ctx_last_prompt = getattr(_compressor, "last_prompt_tokens", 0) or 0
+                                _ctx_length = getattr(_compressor, "context_length", 0) or 0
+                                if _ctx_last_prompt > 0 and _ctx_length > 0:
+                                    _ctx_used_gauge = int(_ctx_last_prompt)
+                                    _ctx_max_gauge = int(_ctx_length)
+                                    _ctx_measured_gauge = time.time()
                             # Per-call cost delta = aggregator cost + MoA
                             # advisor cost (each priced at its own rate). Folded
                             # here so state.db's estimated_cost_usd includes the
@@ -4502,6 +4523,9 @@ def run_conversation(
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
                                 api_call_count=1,
+                                context_used_tokens=_ctx_used_gauge,
+                                context_max_tokens=_ctx_max_gauge,
+                                context_measured_at=_ctx_measured_gauge,
                             )
                         except Exception as e:
                             # Log token persistence failures so they're

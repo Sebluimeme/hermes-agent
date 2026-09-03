@@ -196,6 +196,99 @@ class TestCoalescing:
             seq_db.close()
 
 
+# =========================================================================
+# Context-window gauge (t_8e9f9def — board "Contexte : X/Y" line)
+# =========================================================================
+
+
+def _context_gauge(db, session_id):
+    with db._lock:
+        row = db._conn.execute(
+            "SELECT context_used_tokens, context_max_tokens,"
+            " context_measured_at FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+class TestContextGauge:
+    """context_used_tokens/context_max_tokens/context_measured_at are a
+    live gauge (current-window occupancy), not a delta: they always
+    overwrite with the newest reading and are left untouched when a call
+    carries no fresh measurement — never summed, never blanked."""
+
+    def test_update_token_counts_persists_gauge(self, db):
+        db.create_session("s-ctx", "test")
+        db.update_token_counts(
+            "s-ctx", input_tokens=1, api_call_count=1,
+            context_used_tokens=12_000, context_max_tokens=200_000,
+            context_measured_at=1_000.0,
+        )
+        gauge = _context_gauge(db, "s-ctx")
+        assert gauge["context_used_tokens"] == 12_000
+        assert gauge["context_max_tokens"] == 200_000
+        assert gauge["context_measured_at"] == 1_000.0
+
+    def test_call_without_measurement_keeps_last_reading(self, db):
+        """A turn where the compressor had no fresh reading (context_used_
+        tokens=None) must not blank out the previous measurement."""
+        db.create_session("s-ctx2", "test")
+        db.update_token_counts(
+            "s-ctx2", input_tokens=1, api_call_count=1,
+            context_used_tokens=5_000, context_max_tokens=200_000,
+            context_measured_at=1_000.0,
+        )
+        db.update_token_counts("s-ctx2", input_tokens=1, api_call_count=1)
+        gauge = _context_gauge(db, "s-ctx2")
+        assert gauge["context_used_tokens"] == 5_000
+        assert gauge["context_max_tokens"] == 200_000
+        assert gauge["context_measured_at"] == 1_000.0
+
+    def test_absolute_mode_still_overwrites_gauge(self, db):
+        """The gauge is not gated on absolute=True — it is not a delta."""
+        db.create_session("s-ctx3", "test")
+        db.update_token_counts(
+            "s-ctx3", input_tokens=1, absolute=True,
+            context_used_tokens=7_000, context_max_tokens=200_000,
+            context_measured_at=2_000.0,
+        )
+        gauge = _context_gauge(db, "s-ctx3")
+        assert gauge["context_used_tokens"] == 7_000
+        assert gauge["context_max_tokens"] == 200_000
+
+    def test_coalescing_keeps_newest_gauge_not_sum(self, db):
+        """Two same-route deltas merged by the writer must keep the SECOND
+        (newer) context reading, never the sum of the two."""
+        db.create_session("s-ctx4", "test")
+        batch = [
+            ("s-ctx4", dict(
+                input_tokens=1, model="m1", billing_provider="p1",
+                api_call_count=1,
+                context_used_tokens=10_000, context_max_tokens=200_000,
+                context_measured_at=1_000.0,
+            )),
+            ("s-ctx4", dict(
+                input_tokens=1, model="m1", billing_provider="p1",
+                api_call_count=1,
+                context_used_tokens=15_000, context_max_tokens=200_000,
+                context_measured_at=2_000.0,
+            )),
+        ]
+        coalesced = db._coalesce_token_deltas(batch)
+        assert len(coalesced) == 1
+        _, merged_kwargs = coalesced[0]
+        assert merged_kwargs["context_used_tokens"] == 15_000
+        assert merged_kwargs["context_measured_at"] == 2_000.0
+
+    def test_unmeasured_session_gauge_is_null(self, db):
+        """A session that never had a live reading exposes NULL — the board
+        must render 'non mesuré', never a fabricated 0."""
+        db.create_session("s-ctx5", "test")
+        db.update_token_counts("s-ctx5", input_tokens=1, api_call_count=1)
+        gauge = _context_gauge(db, "s-ctx5")
+        assert gauge["context_used_tokens"] is None
+        assert gauge["context_max_tokens"] is None
+        assert gauge["context_measured_at"] is None
 
 
 # =========================================================================
@@ -532,6 +625,7 @@ class TestCoalesceFieldContract:
             set(db._TOKEN_DELTA_SUM_FIELDS)
             | set(db._TOKEN_DELTA_COST_FIELDS)
             | set(db._TOKEN_DELTA_ROUTE_FIELDS)
+            | set(db._TOKEN_DELTA_GAUGE_FIELDS)
             | {"absolute"}  # control flag: absolute deltas never merge
         )
 
@@ -539,9 +633,10 @@ class TestCoalesceFieldContract:
         assert not unclassified, (
             f"update_token_counts kwargs not classified for coalescing: "
             f"{sorted(unclassified)}. Add each to _TOKEN_DELTA_SUM_FIELDS, "
-            f"_TOKEN_DELTA_COST_FIELDS, or _TOKEN_DELTA_ROUTE_FIELDS (or the "
-            f"control-flag set in this test) — unclassified kwargs are "
-            f"silently dropped from merged deltas."
+            f"_TOKEN_DELTA_COST_FIELDS, _TOKEN_DELTA_ROUTE_FIELDS, or "
+            f"_TOKEN_DELTA_GAUGE_FIELDS (or the control-flag set in this "
+            f"test) — unclassified kwargs are silently dropped from merged "
+            f"deltas."
         )
         phantom = classified - params - {"absolute"}
         assert not phantom, (
