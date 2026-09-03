@@ -182,6 +182,34 @@ def test_completion_ready_respects_optional_plugin_validation_before_terminal_wr
     assert ready["evidence"]["kind"] == "test"
 
 
+def test_completion_reuses_exact_ready_handoff_when_model_sends_wrong_args(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    handoff = {
+        "summary": "Le prompt demandé est prêt",
+        "metadata": {
+            "evidence": {"kind": "artifact", "detail": "prompt complet validé"},
+            "answer": "contenu à livrer",
+        },
+    }
+    ready = json.loads(kt._handle_completion_ready(handoff))
+    assert ready["ready"] is True
+
+    # Regression: the worker used to replace the validated handoff with an
+    # unrelated object and then enter a guard/retry loop.
+    completed = json.loads(kt._handle_complete({"ok": True, "status": "done"}))
+    assert completed["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run.summary == handoff["summary"]
+        assert run.metadata["answer"] == "contenu à livrer"
+    finally:
+        conn.close()
+
+
 def test_defer_review_tool_keeps_review_retryable(worker_env):
     import time
 

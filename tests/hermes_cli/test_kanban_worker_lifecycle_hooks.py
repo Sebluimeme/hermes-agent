@@ -91,6 +91,7 @@ def test_dispatch_spawn_fires_worker_spawned(
     assert kw["assignee"] == "alice"
     assert kw["worker_pid"] == 4242
     assert kw["workspace_path"]
+    assert kw["workspace_kind"] == "scratch"
     assert kw["run_id"] is not None
     assert "profile_name" in kw
     assert "board" in kw

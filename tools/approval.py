@@ -1225,9 +1225,12 @@ DANGEROUS_PATTERNS = [
     # this cannot collide with another reset mode. It also does not match
     # `--help`, which git special-cases before mode resolution.
     (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
+    (r'\bgit(?:\s+-C\s+\S+)?\s+restore\b', "git restore (can destroy uncommitted changes)"),
+    (r'\bgit(?:\s+-C\s+\S+)?\s+checkout\s+(?:-[^\s]*f\b|--\s)', "git checkout overwrite (can destroy uncommitted changes)"),
     (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
+    (r'\bgit\s+-C\s+\S+\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
     # `-D` is shorthand for `-d --force`; the long-flag spellings
     # (`--delete`, `--force`) are different tokens entirely, so they slip
@@ -2840,6 +2843,11 @@ def human_wait_seconds(session_key: str | None = None) -> float:
 # interrupts — so it is prompt-cache-invariant by construction. Inspired by
 # ChatGPT Work's auto-review circuit breaker (3 consecutive denials).
 _denial_tally: dict[str, int] = {}
+# A Kanban worker that receives an explicit refusal or times out has no
+# consent to continue searching for an equivalent destructive route. Keep a
+# process-local hard stop for the rest of that worker run; a resumed run is a
+# new process and can present a genuinely new operator decision.
+_kanban_hard_denied_sessions: set[str] = set()
 # Plain dict with a small cap so an army of short-lived session keys cannot
 # grow it without bound; oldest (least recently denied) entries are evicted.
 _DENIAL_TALLY_MAX_SESSIONS = 256
@@ -3123,6 +3131,7 @@ def clear_session(session_key: str) -> None:
     with _lock:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
+        _kanban_hard_denied_sessions.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
@@ -3708,6 +3717,22 @@ def _await_kanban_worker_approval(
     stable_keys = sorted({str(key).strip() for key in pattern_keys if str(key).strip()})
     primary_key = stable_keys[0] if stable_keys else "kanban_worker"
 
+    with _lock:
+        hard_denied = session_key in _kanban_hard_denied_sessions
+    if hard_denied:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: Une action destructive a déjà été refusée ou a expiré "
+                "pendant ce run. Aucun consentement n’a été donné. Arrête le "
+                "workflow courant ; ne tente aucune commande équivalente."
+            ),
+            "pattern_key": primary_key,
+            "description": description,
+            "outcome": "prior_denial",
+            "user_consent": False,
+        }
+
     # Worker approvals must not materialize a core-owned human prompt.  The
     # plugin transport owns presentation; the host only keeps detection,
     # redaction, timeout, correlation validation and final persistence.
@@ -3750,6 +3775,8 @@ def _await_kanban_worker_approval(
             if outcome == "denied"
             else "expirée sans réponse"
         )
+        with _lock:
+            _kanban_hard_denied_sessions.add(session_key)
         return {
             "approved": False,
             "message": (

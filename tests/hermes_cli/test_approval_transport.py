@@ -389,6 +389,32 @@ def test_kanban_worker_check_all_denies_when_only_builtin_is_configured(monkeypa
     assert mailbox_calls == []
 
 
+def test_kanban_worker_denial_hard_stops_later_destructive_variant(monkeypatch, request):
+    from tools import approval
+
+    session_key = approval.get_current_session_key()
+    approval.clear_session(session_key)
+    approval._kanban_hard_denied_sessions.clear()
+    request.addfinalizer(approval._kanban_hard_denied_sessions.clear)
+    manager = PluginManager()
+    seen = []
+    choices = iter(("deny", "once"))
+    _context(manager).register_approval_transport(
+        "phone",
+        lambda request: seen.append(request) or request.respond(next(choices)),
+    )
+    _configure_kanban_worker_guard(monkeypatch, approval, manager)
+
+    first = approval.check_all_command_guards("git clean -fd", "local")
+    second = approval.check_all_command_guards("git restore app.py", "local")
+
+    assert first["approved"] is False
+    assert first["outcome"] == "denied"
+    assert second["approved"] is False
+    assert second["outcome"] == "prior_denial"
+    assert len(seen) == 1
+
+
 def test_kanban_worker_run_approval_gate_uses_selected_transport(monkeypatch):
     from tools import approval
 

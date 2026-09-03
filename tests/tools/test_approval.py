@@ -1057,7 +1057,7 @@ class TestLaunchctlGatewayLifecycle:
 
 
 class TestGitDestructiveOps:
-    """git reset --hard, push --force, clean -f, branch -D can destroy
+    """git reset/restore/checkout, push --force, clean and branch -D can destroy
     work and rewrite shared history. Not covered by rm/chmod patterns.
 
     See security audit Test 6.
@@ -1078,6 +1078,17 @@ class TestGitDestructiveOps:
             dangerous, _, desc = detect_dangerous_command(cmd)
             assert dangerous is True, cmd
             assert word in desc.lower(), cmd
+
+    def test_restore_checkout_and_git_c_clean_are_detected(self):
+        for cmd in (
+            "git restore app.py",
+            "git -C /home/example/repo restore app.py",
+            "git checkout -- app.py",
+            "git checkout -f main",
+            "git -C /home/example/repo clean -fd",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
 
 
     def test_safe_git_ops_not_flagged(self):

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -53,6 +54,30 @@ KANBAN_SHOW_DEFAULT_RUN_LIMIT = 4
 _SHOW_CURSORS: dict[
     tuple[str, str, str, str], tuple[int, int, int, str, int | None]
 ] = {}
+_COMPLETION_READY_HANDOFFS: dict[str, dict[str, Any]] = {}
+_COMPLETION_READY_LOCK = threading.Lock()
+
+
+def hydrate_completion_args_from_readiness(args: dict[str, Any]) -> dict[str, Any]:
+    """Reuse the exact handoff accepted by ``kanban_completion_ready``.
+
+    Models occasionally call the terminal tool with a fresh, incomplete
+    object after readiness succeeded. That used to discard the validated
+    summary/evidence and start an expensive guard/retry loop. A readiness
+    receipt is process-local, task-scoped, and short-lived; when present it is
+    the authoritative handoff for the immediately following completion.
+    """
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return args
+    with _COMPLETION_READY_LOCK:
+        receipt = _COMPLETION_READY_HANDOFFS.get(tid)
+        if receipt is None:
+            return args
+        hydrated = dict(args)
+        hydrated.update(receipt)
+        hydrated["task_id"] = tid
+        return hydrated
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -770,6 +795,7 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
+    args = hydrate_completion_args_from_readiness(args)
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
     if delegated_err:
         return delegated_err
@@ -925,6 +951,8 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
+            with _COMPLETION_READY_LOCK:
+                _COMPLETION_READY_HANDOFFS.pop(tid, None)
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
@@ -988,6 +1016,16 @@ def _handle_completion_ready(args: dict, **kw) -> str:
                 if isinstance(metadata, dict) and isinstance(metadata.get("evidence"), dict)
                 else None
             )
+            if not missing:
+                receipt = {
+                    "summary": args.get("summary"),
+                    "result": args.get("result"),
+                    "metadata": metadata,
+                    "created_cards": args.get("created_cards"),
+                    "artifacts": list(artifacts),
+                }
+                with _COMPLETION_READY_LOCK:
+                    _COMPLETION_READY_HANDOFFS[tid] = receipt
             return json.dumps({
                 "ok": True,
                 "task_id": tid,
@@ -995,7 +1033,7 @@ def _handle_completion_ready(args: dict, **kw) -> str:
                 "evidence": evidence,
                 "missing": missing,
                 "next": (
-                    "call kanban_complete once with the same metadata/artifacts"
+                    "call kanban_complete once; the validated handoff receipt will be reused automatically"
                     if not missing else
                     "collect the listed evidence before calling kanban_complete"
                 ),

@@ -332,6 +332,7 @@ def _fire_worker_spawned_hook(
             run_id=_current_run_id(conn, task.id),
             worker_pid=int(pid) if pid else None,
             workspace_path=str(workspace_path),
+            workspace_kind=task.workspace_kind,
         )
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban worker spawned hook failed: %s", exc)
@@ -14563,6 +14564,7 @@ def _default_spawn(
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_TURN_BUDGET"] = str(turn_budget)
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env["HERMES_KANBAN_WORKSPACE_KIND"] = task.workspace_kind or "scratch"
     if review_run:
         env["HERMES_KANBAN_REVIEW_RUN"] = "1"
     if resume_session_id:
