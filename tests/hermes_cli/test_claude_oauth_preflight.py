@@ -130,6 +130,44 @@ def test_noncredential_canary_failure_reroutes_without_human_block(
     assert runs == 0
 
 
+def test_fresh_noncredential_canary_failure_reroutes_without_prior_worker_error(
+    kanban_home, all_assignees_spawnable, configured_handoff_routes, monkeypatch,
+):
+    """A failed live canary is enough proof to leave Claude 2.
+
+    Regression for t_c9b92dac run 1240: after a human unblocked a card, the
+    Claude 2 canary failed before a worker existed. The old path demanded an
+    earlier worker error too and converted the card to block_loop_detected
+    instead of routing it to Claude 1.
+    """
+    routing = kanban_home / "state" / "ai-quota-routing.json"
+    routing.parent.mkdir(parents=True)
+    routing.write_text(json.dumps({
+        "agent_cooldowns": {
+            "claude2": {"dispatch_allowed": True, "preflight_required": False},
+            "claude1": {"dispatch_allowed": True, "preflight_required": False},
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_QUOTA_ROUTING_PATH", str(routing))
+    monkeypatch.setattr(
+        "hermes_cli.claude_oauth_preflight.probe_claude2_oauth",
+        lambda: oauth.ProbeResult(False, False, "canari OAuth Claude 2 échoué (code 1)"),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="fresh provider fallback", assignee="claude2", routing_tier="complex",
+        )
+        outcome = kb.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 4242)
+        task = kb.get_task(conn, task_id)
+
+    assert outcome.oauth_rerouted == [task_id]
+    assert outcome.oauth_blocked == []
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "claude1"
+
+
 # --- Transition-gated canary (t_b0bc4445 LOT 2) ----------------------------
 # Table tests for the pure decision function, then integration tests proving
 # the paid canary is skipped on steady-state dispatch and re-fires on each

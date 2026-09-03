@@ -10195,18 +10195,12 @@ def claude2_oauth_dispatch_guard(
         )
         return "blocked"
 
-    provider_failure_proven = bool(
-        task_failure_error and _RESPAWN_BLOCKER_RE.search(task_failure_error)
-    )
-    if not provider_failure_proven:
-        block_task(
-            conn,
-            task_id,
-            reason=dispatch_block_reason(probe),
-            kind="capability",
-        )
-        return "blocked"
-
+    # A live canary is itself the current proof that this lane cannot execute
+    # the card. Requiring an older worker failure as a second proof stranded
+    # freshly unblocked cards: the canary failed before any worker could start,
+    # so there was deliberately no prior worker error to satisfy that test.
+    # Only ``reconnect_required`` above is a human capability gate; every other
+    # live failure must continue through the ordered fallback chain.
     with write_txn(conn):
         moved = fallback_simple_route(
             conn,
