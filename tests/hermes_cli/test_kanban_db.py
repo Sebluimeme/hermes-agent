@@ -593,6 +593,70 @@ def test_rate_limit_exit_immediately_falls_back_with_same_worktree(
     assert fallback_event is not None
 
 
+def test_rate_limit_fallback_survives_same_tick_pool_capacity_reroute(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
+):
+    """t_664c2bab / t_46414f08: after ``fallback_simple_route`` advances a
+    rate-limited claude2 card to claude1, the pool capacity reroute that
+    runs later in the *same* ``dispatch_once`` tick must not walk it back
+    to claude2 just because claude2 now shows zero running workers and a
+    clean preflight. The real incident: ``simple_route_fallback`` (claude2
+    -> claude1) was immediately followed by an ``assigned`` event with
+    ``source=generalist_pool_free_capacity`` putting claude2 right back,
+    so the card never actually reached Claude 1."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import config as _kb_config
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(
+        _kb_config, "load_config",
+        lambda: {"kanban": {"generalist_worker_pool_routing": True}},
+    )
+
+    spawned = []
+
+    def fake_spawn(task, workspace, **_kwargs):
+        spawned.append((task.assignee, workspace))
+        return 71_500 + len(spawned)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        workspace = kanban_home / "project"
+        workspace.mkdir()
+        tid = kb.create_task(
+            conn,
+            title="quota fallback survives pool reroute",
+            assignee="claude2",
+            routing_tier="complex",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        pid = 71050
+        kb.claim_task(conn, tid, claimer=f"{host}:quota")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+
+        # One full tick: detect_crashed_workers() runs the proven fallback
+        # (claude2 -> claude1) *and* the ready-task pool reroute loop below
+        # it, all inside this single dispatch_once() call -- exactly the
+        # same-tick race that produced the incident.
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=1)
+
+        task = kb.get_task(conn, tid)
+        pool_reroute_event = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'assigned' "
+            "AND json_extract(payload, '$.source') = 'generalist_pool_free_capacity'",
+            (tid,),
+        ).fetchone()
+
+    assert task is not None
+    assert task.assignee == "claude1"
+    assert pool_reroute_event is None
+    assert result.spawned == [(tid, "claude1", str(workspace.resolve()))]
+    assert spawned == [("claude1", str(workspace.resolve()))]
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(

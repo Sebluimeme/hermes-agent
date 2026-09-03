@@ -9930,6 +9930,41 @@ def _ready_task_has_resumable_worker_session(
     return isinstance(worker_session_id, str) and bool(worker_session_id.strip())
 
 
+def _ready_task_just_fallback_routed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+) -> bool:
+    """True when ``assignee`` is the target of this task's most recent
+    ``simple_route_fallback`` event.
+
+    ``detect_crashed_workers`` can advance a card to the next hop of its
+    ordered chain (proven quota wall, dead OAuth, ...) earlier in the very
+    same dispatch tick via ``fallback_simple_route``, resetting the task to
+    ``ready`` with the new assignee. The pool capacity reroute below exists
+    to place a genuinely fresh card -- one with no worker context at all --
+    onto the first free lane; it must not re-litigate a fallback decision
+    made moments earlier and walk the card back to the lane it just proved
+    unavailable, simply because that lane now shows zero running workers.
+    Requiring the fallback event to be the task's single latest event keeps
+    this narrow: any later real activity (a claim, another block/unblock, a
+    human reassignment) invalidates the pin and lets normal pool routing
+    resume.
+    """
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["kind"] != "simple_route_fallback":
+        return False
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("to_assignee") == assignee
+
+
 def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None) -> Optional[str]:
     """Block Claude only when telemetry proves an active provider cooldown.
 
@@ -13629,6 +13664,9 @@ def _dispatch_once_locked(
             and _generalist_pool_enabled
             and row_assignee in _configured_route_profiles
             and not _ready_task_has_resumable_worker_session(
+                conn, row["id"], row_assignee,
+            )
+            and not _ready_task_just_fallback_routed(
                 conn, row["id"], row_assignee,
             )
             and (
