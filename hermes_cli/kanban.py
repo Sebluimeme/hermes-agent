@@ -2976,6 +2976,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
             "auto_assigned_default": res.auto_assigned_default,
+            "rerouted_for_capacity": [
+                {"task_id": tid, "from": previous, "to": current}
+                for (tid, previous, current) in res.rerouted_for_capacity
+            ],
+            "deferred_no_free_lane": res.deferred_no_free_lane,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -3009,6 +3014,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
             f"{', '.join(res.auto_assigned_default)}"
+        )
+    for tid, previous, current in res.rerouted_for_capacity:
+        print(f"Re-routed (free lane): {tid}  {previous} -> {current}")
+    if res.deferred_no_free_lane:
+        print(
+            "Deferred (all eligible generalist lanes busy): "
+            f"{', '.join(res.deferred_no_free_lane)}"
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")

@@ -2895,7 +2895,10 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
-        # Optional deterministic pool assignment for independent fan-out waves.
+        # Optional dynamic pool assignment for fresh ready work. On every
+        # dispatcher tick, choose the first provider-eligible handoff route
+        # below that is under its per-profile cap. Exact-session resumptions
+        # remain pinned to their current worker.
         "generalist_worker_pool_routing": False,
         # Explicit Kanban worker handoff routes, by routing tier.  Empty by
         # default: portable installs must opt in with real profile identities

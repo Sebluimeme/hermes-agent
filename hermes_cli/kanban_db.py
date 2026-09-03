@@ -418,6 +418,8 @@ def _fire_dispatch_tick_hook(
             result.auto_blocked,
             result.rate_limited,
             result.auto_assigned_default,
+            result.rerouted_for_capacity,
+            result.deferred_no_free_lane,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
@@ -9820,6 +9822,87 @@ def resolve_parallel_routes(
     return [selected[i % len(selected)] for i in range(task_count)], trace
 
 
+def resolve_first_available_route(
+    routing_tier: Optional[str],
+    running_by_profile: Mapping[str, int],
+    *,
+    max_in_progress_per_profile: Optional[int],
+    preflight_fn: Callable[[str], "tuple[bool, str]"] = route_preflight_ok,
+) -> "tuple[Optional[str], Optional[str], list[dict]]":
+    """Return the first provider-eligible route with worker capacity.
+
+    Unlike provider fallback, this selector is allowed to pass over a healthy
+    but busy lane: no work has started yet, so there is no worker session or
+    checkpoint to preserve. If every eligible lane is busy, return no route
+    and let the card remain in ``ready`` for a later dispatcher tick.
+    """
+    chain = _configured_route_for_tier(routing_tier)
+    trace: list[dict] = []
+    cap = (
+        max_in_progress_per_profile
+        if isinstance(max_in_progress_per_profile, int)
+        and max_in_progress_per_profile > 0
+        else None
+    )
+    for assignee, model_override in chain:
+        ok, reason = preflight_fn(assignee)
+        provider_eligible = ok or reason in {
+            "quota_measurement_unknown",
+            "quota_preflight_required",
+        }
+        running = int(running_by_profile.get(assignee, 0))
+        capacity_available = cap is None or running < cap
+        trace.append({
+            "route": assignee,
+            "model_override": model_override,
+            "ok": ok,
+            "reason": reason,
+            "running": running,
+            "capacity_available": capacity_available,
+        })
+        if provider_eligible and capacity_available:
+            return assignee, model_override, trace
+    return None, None, trace
+
+
+def _ready_task_has_resumable_worker_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+) -> bool:
+    """Whether capacity routing must preserve this task's exact worker.
+
+    This mirrors the outcomes accepted by ``resumable_worker_session_id`` but
+    reads through the dispatcher's existing connection. A human/capability
+    block deliberately resumes from its durable handoff and may re-enter the
+    generalist pool; transient/runtime recovery keeps the exact conversation.
+    """
+    row = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    previous = conn.execute(
+        "SELECT profile, outcome, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if previous is None or previous["profile"] != assignee:
+        return False
+    outcome = previous["outcome"]
+    if outcome not in {
+        "blocked", "rate_limited", "crashed", "timed_out", "stale",
+        "review_deferred", "reclaimed", "scheduled", "interrupted",
+    }:
+        return False
+    if outcome == "blocked" and (row is None or row["block_kind"] != "transient"):
+        return False
+    try:
+        metadata = json.loads(previous["metadata"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    worker_session_id = metadata.get("worker_session_id") if isinstance(metadata, dict) else None
+    return isinstance(worker_session_id, str) and bool(worker_session_id.strip())
+
+
 def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None) -> Optional[str]:
     """Block Claude only when telemetry proves an active provider cooldown.
 
@@ -10119,6 +10202,14 @@ class DispatchResult:
     Surfaces the auto-assignment to telemetry / CLI / dashboard so the
     operator can see when the dispatcher is acting on the fallback rule
     rather than on explicit per-task assignments."""
+    rerouted_for_capacity: list[tuple[str, str, str]] = field(default_factory=list)
+    """Fresh pool tasks moved before their first run because an earlier lane
+    in their configured route was busy. Entries are
+    ``(task_id, previous_assignee, new_assignee)``. A task carrying an exact
+    resumable worker session is never included: resumptions preserve it."""
+    deferred_no_free_lane: list[str] = field(default_factory=list)
+    """Fresh generalist-pool cards left in ``ready`` because every
+    provider-eligible lane is currently at its per-profile capacity."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids skipped because their assignee names a control-plane
     lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
@@ -13266,7 +13357,9 @@ def _dispatch_once_locked(
             _occupied_workspaces.setdefault(_key, _barrier_task_id)
 
     ready_rows = conn.execute(
-        "SELECT id, assignee, routing_tier, workspace_kind, workspace_path FROM tasks "
+        "SELECT id, assignee, routing_tier, workspace_kind, workspace_path, "
+        "model_override "
+        "FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "AND queue_class = 'active' "
         "AND (next_retry_at IS NULL OR next_retry_at <= CAST(strftime('%s','now') AS INTEGER)) "
@@ -13385,8 +13478,12 @@ def _dispatch_once_locked(
         from hermes_cli.config import load_config as _load_kanban_cfg
         _tiered_cfg = (_load_kanban_cfg().get("kanban", {}) or {})
         _tiered_routing_enabled = bool(_tiered_cfg.get("tiered_routing_enabled", True))
+        _generalist_pool_enabled = bool(
+            _tiered_cfg.get("generalist_worker_pool_routing", False)
+        )
     except Exception:
         _tiered_routing_enabled = True
+        _generalist_pool_enabled = False
     _configured_route_profiles = {
         profile
         for route in _configured_routes.values()
@@ -13396,34 +13493,6 @@ def _dispatch_once_locked(
         _default_assignee is None or _default_assignee in _configured_route_profiles
     )
 
-    # Route a whole ready wave as a wave, not as N unrelated first choices.
-    # Calling resolve_ordered_route independently for fifteen unassigned cards
-    # selected claude2 fifteen times and the per-profile cap then serialized
-    # the batch.  Build a deterministic capacity plan up front so independent
-    # work occupies the available lanes (up to the global concurrency cap)
-    # while retaining each tier's ordered/fail-safe eligibility rules.
-    _parallel_auto_routes: dict[str, tuple[str, Optional[str], list[dict]]] = {}
-    if _tiered_routing_applies:
-        for _wave_tier in (ROUTING_TIER_SIMPLE, ROUTING_TIER_COMPLEX):
-            _wave_rows = [
-                _row for _row in ready_rows
-                if not _row["assignee"]
-                and normalize_routing_tier(
-                    _row["routing_tier"]
-                    if "routing_tier" in _row.keys() else None
-                ) == _wave_tier
-            ]
-            _routes, _wave_trace = resolve_parallel_routes(
-                _wave_tier, len(_wave_rows)
-            )
-            for _wave_row, (_route_assignee, _route_model) in zip(
-                _wave_rows, _routes
-            ):
-                _parallel_auto_routes[_wave_row["id"]] = (
-                    _route_assignee,
-                    _route_model,
-                    _wave_trace,
-                )
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -13453,15 +13522,16 @@ def _dispatch_once_locked(
             # by ``kanban.default_assignee``, not "unassigned but secretly
             # routed".
             if _tiered_routing_applies:
-                _tier_assignee, _tier_model, _tier_trace = _parallel_auto_routes.get(
-                    row["id"],
-                    resolve_ordered_route(
-                        row["routing_tier"]
-                        if "routing_tier" in row.keys() else None
-                    ),
+                _tier_assignee, _tier_model, _tier_trace = resolve_first_available_route(
+                    row["routing_tier"],
+                    _per_profile_running,
+                    max_in_progress_per_profile=_per_profile_cap,
                 )
                 if not _tier_assignee:
-                    result.skipped_unassigned.append(row["id"])
+                    # All provider-eligible workers are currently occupied.
+                    # This is healthy queued work, not an unassigned-card
+                    # configuration error; leave it untouched for a later tick.
+                    result.deferred_no_free_lane.append(row["id"])
                     continue
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
@@ -13527,6 +13597,69 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        elif (
+            _tiered_routing_applies
+            and _generalist_pool_enabled
+            and row_assignee in _configured_route_profiles
+            and not _ready_task_has_resumable_worker_session(
+                conn, row["id"], row_assignee,
+            )
+            and (
+                row["model_override"] is None
+                or row["model_override"] in {
+                    model
+                    for route in _configured_routes.values()
+                    for _profile, model in route
+                    if model
+                }
+            )
+        ):
+            # A fresh pool card has no worker context to preserve. Select the
+            # first capable lane with free capacity on every tick, even if the
+            # card was initially stamped with the default assignee. This lets
+            # Spark lead simple work and lets Claude 1/Coder absorb work while
+            # earlier healthy lanes are merely busy.
+            _pool_assignee, _pool_model, _pool_trace = resolve_first_available_route(
+                row["routing_tier"],
+                _per_profile_running,
+                max_in_progress_per_profile=_per_profile_cap,
+            )
+            if not _pool_assignee:
+                result.deferred_no_free_lane.append(row["id"])
+                continue
+            if _pool_assignee != row_assignee or _pool_model != row["model_override"]:
+                previous_assignee = row_assignee
+                if not dry_run:
+                    try:
+                        with write_txn(conn):
+                            conn.execute(
+                                "UPDATE tasks SET assignee = ?, model_override = ? "
+                                "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+                                (_pool_assignee, _pool_model, row["id"]),
+                            )
+                            _append_event(
+                                conn,
+                                row["id"],
+                                "assigned",
+                                {
+                                    "assignee": _pool_assignee,
+                                    "model_override": _pool_model,
+                                    "previous_assignee": previous_assignee,
+                                    "source": "generalist_pool_free_capacity",
+                                    "trace": _pool_trace,
+                                },
+                            )
+                    except Exception:
+                        _log.debug(
+                            "kanban dispatch: failed capacity reroute %s %r -> %r",
+                            row["id"], previous_assignee, _pool_assignee,
+                            exc_info=True,
+                        )
+                        continue
+                row_assignee = _pool_assignee
+                result.rerouted_for_capacity.append(
+                    (row["id"], previous_assignee, _pool_assignee)
+                )
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a

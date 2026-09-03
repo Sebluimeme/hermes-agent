@@ -1015,6 +1015,43 @@ def test_parallel_complex_routes_use_coder_when_a_claude_is_unavailable(
     assert routes == [("claude1", None), ("coder", None)]
 
 
+def test_first_available_route_skips_busy_lanes_in_configured_order(
+    configured_handoff_routes,
+):
+    green = lambda route: (True, "green")
+
+    assignee, model, trace = kb.resolve_first_available_route(
+        "simple",
+        {"spark": 0, "claude2": 0, "claude1": 0, "coder": 0},
+        max_in_progress_per_profile=1,
+        preflight_fn=green,
+    )
+    assert (assignee, model) == ("spark", TEST_SPARK_MODEL_OVERRIDE)
+    assert trace[-1]["capacity_available"] is True
+
+    assignee, model, trace = kb.resolve_first_available_route(
+        "complex",
+        {"claude2": 1, "claude1": 1, "coder": 0},
+        max_in_progress_per_profile=1,
+        preflight_fn=green,
+    )
+    assert (assignee, model) == ("coder", None)
+    assert [entry["route"] for entry in trace] == ["claude2", "claude1", "coder"]
+
+
+def test_first_available_route_keeps_card_queued_when_every_lane_is_busy(
+    configured_handoff_routes,
+):
+    assignee, model, trace = kb.resolve_first_available_route(
+        "complex",
+        {"claude2": 1, "claude1": 1, "coder": 1},
+        max_in_progress_per_profile=1,
+        preflight_fn=lambda route: (True, "green"),
+    )
+    assert (assignee, model) == (None, None)
+    assert all(entry["capacity_available"] is False for entry in trace)
+
+
 def test_unknown_claude_measurement_preserves_claude_instead_of_opening_coder(
     configured_handoff_routes,
 ):
@@ -1482,6 +1519,178 @@ def test_dispatch_once_applies_routing_tier_chain_to_unassigned_ready_task(
         ).fetchall()
         payloads = [json.loads(e["payload"]) for e in events]
         assert any(p.get("source") == "routing_tier_chain" for p in payloads)
+
+
+def test_fresh_assigned_pool_task_moves_to_first_free_claude_lane(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
+    tmp_path,
+):
+    from hermes_cli import config
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"generalist_worker_pool_routing": True}},
+    )
+    monkeypatch.setattr(kb, "claude2_oauth_dispatch_guard", lambda *_args: False)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    busy_workspace = tmp_path / "busy-c2"
+    candidate_workspace = tmp_path / "candidate"
+    busy_workspace.mkdir()
+    candidate_workspace.mkdir()
+
+    with kb.connect() as conn:
+        busy = kb.create_task(
+            conn, title="busy c2", assignee="claude2",
+            routing_tier="complex", workspace_kind="dir",
+            workspace_path=str(busy_workspace),
+        )
+        first = kb.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: 41001,
+            max_in_progress_per_profile=1,
+        )
+        assert first.spawned[0][0] == busy
+
+        candidate = kb.create_task(
+            conn, title="first free claude", assignee="claude2",
+            routing_tier="complex", workspace_kind="dir",
+            workspace_path=str(candidate_workspace),
+        )
+        second = kb.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: 41002,
+            max_in_progress_per_profile=1,
+        )
+        assert second.spawned == [
+            (candidate, "claude1", str(candidate_workspace.resolve())),
+        ]
+        assert second.rerouted_for_capacity == [
+            (candidate, "claude2", "claude1"),
+        ]
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (candidate,),
+        ).fetchone()
+        assert row["assignee"] == "claude1"
+
+
+def test_fresh_assigned_pool_task_uses_coder_when_both_claudes_are_busy(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
+    tmp_path,
+):
+    from hermes_cli import config
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"generalist_worker_pool_routing": True}},
+    )
+    monkeypatch.setattr(kb, "claude2_oauth_dispatch_guard", lambda *_args: False)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+    with kb.connect() as conn:
+        for index in range(3):
+            (tmp_path / f"workspace-{index}").mkdir()
+        first_id = kb.create_task(
+            conn, title="first", assignee="claude2", routing_tier="complex",
+            workspace_kind="dir", workspace_path=str(tmp_path / "workspace-0"),
+        )
+        second_id = kb.create_task(
+            conn, title="second", assignee="claude2", routing_tier="complex",
+            workspace_kind="dir", workspace_path=str(tmp_path / "workspace-1"),
+        )
+        first_wave = kb.dispatch_once(
+            conn, spawn_fn=lambda task, *_args, **_kwargs: 42000 + (1 if task.id == first_id else 2),
+            max_spawn=2, max_in_progress_per_profile=1,
+        )
+        assert [entry[1] for entry in first_wave.spawned] == ["claude2", "claude1"]
+
+        candidate = kb.create_task(
+            conn, title="third", assignee="claude2", routing_tier="complex",
+            workspace_kind="dir", workspace_path=str(tmp_path / "workspace-2"),
+        )
+        second_wave = kb.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: 42003,
+            max_in_progress_per_profile=1,
+        )
+        assert second_wave.spawned[0][0:2] == (candidate, "coder")
+        assert second_wave.rerouted_for_capacity == [
+            (candidate, "claude2", "coder"),
+        ]
+
+
+def test_fresh_simple_pool_task_prefers_available_spark(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
+    tmp_path,
+):
+    from hermes_cli import config
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"generalist_worker_pool_routing": True}},
+    )
+    workspace = tmp_path / "simple"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="simple", assignee="claude2", routing_tier="simple",
+            workspace_kind="dir", workspace_path=str(workspace),
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: 43001,
+            max_in_progress_per_profile=1,
+        )
+        assert result.spawned[0][0:2] == (task_id, "spark")
+        row = conn.execute(
+            "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert (row["assignee"], row["model_override"]) == (
+            "spark", TEST_SPARK_MODEL_OVERRIDE,
+        )
+
+
+def test_ready_checkpoint_preserves_exact_worker_even_when_another_lane_is_free(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
+    tmp_path,
+):
+    from hermes_cli import config
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"generalist_worker_pool_routing": True}},
+    )
+    monkeypatch.setattr(kb, "claude2_oauth_dispatch_guard", lambda *_args: False)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    for name in ("busy", "resume"):
+        (tmp_path / name).mkdir()
+
+    with kb.connect() as conn:
+        kb.create_task(
+            conn, title="busy", assignee="claude2", routing_tier="complex",
+            workspace_kind="dir", workspace_path=str(tmp_path / "busy"),
+        )
+        kb.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: 44001,
+            max_in_progress_per_profile=1,
+        )
+        resumed = kb.create_task(
+            conn, title="resume", assignee="claude2", routing_tier="complex",
+            workspace_kind="dir", workspace_path=str(tmp_path / "resume"),
+        )
+        kb._synthesize_ended_run(
+            conn,
+            resumed,
+            outcome="interrupted",
+            metadata={
+                "worker_session_id": "durable-session",
+                "checkpoint": {"state": "interrupted"},
+            },
+        )
+        result = kb.dispatch_once(
+            conn, dry_run=True, max_in_progress_per_profile=1,
+        )
+        assert result.rerouted_for_capacity == []
+        assert (resumed, "claude2", 1) in result.skipped_per_profile_capped
 
 
 def test_dispatch_empty_handoff_config_preserves_default_assignee_path(
