@@ -1177,6 +1177,17 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
                             # first-class review lane. Wake the origin thread.
+                            # 2026-09-03 (t_e5cb4411): the raw ping used to
+                            # read "Kanban t_xxx ready for review — <title>"
+                            # — the exact "carte longue, jargon technique"
+                            # shape Sébastien flagged again after the
+                            # blocked/crashed/gave_up cleanups. This is a
+                            # decision-required handoff like `blocked`, so it
+                            # keeps a guaranteed direct ping (not deferred to
+                            # the wake) — only the wording changes: plain
+                            # French, no task id, no "Kanban" literal, no
+                            # board/worker tag, same shape as
+                            # `_human_block_message`.
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
                                 summary = str(ev.payload["summary"])
@@ -1190,8 +1201,9 @@ class GatewayKanbanWatchersMixin:
                                     lines[0][:200] if lines else summary[:200]
                                 )
                             msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
-                                f" — {title}{handoff}"
+                                f"👀 {title}\n"
+                                "Travail terminé, en attente de vérification "
+                                f"avant validation finale.{handoff}"
                             )
                         elif kind == "visual_review_deferred":
                             retry_at = 0
@@ -1216,19 +1228,24 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and isinstance(ev.payload.get("message"), str):
                                 msg = ev.payload["message"]
                         elif kind == "changes_requested":
+                            # 2026-09-03 (t_e5cb4411): same cleanup as
+                            # `review_requested` just above — the raw ping
+                            # used to read "Kanban t_xxx review requested
+                            # changes/BLOCK: ... — reviewer @x → implementer
+                            # @y", leaking task id, English jargon and
+                            # internal role tags into a direct chat message.
+                            # Rendered in the same clean French
+                            # Impact/Solution/Preuve shape used by
+                            # crashed/timed_out/gave_up; the reviewer's
+                            # reason is the only detail Sébastien needs.
                             payload = ev.payload or {}
                             reason = _safe_review_reason(payload.get("reason"))
-                            reviewer = _safe_review_reason(payload.get("reviewer"), 48)
-                            implementer = _safe_review_reason(payload.get("implementer"), 48)
-                            reason_text = reason or "reviewer feedback requires changes"
-                            provenance = ""
-                            if reviewer:
-                                provenance += f" — reviewer @{reviewer}"
-                            if implementer:
-                                provenance += f" → implementer @{implementer}"
+                            reason_text = reason or "la revue demande des corrections avant validation"
                             msg = (
-                                f"🛑 {board_tag}Kanban {sub['task_id']} review requested "
-                                f"changes/BLOCK: {reason_text}{provenance}"
+                                f"🛑 {title}\n"
+                                "Impact : la revue a demandé des corrections avant validation.\n"
+                                "Solution : reprise automatique par l'agent concerné.\n"
+                                f"Preuve : {reason_text}"
                             )
                             wake_review_detail = reason_text
                         elif kind == "block_loop_detected":

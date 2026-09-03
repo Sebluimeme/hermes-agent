@@ -674,8 +674,11 @@ async def test_notifier_wakes_origin_for_review_and_keeps_subscription(kanban_ho
             timeout=10.0,
         )
 
-    assert any("ready for review" in message for message in delivered)
+    # t_e5cb4411: plain French human message, no raw task id / "Kanban" jargon.
+    assert any("en attente de vérification" in message for message in delivered)
     assert any("Implementation and tests ready" in message for message in delivered)
+    assert not any(task_id in message for message in delivered)
+    assert not any("Kanban" in message for message in delivered)
     with kb.connect() as conn:
         assert kb.list_notify_subs(conn), "review is non-final; subscription must survive"
 

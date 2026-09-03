@@ -1466,7 +1466,12 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1, "the passive review ping is unchanged"
-    assert "ready for review" in adapter.sent[0]["text"]
+    # t_e5cb4411: the raw ping must read as a plain French human message —
+    # no raw task id, no "Kanban" literal, no English jargon.
+    text = adapter.sent[0]["text"]
+    assert tid not in text
+    assert "Kanban" not in text
+    assert "en attente de vérification" in text
 
     wake = _wake_text(adapter)
     assert tid in wake
