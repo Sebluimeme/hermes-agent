@@ -2420,6 +2420,38 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
 
+def test_archive_task_removes_a_blocked_needs_input_card_from_active_listing(kanban_home):
+    # Regression for t_c9b92dac: a card where Sébastien answered "do nothing"
+    # sits in ``blocked``/``needs_input`` (not ``done``) — it was never
+    # completed, it was decided against. ``archive_task`` must work from that
+    # state too, and the archived card must disappear from the default
+    # active-task listing (the same query family the TODO hub and the
+    # "attend ta réponse" recap read from), not just from a done-task cleanup
+    # path.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Vérifier la certification PEFC")
+        assert kb.block_task(conn, tid, reason="preuve absente", kind="needs_input")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.archive_task(conn, tid)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "archived"
+        # claim state is cleared on archive so a stale lock can't linger.
+        assert task.claim_lock is None
+
+        # Default listing (what the dispatcher / hub-style queries use)
+        # excludes archived tasks without needing an explicit opt-in.
+        assert tid not in {t.id for t in kb.list_tasks(conn)}
+        # Explicit opt-in still finds it — archiving hides, never deletes.
+        assert tid in {t.id for t in kb.list_tasks(conn, include_archived=True)}
+
+        # Archiving is a one-way, idempotent-safe transition: it cannot be
+        # re-applied to an already-archived task (mirrors the ``rowcount != 1``
+        # guard in ``archive_task``).
+        assert kb.archive_task(conn, tid) is False
+
+
 def test_delete_task_removes_task_and_cascades(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="to-delete", assignee="alice")
