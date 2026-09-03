@@ -28,6 +28,45 @@ from utils import normalize_proxy_url
 logger = logging.getLogger(__name__)
 
 
+_KANBAN_TECHNICAL_DETAIL_RE = re.compile(
+    r"(?:\bPID\b|\bpytest\b|\borigin/main\b|\bcommit\s+[0-9a-f]{7,40}\b|"
+    r"\b[0-9a-f]{12,40}\b|(?:^|\s)/(?:home|Users|tmp|var)/|\.tsx\b|\.py\b)",
+    re.IGNORECASE,
+)
+
+
+def _compact_kanban_notification_text(
+    content: str,
+    *,
+    title: str = "",
+    event_kind: str = "",
+    max_chars: int = 420,
+) -> str:
+    """Keep automatic Kanban updates short and non-technical.
+
+    The full worker handoff remains durable on the card. Telegram receives
+    only the useful outcome or action. This is intentionally limited to
+    synthetic Kanban wakes; ordinary user-requested technical answers are not
+    rewritten.
+    """
+    text = re.sub(r"\s+", " ", str(content or "")).strip()
+    if not text:
+        return ""
+    technical_hits = len(_KANBAN_TECHNICAL_DETAIL_RE.findall(text))
+    if technical_hits >= 1:
+        clean_title = re.sub(r"\s+", " ", str(title or "")).strip().rstrip(".")
+        prefix = (
+            "Action requise"
+            if event_kind in {"blocked", "gave_up", "block_loop_detected"}
+            else "Validé"
+        )
+        text = f"{prefix} : {clean_title}." if clean_title else f"{prefix}."
+    if len(text) <= max_chars:
+        return text
+    shortened = text[: max_chars - 1].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return shortened + "…"
+
+
 def _consume_detached_handler_exception(task: "asyncio.Task") -> None:
     """Done-callback retrieving a detached fatal-error handler's exception.
 
@@ -6635,6 +6674,28 @@ class BasePlatformAdapter(ABC):
                             self.name, len(_response_pre_extract), event.source.chat_id,
                         )
                         text_content = _recovered
+
+                # Synthetic Kanban wakes are operational turns, not a second
+                # notification channel. Intermediate review/retry events stay
+                # silent. User-relevant completions and blockers are bounded
+                # to one plain update; technical evidence remains on the card.
+                _internal_meta = event.metadata or {}
+                if (
+                    getattr(event, "internal", False)
+                    and _internal_meta.get("internal_notification_kind") == "kanban"
+                ):
+                    _delivery_policy = _internal_meta.get("user_delivery_policy")
+                    if _delivery_policy == "silent":
+                        text_content = ""
+                        images = []
+                        local_files = []
+                        media_files = []
+                    elif _delivery_policy == "concise":
+                        text_content = _compact_kanban_notification_text(
+                            text_content,
+                            title=_internal_meta.get("kanban_task_title", ""),
+                            event_kind=_internal_meta.get("kanban_event_kind", ""),
+                        )
 
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status

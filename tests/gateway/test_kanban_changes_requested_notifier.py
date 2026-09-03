@@ -101,19 +101,7 @@ def test_changes_requested_notify_wake_is_actionable_and_exactly_routed(tmp_path
 
     asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
 
-    assert len(adapter.sent) == 1
-    text = adapter.sent[0]["text"]
-    # t_e5cb4411: plain French human message — no raw task id, no "Kanban"
-    # literal, no English jargon, no internal reviewer/implementer tags.
-    assert task_id not in text
-    assert "Kanban" not in text
-    assert text.startswith("🛑 existing implementation card\n")
-    assert "Impact :" in text
-    assert "Solution :" in text
-    assert "Preuve : Tests need updates" in text
-    assert "reviewer @" not in text
-    assert "implementer @" not in text
-    assert adapter.sent[0]["metadata"]["thread_id"] == "topic-7"
+    assert adapter.sent == [], "review correction must not also emit a direct ping"
     assert len(adapter.handled) == 1
     wake = adapter.handled[0]
     assert wake.source.chat_id == "chat-1"
@@ -123,11 +111,13 @@ def test_changes_requested_notify_wake_is_actionable_and_exactly_routed(tmp_path
     assert "Inspect the existing card and its current review run" in wake.text
     assert "do not create a duplicate task" in wake.text
     assert wake.text.count("do not create a duplicate task") == 1
+    assert wake.metadata["user_delivery_policy"] == "silent"
+    assert wake.metadata["internal_notification_kind"] == "kanban"
     assert _unseen(task_id) == []
 
     # A fresh watcher after restart cannot replay an event whose cursor advanced.
     asyncio.run(_run_one_tick(monkeypatch, _runner(adapter)))
-    assert len(adapter.sent) == 1
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
 
 

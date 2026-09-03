@@ -131,6 +131,27 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    def test_warns_once_on_fourth_semantically_similar_delivery(self, caplog):
+        messages = (
+            "La note Google est toujours de 4,9 après vérification.",
+            "Vérification terminée : la note Google reste à 4,9.",
+            "La note Google demeure à 4,9 selon la dernière vérification.",
+            "Nouvelle vérification, la note Google est encore à 4,9.",
+            "La note Google reste toujours à 4,9 après contrôle.",
+        )
+
+        with caplog.at_level("WARNING", logger="gateway.delivery_ledger"):
+            for index, content in enumerate(messages):
+                oid = f"rating-{index}"
+                _record(oid=oid, platform="telegram", chat_id="general", content=content)
+                dl.mark_delivered(oid)
+
+        warnings = [
+            record for record in caplog.records
+            if "semantic delivery repetition detected" in record.message
+        ]
+        assert len(warnings) == 1
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):

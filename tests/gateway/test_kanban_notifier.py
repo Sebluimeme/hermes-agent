@@ -82,17 +82,8 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
-def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
-    """DM-topic metadata replays onto the raw ping for a `blocked` event.
-
-    Uses `blocked` (not `completed`) deliberately: since t_62e8c688, a
-    `completed` event on a push adapter with an owning session defers to the
-    wake instead of sending a raw ping at all (see
-    test_completed_event_defers_raw_ping_to_wake_synthesis below), so it no
-    longer exercises this metadata-replay path. `blocked` is an "alerte
-    pertinente" that still sends its own clean ping regardless of wake, so it
-    keeps this regression (DM-topic reply routing) covered.
-    """
+def test_kanban_notifier_replays_telegram_dm_topic_scope_on_sole_wake(tmp_path, monkeypatch):
+    """A blocked DM-topic card uses one wake in the exact original topic."""
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -128,17 +119,11 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["metadata"] == {
-        "chat_type": "dm",
-        "direct_messages_topic_id": "20197",
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": "462",
-        "thread_id": "20197",
-    }
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
     assert adapter.handled[0].source.thread_id == "20197"
+    assert adapter.handled[0].metadata["user_delivery_policy"] == "concise"
 
 
 def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
@@ -432,17 +417,10 @@ def test_gave_up_ping_has_no_raw_task_id_or_english_jargon(tmp_path, monkeypatch
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1, (
-        f"gave_up must still send exactly one guaranteed human message, got: {adapter.sent}"
-    )
-    message = adapter.sent[0]["text"]
-    assert tid not in message, "no raw task id in a direct chat message"
-    assert "Kanban" not in message, "no internal 'Kanban' jargon in a direct chat message"
-    assert "spawn failures" not in message, "no raw English worker-internal wording"
-    assert "Impact :" in message
-    assert "Solution :" in message
-    # The wake self-post still fires so the creator agent stays informed.
+    assert adapter.sent == [], "gave_up must not send a ping before its synthesis"
     assert len(adapter.handled) == 1
+    assert adapter.handled[0].metadata["user_delivery_policy"] == "concise"
+    assert adapter.handled[0].metadata["kanban_event_kind"] == "gave_up"
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
@@ -930,26 +908,11 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1, "block_loop_detected must produce a notification"
-    text = adapter.sent[0]["text"]
-    assert "TRIAGE" not in text, "no raw internal TRIAGE wording in a human message"
-    assert tid not in text, "no raw task id in a direct chat message"
-    assert "gate:" not in text, "internal gate: marker must not leak"
-    assert "Blocage :" in text, "the diagnosis must be labelled separately"
-    assert "l’appel API échoue en 403" in text, "the plain-language cause must survive"
-    assert "Identifier compte e-mail gérant API Ecobloc" in text
-    assert "Action attendue de toi :" in text
-    assert (
-        "activer l’API dans ce projet ou autoriser Hermes à le faire." in text
-    ), "the exact Ecobloc action must survive after the long technical diagnosis"
-    assert "clore la carte." in text, "the single-task action must not be truncated"
-    assert "réutili\n" not in text, "copy must never be cut in the middle of a word"
-    assert "Ensuite : Hermes reprend automatiquement" in text
-    assert "@worker" not in text, "no assignee/profile tag on a human-decision message"
-    assert "[default]" not in text, "no bracketed board-tag prefix on a human-decision message"
+    assert adapter.sent == [], "triage escalation must use the wake as its sole path"
     assert len(adapter.handled) == 1, (
-        "block_loop_detected must wake the owning Hermes conversation after notifying"
+        "block_loop_detected must wake the owning Hermes conversation"
     )
+    assert adapter.handled[0].metadata["user_delivery_policy"] == "concise"
     # Cursor advanced: the event is claimed and not re-delivered.
     conn = kb.connect()
     try:
@@ -1159,29 +1122,12 @@ def test_notifier_sends_clean_human_ping_for_blocked_task(tmp_path, monkeypatch)
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # Exactly one terminal message — not silence, not a duplicate.
-    assert len(adapter.sent) == 1, (
-        f"blocked must send exactly one human message, got: {adapter.sent}"
-    )
-    message = adapter.sent[0]["text"]
-    assert tid not in message, "no raw task id in a direct chat message"
-    assert "gate:" not in message, "internal gate: marker must not leak"
-    assert "needs the Ecobloc GSC token to continue" in message, (
-        "the plain-language reason must survive"
-    )
-    assert "Blocage :" in message
-    assert "Action attendue de toi :" in message
-    assert "Ensuite : Hermes reprend automatiquement" in message
-    assert "codex-worker" not in message, (
-        "no assignee/profile tag on a human-decision message"
-    )
-    assert "[default]" not in message, (
-        "no bracketed board-tag prefix on a human-decision message"
-    )
-
-    # The wake self-post still fires — the creator agent is still informed
-    # internally and can act (e.g. route a real button-based permission ask).
+    # One wake is the sole delivery path. Its final user-facing synthesis is
+    # compacted later by the platform delivery policy.
+    assert adapter.sent == []
     assert len(adapter.handled) == 1
+    assert adapter.handled[0].metadata["user_delivery_policy"] == "concise"
+    assert adapter.handled[0].metadata["kanban_event_kind"] == "blocked"
 
     # Cursor still advances past the blocked event — it must not be
     # redelivered forever.
@@ -1465,13 +1411,7 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1, "the passive review ping is unchanged"
-    # t_e5cb4411: the raw ping must read as a plain French human message —
-    # no raw task id, no "Kanban" literal, no English jargon.
-    text = adapter.sent[0]["text"]
-    assert tid not in text
-    assert "Kanban" not in text
-    assert "en attente de vérification" in text
+    assert adapter.sent == [], "review handoff must use the wake as its sole path"
 
     wake = _wake_text(adapter)
     assert tid in wake
@@ -1479,6 +1419,7 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
         "the worker's handoff must ride the wake turn like it does for "
         "`completed`, otherwise the woken reviewer has to re-read the board"
     )
+    assert adapter.handled[0].metadata["user_delivery_policy"] == "silent"
 
 
 def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
@@ -1518,7 +1459,7 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
+    assert adapter.sent == []
     assert tid in _wake_text(adapter)
 
 

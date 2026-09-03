@@ -59,6 +59,7 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -82,6 +83,7 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            metadata=dict(metadata or {}),
         )
         await adapter.handle_message(synth_event)
         return

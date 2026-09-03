@@ -8369,7 +8369,13 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    author: Optional[str] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
     For compatibility, calling this on an already auto-scheduled transient
@@ -8383,6 +8389,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    note = str(reason or "").strip()
+    actor = str(author or "").strip()
+    if note and not actor:
+        raise ValueError("unblock reason requires an author")
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
@@ -8444,6 +8454,23 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if note:
+            # Store the operator's decision and the state transition in the
+            # same transaction. Previously the CLI committed the comment
+            # first and called unblock separately; a crash or second writer in
+            # between left an authorized task visibly blocked.
+            body = f"UNBLOCK: {note}"
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, actor, body, now),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "commented",
+                {"author": actor, "len": len(body)},
+            )
         _append_event(
             conn, task_id, "unblocked",
             (

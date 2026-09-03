@@ -53,6 +53,21 @@ def test_adapter_supports_push_default_true():
     assert adapter_supports_push(ApiServerLikeAdapter()) is False
 
 
+def test_push_wake_preserves_internal_delivery_policy_metadata():
+    adapter = PushAdapter()
+
+    asyncio.run(deliver_wake(
+        adapter,
+        text="internal review handoff",
+        source=_source(),
+        metadata={"user_delivery_policy": "silent"},
+    ))
+
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].internal is True
+    assert adapter.handled[0].metadata["user_delivery_policy"] == "silent"
+
+
 async def _serve(handler):
     """Spin an in-process aiohttp server on an ephemeral loopback port."""
     from aiohttp import web
@@ -123,5 +138,4 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
-
 

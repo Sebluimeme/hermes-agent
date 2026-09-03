@@ -1324,6 +1324,30 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
+
+                        # A notify+wake subscription used to emit two visible
+                        # updates for the same state change: the direct Kanban
+                        # ping here, then the creator session's synthesis after
+                        # the wake below.  When a push-capable origin session is
+                        # available, make that synthesis the sole delivery for
+                        # every event that wakes it.  Notify-only subscriptions
+                        # and sessionless legacy cards keep their direct ping.
+                        # Intermediate review/retry wakes are marked silent
+                        # below, so they continue orchestration without adding
+                        # chatter to the user's topic.
+                        if kind in {
+                            "blocked", "gave_up", "review_requested",
+                            "changes_requested", "block_loop_detected",
+                        }:
+                            from gateway.wake import adapter_supports_push as _single_delivery_push_ok
+                            if (
+                                wake_agent
+                                and _single_delivery_push_ok(adapter)
+                                and task
+                                and getattr(task, "session_id", None)
+                            ):
+                                _completed_defers_to_wake = True
+                                continue
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
@@ -1631,11 +1655,35 @@ class GatewayKanbanWatchersMixin:
                             # push-capable adapters (the non-push /
                             # self-post branch is handled BEFORE the
                             # cursor advance above).
+                            # Intermediate transitions that do not require a
+                            # decision remain available to the orchestrator but
+                            # must not produce a user-facing Telegram message.
+                            # A completion or a genuine human block gets one
+                            # short synthesis, never a raw ping plus a synthesis.
+                            _visible_kinds = {"completed", "blocked", "gave_up", "block_loop_detected"}
+                            _delivery_policy = (
+                                "concise" if _wake_kinds & _visible_kinds else "silent"
+                            )
+                            _primary_kind = next(
+                                (
+                                    candidate for candidate in (
+                                        "blocked", "gave_up", "block_loop_detected", "completed"
+                                    )
+                                    if candidate in _wake_kinds
+                                ),
+                                "intermediate",
+                            )
                             await deliver_wake(
                                 adapter,
                                 text=_synth,
                                 session_id=_session_key,
                                 source=_source,
+                                metadata={
+                                    "internal_notification_kind": "kanban",
+                                    "user_delivery_policy": _delivery_policy,
+                                    "kanban_event_kind": _primary_kind,
+                                    "kanban_task_title": title,
+                                },
                             )
                             logger.info(
                                 "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",

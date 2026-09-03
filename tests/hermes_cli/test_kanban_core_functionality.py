@@ -605,6 +605,55 @@ def test_unblock_invariant_recovery(kanban_home):
         conn.close()
 
 
+def test_unblock_reason_and_state_change_are_atomic(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="publish authorized", assignee="worker")
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="publication needs the operator's approval",
+            kind="needs_input",
+        )
+
+        assert kb.unblock_task(
+            conn,
+            tid,
+            reason="Sébastien autorise la publication",
+            author="default",
+        )
+
+        assert kb.get_task(conn, tid).status == "ready"
+        comments = kb.list_comments(conn, tid)
+        assert comments[-1].body == "UNBLOCK: Sébastien autorise la publication"
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 2",
+            (tid,),
+        ).fetchall()
+        assert [row["kind"] for row in events] == ["unblocked", "commented"]
+    finally:
+        conn.close()
+
+
+def test_unblock_reason_is_not_written_when_transition_fails(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="already ready", assignee="worker")
+        before = kb.list_comments(conn, tid)
+
+        assert kb.unblock_task(
+            conn,
+            tid,
+            reason="must not become an orphan comment",
+            author="default",
+        ) is False
+
+        assert kb.list_comments(conn, tid) == before
+        assert kb.get_task(conn, tid).status == "ready"
+    finally:
+        conn.close()
+
+
 def test_migration_backfill_idempotent_under_re_run(tmp_path, monkeypatch):
     """init_db must be safe to re-run repeatedly. Each call should leave
     at most one run row per in-flight task, even if called while a
@@ -1406,5 +1455,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

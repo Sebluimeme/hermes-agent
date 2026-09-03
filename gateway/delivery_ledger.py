@@ -45,9 +45,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -64,6 +66,20 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+
+# A repeated semantic subject is usually a routing/deduplication regression,
+# not a delivery failure.  Keep this detector internal: it warns operators but
+# never blocks or changes a user-visible send.
+_SEMANTIC_REPEAT_WINDOW_SECONDS = 2 * 60 * 60
+_SEMANTIC_REPEAT_THRESHOLD = 4
+_SEMANTIC_STOP_WORDS = frozenset(
+    {
+        "alors", "avec", "cette", "dans", "des", "elle", "est", "etre",
+        "fait", "les", "mais", "nous", "pour", "que", "qui", "sur", "une",
+        "vous", "votre", "the", "this", "that", "with", "from", "your",
+        "completed", "complete", "terminee", "termine", "valide", "validee",
+    }
+)
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -264,6 +280,10 @@ def mark_attempting(obligation_id: str) -> None:
 
 def mark_delivered(obligation_id: str) -> None:
     _update_state(obligation_id, "delivered")
+    try:
+        _warn_on_semantic_repeat(obligation_id)
+    except Exception:
+        logger.debug("semantic delivery-repeat check failed", exc_info=True)
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
@@ -303,6 +323,70 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
                SET state=?, updated_at=?, last_error=?
                WHERE obligation_id=?""",
             (state, time.time(), error[:500] if error else None, obligation_id),
+        )
+
+
+def _semantic_terms(content: str) -> frozenset[str]:
+    """Return stable, accent-insensitive terms for coarse repeat detection."""
+    normalized = unicodedata.normalize("NFKD", str(content or ""))
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    return frozenset(
+        term
+        for term in re.findall(r"[a-z0-9]+", ascii_text)
+        if len(term) >= 3 and term not in _SEMANTIC_STOP_WORDS
+    )
+
+
+def _semantically_similar(left: str, right: str) -> bool:
+    left_terms = _semantic_terms(left)
+    right_terms = _semantic_terms(right)
+    if not left_terms or not right_terms:
+        return False
+    shared = left_terms & right_terms
+    return len(shared) >= 2 and len(shared) / min(len(left_terms), len(right_terms)) >= 0.5
+
+
+def _warn_on_semantic_repeat(obligation_id: str) -> None:
+    """Warn once when a destination receives a fourth similar recent message."""
+    with _DB_LOCK, _transaction() as conn:
+        current = conn.execute(
+            """SELECT platform, chat_id, thread_id, content, updated_at
+               FROM delivery_obligations
+               WHERE obligation_id=? AND state='delivered'""",
+            (obligation_id,),
+        ).fetchone()
+        if current is None:
+            return
+        platform, chat_id, thread_id, content, delivered_at = current
+        candidates = conn.execute(
+            """SELECT content FROM delivery_obligations
+               WHERE obligation_id<>? AND state='delivered'
+                 AND platform=? AND chat_id=? AND thread_id IS ?
+                 AND updated_at>=?
+               ORDER BY updated_at DESC LIMIT 50""",
+            (
+                obligation_id,
+                platform,
+                chat_id,
+                thread_id,
+                delivered_at - _SEMANTIC_REPEAT_WINDOW_SECONDS,
+            ),
+        ).fetchall()
+
+    similar_count = 1 + sum(
+        1 for (candidate,) in candidates if _semantically_similar(content, candidate)
+    )
+    if similar_count == _SEMANTIC_REPEAT_THRESHOLD:
+        fingerprint = hashlib.sha256(
+            " ".join(sorted(_semantic_terms(content))).encode("utf-8")
+        ).hexdigest()[:12]
+        logger.warning(
+            "semantic delivery repetition detected: count=%s target=%s:%s:%s fingerprint=%s",
+            similar_count,
+            platform,
+            chat_id,
+            thread_id or "-",
+            fingerprint,
         )
 
 
