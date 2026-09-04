@@ -698,6 +698,61 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_exponentially_backs_off_repeated_unknown_quota(
+    kanban_home, monkeypatch,
+):
+    """A final route without reset evidence must not probe every five minutes."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="repeated quota", assignee="coder")
+        for ended_at in (now - 400, now):
+            conn.execute(
+                "INSERT INTO task_runs(task_id, profile, status, started_at, ended_at, outcome) "
+                "VALUES (?, 'coder', 'rate_limited', ?, ?, 'rate_limited')",
+                (tid, ended_at - 10, ended_at),
+            )
+        conn.execute(
+            "UPDATE tasks SET status='ready', last_failure_error='HTTP 429 quota wall' "
+            "WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 500)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 700)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_provider_reset_blocks_profile_globally_until_explicit_deadline(
+    kanban_home, monkeypatch,
+):
+    cooldowns = kanban_home / "state" / "provider-error-cooldowns.json"
+    monkeypatch.setenv("HERMES_KANBAN_PROVIDER_COOLDOWNS_PATH", str(cooldowns))
+    received = 10_000.0
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="coder reset", assignee="coder")
+        captured = kb.capture_provider_reset(
+            conn,
+            tid,
+            "HTTP status: 429 retry-after: 600 seconds",
+            received_at=received,
+        )
+        conn.commit()
+
+    assert captured is not None
+    assert captured["route"] == "coder"
+    assert captured["reset_source"] == "api_retry_after"
+    assert kb.route_preflight_ok("coder", now=received + 599) == (
+        False,
+        "provider_cooldown",
+    )
+    assert kb.route_preflight_ok("coder", now=received + 601)[0] is True
+
+
 def test_respawn_guard_does_not_transfer_rate_limit_to_new_profile(
     kanban_home, monkeypatch,
 ):

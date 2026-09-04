@@ -21670,7 +21670,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         try:
             from hermes_cli.kanban_db import (
                 KANBAN_RATE_LIMIT_EXIT_CODE,
-                capture_claude_provider_reset,
+                capture_provider_reset,
                 connect,
                 write_txn,
             )
@@ -21678,7 +21678,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             try:
                 with connect() as conn:
                     with write_txn(conn):
-                        capture_claude_provider_reset(conn, task_id, error)
+                        capture_provider_reset(conn, task_id, error)
             except Exception:
                 # Best-effort observability only; must never block the exit.
                 pass
@@ -21722,7 +21722,7 @@ def _single_query_exit_code(result: object) -> int:
         try:
             from hermes_cli.kanban_db import (
                 KANBAN_RATE_LIMIT_EXIT_CODE,
-                capture_claude_provider_reset,
+                capture_provider_reset,
                 connect,
                 write_txn,
             )
@@ -21738,7 +21738,7 @@ def _single_query_exit_code(result: object) -> int:
                 try:
                     with connect() as conn:
                         with write_txn(conn):
-                            capture_claude_provider_reset(conn, task_id, error)
+                            capture_provider_reset(conn, task_id, error)
                 except Exception:
                     # Exit classification is safety-critical; observability is
                     # best-effort and must never turn a clean EX_TEMPFAIL into

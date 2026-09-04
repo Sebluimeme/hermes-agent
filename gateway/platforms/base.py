@@ -6574,6 +6574,7 @@ class BasePlatformAdapter(ABC):
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            _delivery_intentionally_silent = False
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
@@ -6686,6 +6687,7 @@ class BasePlatformAdapter(ABC):
                 ):
                     _delivery_policy = _internal_meta.get("user_delivery_policy")
                     if _delivery_policy == "silent":
+                        _delivery_intentionally_silent = True
                         text_content = ""
                         images = []
                         local_files = []
@@ -7075,7 +7077,11 @@ class BasePlatformAdapter(ABC):
                     delivery_attempted or _tts_caption_delivered
                     or images or local_files or media_files
                 )
-                if not _anything_delivered and _response_pre_extract.strip():
+                if (
+                    not _anything_delivered
+                    and _response_pre_extract.strip()
+                    and not _delivery_intentionally_silent
+                ):
                     logger.error(
                         "[%s] response_delivery_dropped: non-empty response "
                         "(%d chars) produced no delivered message or attachment "
@@ -7084,7 +7090,11 @@ class BasePlatformAdapter(ABC):
                     )
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (
+                delivery_succeeded
+                if delivery_attempted
+                else not bool(response) or _delivery_intentionally_silent
+            )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(

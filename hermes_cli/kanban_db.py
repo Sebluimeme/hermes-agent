@@ -9691,10 +9691,97 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # without thrashing. Overridable via ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``
 # for operators who want a tighter/looser probe cadence.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
+MAX_RATE_LIMIT_COOLDOWN_SECONDS = 6 * 3600
 
 # Claude capacity is external evidence.  A missing, unobserved or expired
 # measurement must never be treated as permission to dispatch.
 QUOTA_ROUTING_STATE_PATH = "state/ai-quota-routing.json"
+PROVIDER_ERROR_COOLDOWNS_PATH = "state/provider-error-cooldowns.json"
+
+
+def _provider_error_cooldowns_path() -> Path:
+    return Path(
+        os.environ.get("HERMES_KANBAN_PROVIDER_COOLDOWNS_PATH", "").strip()
+        or str(kanban_home() / PROVIDER_ERROR_COOLDOWNS_PATH)
+    )
+
+
+def _persist_provider_error_cooldown(
+    profile: str,
+    *,
+    reset_at: dt.datetime,
+    observed_at: dt.datetime,
+    source: str,
+) -> None:
+    """Persist an API-sourced provider wall independently of UI telemetry."""
+    path = _provider_error_cooldowns_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        try:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    payload = {}
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            records = payload.setdefault("profiles", {})
+            previous = records.get(profile) if isinstance(records, dict) else None
+            previous_deadline = None
+            if isinstance(previous, dict):
+                try:
+                    previous_deadline = dt.datetime.fromisoformat(
+                        str(previous.get("cooldown_until", "")).replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    previous_deadline = None
+            if previous_deadline is None or reset_at >= previous_deadline:
+                records[profile] = {
+                    "dispatch_allowed": False,
+                    "reason": "provider_cooldown",
+                    "source": source,
+                    "observed_at": observed_at.isoformat(),
+                    "cooldown_until": reset_at.isoformat(),
+                }
+            tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        finally:
+            try:
+                import fcntl
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+
+
+def provider_error_cooldown(
+    profile: Optional[str], *, now: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    """Return a still-active provider-reported cooldown for ``profile``."""
+    if not profile:
+        return None
+    try:
+        payload = json.loads(_provider_error_cooldowns_path().read_text(encoding="utf-8"))
+        record = (payload.get("profiles") or {}).get(profile)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    try:
+        deadline = dt.datetime.fromisoformat(
+            str(record.get("cooldown_until", "")).replace("Z", "+00:00")
+        ).timestamp()
+    except ValueError:
+        return None
+    return record if (time.time() if now is None else now) < deadline else None
 
 
 # --- Routing tiers (t_8e9eedfa LOT 1) ----------------------------------
@@ -9753,6 +9840,8 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
       of failure is handled entirely by the existing respawn-guard /
       consecutive-failures machinery, never by this preflight.
     """
+    if provider_error_cooldown(route, now=now) is not None:
+        return (False, "provider_cooldown")
     if route in ("claude1", "claude2"):
         reason = quota_dispatch_guard(route, now=now)
         return (reason is None, reason or "fresh_available")
@@ -10120,6 +10209,8 @@ def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None
     a provider quota wall, the worker exits with the rate-limit sentinel and
     the normal fallback chain advances with concrete provider evidence.
     """
+    if provider_error_cooldown(assignee, now=now) is not None:
+        return "provider_cooldown"
     if assignee not in {"claude1", "claude2"}:
         return None
     path = Path(os.environ.get("HERMES_KANBAN_QUOTA_ROUTING_PATH", "").strip() or (kanban_home() / QUOTA_ROUTING_STATE_PATH))
@@ -11654,10 +11745,10 @@ def _latest_spawn_resolution(conn: sqlite3.Connection, task_id: str) -> tuple[Op
     return None, None
 
 
-def capture_claude_provider_reset(
+def capture_provider_reset(
     conn: sqlite3.Connection, task_id: str, error: str, *, received_at: Optional[float] = None
 ) -> Optional[dict[str, Any]]:
-    """Persist a secret-free provider failure observation before a Claude relay.
+    """Persist a secret-free provider failure observation before a relay.
 
     Only explicit provider reset evidence is converted to ``reset_at``.  A
     duration is anchored to the wall-clock receipt time; quota gauges and
@@ -11669,7 +11760,7 @@ def capture_claude_provider_reset(
     if task is None:
         return None
     role = _route_role_for_assignment(task["assignee"], task["model_override"])
-    if role not in ("claude2", "claude1"):
+    if role not in ("claude2", "claude1", "spark", "coder"):
         return None
     received = float(time.time() if received_at is None else received_at)
     received_dt = dt.datetime.fromtimestamp(received, tz=dt.timezone.utc)
@@ -11677,7 +11768,8 @@ def capture_claude_provider_reset(
     code_match = _PROVIDER_CODE_RE.search(error)
     model, provider = _latest_spawn_resolution(conn, task_id)
     payload: dict[str, Any] = {
-        "claude_role": role,
+        "route": role,
+        "claude_role": role if role in ("claude2", "claude1") else None,
         "http_status": int(status_match.group(1)) if status_match else None,
         "error_code": code_match.group(1)[:80] if code_match else None,
         "model_resolved": model,
@@ -11709,8 +11801,27 @@ def capture_claude_provider_reset(
             if delay_seconds is not None and delay_seconds >= 0:
                 payload["reset_at"] = (received_dt + dt.timedelta(seconds=delay_seconds)).isoformat()
                 payload["reset_source"] = "api_retry_after"
-    _append_event(conn, task_id, "claude_provider_reset", payload)
+    _append_event(conn, task_id, "provider_reset_observed", payload)
+    if role in ("claude2", "claude1"):
+        _append_event(conn, task_id, "claude_provider_reset", payload)
+    if payload["reset_at"] is not None:
+        reset_at = dt.datetime.fromisoformat(
+            str(payload["reset_at"]).replace("Z", "+00:00")
+        )
+        _persist_provider_error_cooldown(
+            role,
+            reset_at=reset_at,
+            observed_at=received_dt,
+            source=str(payload["reset_source"] or "provider_error"),
+        )
     return payload
+
+
+def capture_claude_provider_reset(
+    conn: sqlite3.Connection, task_id: str, error: str, *, received_at: Optional[float] = None
+) -> Optional[dict[str, Any]]:
+    """Backward-compatible alias for callers predating all-route capture."""
+    return capture_provider_reset(conn, task_id, error, received_at=received_at)
 
 
 def _relay_to_coder_message(conn: sqlite3.Connection, task_id: str) -> str:
@@ -12681,7 +12792,20 @@ def check_respawn_guard(
             # re-trap the task.
             return None
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        streak = 0
+        for prior in conn.execute(
+            "SELECT outcome, profile FROM task_runs WHERE task_id = ? "
+            "AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 32",
+            (task_id,),
+        ).fetchall():
+            if prior["outcome"] != "rate_limited" or prior["profile"] != row["assignee"]:
+                break
+            streak += 1
+        effective_cooldown = min(
+            MAX_RATE_LIMIT_COOLDOWN_SECONDS,
+            rl_cooldown * (2 ** max(0, streak - 1)),
+        )
+        if ended_at is not None and (now - int(ended_at)) < effective_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
@@ -12813,6 +12937,10 @@ def _has_spawnable_unoccupied(
 
     for row in rows:
         if profile_exists is not None and not profile_exists(row["assignee"]):
+            continue
+        if quota_dispatch_guard(row["assignee"]) is not None:
+            continue
+        if check_respawn_guard(conn, row["id"], lane=status) is not None:
             continue
         if (
             per_profile_cap is not None

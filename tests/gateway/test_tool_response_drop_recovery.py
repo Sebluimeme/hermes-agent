@@ -205,6 +205,34 @@ class TestUnrecoverableDropIsLoud:
         ), [r.getMessage() for r in caplog.records]
 
 
+class TestIntentionalInternalSilence:
+    @pytest.mark.asyncio
+    async def test_silent_kanban_wake_is_not_reported_as_dropped(self, caplog):
+        adapter = _DummyAdapter(Platform.TELEGRAM)
+        adapter._keep_typing = _hold_typing
+
+        async def handler(_event):
+            return "Internal retry inspected; no user update is due."
+
+        adapter.set_message_handler(handler)
+        event = _make_event(Platform.TELEGRAM)
+        event.internal = True
+        event.metadata = {
+            "internal_notification_kind": "kanban",
+            "user_delivery_policy": "silent",
+        }
+        with caplog.at_level(logging.ERROR, logger="gateway.platforms.base"):
+            await adapter._process_message_background(
+                event, build_session_key(event.source)
+            )
+
+        assert adapter.sent == []
+        assert not any(
+            "response_delivery_dropped" in r.getMessage()
+            for r in caplog.records
+        )
+
+
 # ===========================================================================
 # Issue #44212: post-/stop stale interrupt silently swallows the next message
 # ===========================================================================
