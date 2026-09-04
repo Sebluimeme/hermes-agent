@@ -903,6 +903,36 @@ def test_create_task_rejects_invalid_routing_tier(kanban_home):
             kb.create_task(conn, title="bad", assignee="a", routing_tier="urgent")
 
 
+def test_create_task_rejects_read_only_analysis_on_shared_workspace_root(kanban_home):
+    shared_workspace = kanban_home / "workspace"
+    shared_workspace.mkdir()
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="cannot reserve the shared Hermes workspace root"):
+            kb.create_task(
+                conn,
+                title="Établir une preuve du TTL",
+                body="Enquêter en lecture seule et ne pas modifier Firebase.",
+                assignee="claude2",
+                workspace_kind="dir",
+                workspace_path=str(shared_workspace),
+            )
+
+
+def test_create_task_allows_exact_workspace_for_read_only_analysis(kanban_home):
+    exact_workspace = kanban_home / "workspace" / "ecobloc"
+    exact_workspace.mkdir(parents=True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Vérifier le TTL",
+            body="Contrôle en lecture seule.",
+            assignee="claude2",
+            workspace_kind="dir",
+            workspace_path=str(exact_workspace),
+        )
+    assert task_id.startswith("t_")
+
+
 def test_route_preflight_ok_reads_claude_from_quota_cache(kanban_home, monkeypatch):
     routing = kanban_home / "state" / "ai-quota-routing.json"
     routing.parent.mkdir(parents=True)
@@ -1224,6 +1254,41 @@ def test_dispatch_serializes_two_tasks_sharing_the_same_workspace(
     assert second_task is not None and second_task.status == "ready"
     assert spawnable_while_first_runs is False
     assert spawned == [(first, str(workspace.resolve()))]
+    with kb.connect() as conn:
+        waits = [
+            event for event in kb.list_events(conn, second)
+            if event.kind == "workspace_wait_started"
+        ]
+    assert len(waits) == 1
+    assert waits[0].payload == {
+        "workspace": str(workspace.resolve()),
+        "owner_task_id": first,
+    }
+
+
+def test_workspace_wait_events_are_deduplicated_and_measure_duration(kanban_home):
+    workspace = kanban_home / "busy"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="waiting", assignee="coder")
+        kb._start_workspace_wait(conn, task_id, str(workspace), "t_owner")
+        kb._start_workspace_wait(conn, task_id, str(workspace), "t_owner")
+        started = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_wait_started"
+        ]
+        assert len(started) == 1
+
+        kb._end_workspace_wait(conn, task_id)
+        ended = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "workspace_wait_ended"
+        ]
+
+    assert len(ended) == 1
+    assert ended[0].payload["owner_task_id"] == "t_owner"
+    assert ended[0].payload["workspace"] == str(workspace)
+    assert ended[0].payload["wait_seconds"] >= 0
 
 
 def test_health_probe_ignores_ready_work_for_a_profile_at_capacity(

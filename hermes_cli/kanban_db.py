@@ -153,6 +153,16 @@ TRANSIENT_RETRY_DELAY_SECONDS = 10
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+_ANALYSIS_ONLY_TITLE_PREFIXES = (
+    "analyse ", "analyser ", "analyze ", "audit ", "auditer ",
+    "établir une preuve", "etablir une preuve", "investiguer ",
+    "vérifier ", "verifier ",
+)
+_READ_ONLY_MARKERS = (
+    "lecture seule", "read-only", "read only", "ne pas modifier",
+    "aucune modification",
+)
+
 _BLOCK_REASON_PLACEHOLDERS = {
     "test",
     "test reason simple",
@@ -3749,6 +3759,31 @@ def mark_task_delivered(conn: sqlite3.Connection, task_id: str) -> bool:
     return True
 
 
+def _validate_analysis_workspace_scope(
+    title: str,
+    body: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+) -> None:
+    """Reject a read-only analysis that would serialize every Hermes project."""
+    if workspace_kind != "dir" or not workspace_path:
+        return
+    try:
+        candidate = Path(workspace_path).expanduser().resolve()
+        shared_workspace = (kanban_home() / "workspace").resolve()
+    except OSError:
+        return
+    normalized_title = " ".join((title or "").casefold().split())
+    normalized_body = " ".join((body or "").casefold().split())
+    analysis_title = normalized_title.startswith(_ANALYSIS_ONLY_TITLE_PREFIXES)
+    read_only_contract = any(marker in normalized_body for marker in _READ_ONLY_MARKERS)
+    if candidate == shared_workspace and analysis_title and read_only_contract:
+        raise ValueError(
+            "read-only analysis cannot reserve the shared Hermes workspace root; "
+            "use workspace_kind='scratch' or the exact repository/directory that may change"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -4075,6 +4110,10 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    _validate_analysis_workspace_scope(
+        title, body, workspace_kind, workspace_path,
+    )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -5161,6 +5200,55 @@ def _append_state_event_if_changed(
         return False
     _append_event(conn, task_id, kind, payload)
     return True
+
+
+def _start_workspace_wait(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: str,
+    owner_task_id: str,
+) -> None:
+    """Persist one open workspace wait instead of one event per dispatch tick."""
+    latest = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('workspace_wait_started', 'workspace_wait_ended') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    payload = {"workspace": workspace, "owner_task_id": owner_task_id}
+    encoded = json.dumps(payload, ensure_ascii=False)
+    if (
+        latest is not None
+        and latest["kind"] == "workspace_wait_started"
+        and latest["payload"] == encoded
+    ):
+        return
+    with write_txn(conn):
+        _append_event(conn, task_id, "workspace_wait_started", payload)
+
+
+def _end_workspace_wait(conn: sqlite3.Connection, task_id: str) -> None:
+    """Close an outstanding workspace wait when the card is actually claimed."""
+    latest = conn.execute(
+        "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? "
+        "AND kind IN ('workspace_wait_started', 'workspace_wait_ended') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is None or latest["kind"] != "workspace_wait_started":
+        return
+    try:
+        started_payload = json.loads(latest["payload"] or "{}")
+    except (TypeError, ValueError):
+        started_payload = {}
+    now = int(time.time())
+    payload = {
+        **started_payload,
+        "started_at": int(latest["created_at"]),
+        "wait_seconds": max(0, now - int(latest["created_at"])),
+    }
+    with write_txn(conn):
+        _append_event(conn, task_id, "workspace_wait_ended", payload)
 
 
 def _end_run(
@@ -13565,6 +13653,10 @@ def _dispatch_once_locked(
                 row["id"], row_workspace_key,
                 occupied_by,
             ))
+            if not dry_run:
+                _start_workspace_wait(
+                    conn, row["id"], row_workspace_key, occupied_by,
+                )
             continue
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -13839,6 +13931,7 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        _end_workspace_wait(conn, claimed.id)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -13945,6 +14038,10 @@ def _dispatch_once_locked(
                 row["id"], row_workspace_key,
                 occupied_by,
             ))
+            if not dry_run:
+                _start_workspace_wait(
+                    conn, row["id"], row_workspace_key, occupied_by,
+                )
             continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
@@ -14006,6 +14103,7 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        _end_workspace_wait(conn, claimed.id)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
