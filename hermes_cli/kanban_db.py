@@ -11897,11 +11897,15 @@ def fallback_simple_route(
     # The provider observation must precede every transition to a different
     # writer, so a final Coder relay can only cite the Claude attempt that failed.
     current_role = chain[current_index][0]
-    capture_claude_provider_reset(conn, task_id, error)
     idx = current_index
     is_opus = bool(row["model_override"] and "opus" in row["model_override"].casefold())
     if is_opus and current_role == "claude1":
-        return False  # an explicit Opus task may not degrade to Coder/Sonnet
+        # An explicit Opus task may not degrade to Coder/Sonnet. The provider
+        # error was already captured by the exiting worker; dispatcher ticks
+        # that merely observe its global cooldown must not append the same
+        # provider-reset evidence every ten seconds.
+        return False
+    capture_claude_provider_reset(conn, task_id, error)
     if idx + 1 >= len(chain):
         return False  # already on the last hop (Coder) -- nothing further to try
     next_assignee, next_model = chain[idx + 1]

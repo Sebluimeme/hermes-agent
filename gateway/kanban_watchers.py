@@ -171,6 +171,27 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     return reason
 
 
+def _mission_completion_is_intermediate(task_id: str, board_slug: Optional[str]) -> bool:
+    """Return True when a completed card belongs to a mission still in flight."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing(board=board_slug or "default") as conn:
+        row = conn.execute(
+            "SELECT mission_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        mission_id = row["mission_id"] if row else None
+        if not mission_id:
+            return False
+        open_row = conn.execute(
+            """SELECT 1 FROM tasks
+               WHERE mission_id=? AND queue_class='active' AND id<>?
+                 AND status NOT IN ('done','archived')
+               LIMIT 1""",
+            (mission_id, task_id),
+        ).fetchone()
+        return open_row is not None
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -973,6 +994,20 @@ class GatewayKanbanWatchersMixin:
                     # site below; it now means "a wake-deferred event was seen
                     # in this batch", not just "completed" specifically.
                     _completed_defers_to_wake = False
+                    _silent_intermediate_completion = False
+                    if any(ev.kind == "completed" for ev in d["events"]):
+                        try:
+                            _silent_intermediate_completion = await asyncio.to_thread(
+                                _mission_completion_is_intermediate,
+                                sub["task_id"],
+                                board_slug,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "kanban notifier: mission completion lookup failed for %s",
+                                sub["task_id"],
+                                exc_info=True,
+                            )
                     wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
@@ -1004,6 +1039,12 @@ class GatewayKanbanWatchersMixin:
                                 f"{continuation}"
                             )
                         elif kind == "completed":
+                            # A multi-card mission reports one conclusion when
+                            # its final active card closes. Intermediate card
+                            # completions advance their cursor silently; the
+                            # dispatcher already starts dependent work.
+                            if _silent_intermediate_completion:
+                                continue
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -1496,7 +1537,14 @@ class GatewayKanbanWatchersMixin:
                             "block_loop_detected",
                         )
                         _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            {
+                                ev.kind for ev in d["events"]
+                                if ev.kind in _WAKE_KINDS
+                                and not (
+                                    ev.kind == "completed"
+                                    and _silent_intermediate_completion
+                                )
+                            }
                             if wake_agent
                             else set()
                         )

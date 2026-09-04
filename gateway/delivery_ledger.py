@@ -72,6 +72,8 @@ _MAX_ROWS = 500
 # never blocks or changes a user-visible send.
 _SEMANTIC_REPEAT_WINDOW_SECONDS = 2 * 60 * 60
 _SEMANTIC_REPEAT_THRESHOLD = 4
+_SEMANTIC_SUPPRESSION_WINDOW_SECONDS = 10 * 60
+_SEMANTIC_SUPPRESSION_MAX_CHARS = 280
 _SEMANTIC_STOP_WORDS = frozenset(
     {
         "alors", "avec", "cette", "dans", "des", "elle", "est", "etre",
@@ -344,6 +346,39 @@ def _semantically_similar(left: str, right: str) -> bool:
         return False
     shared = left_terms & right_terms
     return len(shared) >= 2 and len(shared) / min(len(left_terms), len(right_terms)) >= 0.5
+
+
+def has_recent_semantic_delivery(
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    content: str,
+    now: Optional[float] = None,
+) -> bool:
+    """Return True for a recent short status update with the same meaning.
+
+    This is deliberately narrower than the diagnostic repeat detector: it is
+    used only by the gateway for synthetic Kanban summaries. Long conclusions
+    are never suppressed, and the destination/topic must match exactly.
+    """
+    candidate = str(content or "").strip()
+    if not candidate or len(candidate) > _SEMANTIC_SUPPRESSION_MAX_CHARS:
+        return False
+    cutoff = (time.time() if now is None else float(now)) - _SEMANTIC_SUPPRESSION_WINDOW_SECONDS
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT content FROM delivery_obligations
+               WHERE state='delivered' AND platform=? AND chat_id=?
+                 AND thread_id IS ? AND updated_at>=?
+               ORDER BY updated_at DESC LIMIT 30""",
+            (platform, str(chat_id), str(thread_id) if thread_id else None, cutoff),
+        ).fetchall()
+    return any(
+        len(str(previous or "").strip()) <= _SEMANTIC_SUPPRESSION_MAX_CHARS
+        and _semantically_similar(candidate, str(previous or ""))
+        for (previous,) in rows
+    )
 
 
 def _warn_on_semantic_repeat(obligation_id: str) -> None:

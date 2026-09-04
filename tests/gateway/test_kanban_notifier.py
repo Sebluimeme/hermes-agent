@@ -279,7 +279,58 @@ def test_completed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch
         )
     finally:
         conn.close()
+
     assert remaining == []
+
+
+def test_intermediate_mission_completion_advances_silently(tmp_path, monkeypatch):
+    """Only the final card of a multi-card mission wakes the user-facing session."""
+    db_path = tmp_path / "mission-intermediate-completion.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        mission_id = kb.ensure_mission(
+            conn,
+            title="Validation en plusieurs passes",
+            request_text="Valider puis synthétiser",
+        )
+        first = kb.create_task(
+            conn,
+            title="Première revue",
+            assignee="worker",
+            mission_id=mission_id,
+            session_id="agent:main:telegram:group:chat-1",
+        )
+        kb.create_task(
+            conn,
+            title="Synthèse finale",
+            assignee="worker",
+            mission_id=mission_id,
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=first,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_mode="notify+wake",
+        )
+        assert kb.complete_task(
+            conn,
+            first,
+            summary="Première revue terminée",
+            metadata={"evidence": {"kind": "test", "detail": "revue vérifiée"}},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    assert _unseen_terminal_events(first) == []
 
 
 def test_crashed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):

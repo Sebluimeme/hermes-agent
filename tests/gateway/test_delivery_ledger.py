@@ -152,6 +152,42 @@ class TestStateMachine:
         ]
         assert len(warnings) == 1
 
+    def test_recent_short_semantic_delivery_is_suppressed_only_in_same_topic(self):
+        _record(
+            oid="prior-status",
+            platform="telegram",
+            chat_id="general",
+            thread_id="4",
+            content="La partie SEO est arrêtée, je reste uniquement sur le plan Piscines.",
+        )
+        dl.mark_delivered("prior-status")
+
+        assert dl.has_recent_semantic_delivery(
+            platform="telegram",
+            chat_id="general",
+            thread_id="4",
+            content="Le plan Piscines reste la seule priorité active.",
+        )
+        assert not dl.has_recent_semantic_delivery(
+            platform="telegram",
+            chat_id="general",
+            thread_id="5",
+            content="Le plan Piscines reste la seule priorité active.",
+        )
+
+    def test_long_kanban_conclusion_is_never_semantically_suppressed(self):
+        _record(
+            oid="prior-long",
+            content="Piscines " + ("résultat vérifié " * 30),
+        )
+        dl.mark_delivered("prior-long")
+        assert not dl.has_recent_semantic_delivery(
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id=None,
+            content="Piscines " + ("résultat vérifié " * 30),
+        )
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):

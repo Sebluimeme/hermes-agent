@@ -2482,6 +2482,31 @@ def test_claude_provider_reset_parses_named_timezone_clock(kanban_home):
     assert captured["reset_at"] == "2026-08-28T10:20:00+00:00"
 
 
+def test_pinned_opus_cooldown_tick_does_not_duplicate_provider_reset_events(
+    kanban_home, configured_handoff_routes,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Synthèse Opus",
+            assignee="claude1",
+            model_override="claude-opus-5",
+        )
+        assert kb.fallback_simple_route(
+            conn,
+            task_id,
+            "provider_cooldown",
+            provider_proven=True,
+        ) is False
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind IN ('provider_reset_observed','claude_provider_reset')",
+            (task_id,),
+        ).fetchone()[0]
+
+    assert count == 0
+
+
 def test_claude_provider_reset_rejects_clock_without_valid_timezone(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="work", assignee="claude2")
