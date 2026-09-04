@@ -424,6 +424,38 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_unknown_exit_with_fresh_429_event_is_rate_limited(
+    kanban_home, monkeypatch,
+):
+    """A lost wait-status must not turn explicit 429 evidence into a crash."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="quota", assignee="claude2")
+        kb.claim_task(conn, tid, claimer=f"{host}:quota")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (71123, tid))
+        conn.commit()
+        kb.capture_claude_provider_reset(
+            conn,
+            tid,
+            "HTTP 429: session limit, resets 12:20pm (Europe/Paris)",
+        )
+
+        # No _record_worker_exit call: reproduces a worker reaped by a
+        # different process or dispatcher generation.
+        assert tid not in kb.detect_crashed_workers(conn)
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "rate_limited"
+        assert kb.get_task(conn, tid).consecutive_failures == 0
+
+
 def test_guardrail_halt_requeues_checkpoint_without_counting_failure(
     kanban_home, monkeypatch,
 ):
@@ -2505,6 +2537,39 @@ def test_pinned_opus_cooldown_tick_does_not_duplicate_provider_reset_events(
         ).fetchone()[0]
 
     assert count == 0
+
+
+def test_cooldown_route_transition_reuses_existing_provider_evidence(
+    kanban_home, configured_handoff_routes, monkeypatch,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="work", assignee="claude2", routing_tier="complex",
+        )
+        kb.capture_claude_provider_reset(
+            conn,
+            task_id,
+            "HTTP 429: session limit, resets 12:20pm (Europe/Paris)",
+        )
+        before = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind IN ('provider_reset_observed','claude_provider_reset')",
+            (task_id,),
+        ).fetchone()[0]
+
+        assert kb.fallback_simple_route(
+            conn, task_id, "provider_cooldown", provider_proven=True,
+        ) is True
+        after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind IN ('provider_reset_observed','claude_provider_reset')",
+            (task_id,),
+        ).fetchone()[0]
+
+    assert after == before
 
 
 def test_claude_provider_reset_rejects_clock_without_valid_timezone(kanban_home):

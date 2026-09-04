@@ -10648,6 +10648,42 @@ def classify_worker_incident(
     return "normal_failure"
 
 
+def _recent_provider_limit_observed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_started_at: Optional[float],
+    now: Optional[float] = None,
+) -> bool:
+    """Return whether this run emitted fresh, explicit provider-limit evidence.
+
+    A dispatcher does not always reap a worker it spawned (for example after a
+    service restart), so its exit code can be unavailable even though the
+    worker lifecycle hook already recorded the provider's HTTP 429. In that
+    case treating the dead PID as a generic crash burns a retry and can route
+    straight back to another profile unnecessarily.
+    """
+    observed_after = float(run_started_at or 0)
+    current = float(time.time() if now is None else now)
+    cutoff = max(observed_after, current - 120)
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'provider_reset_observed' "
+        "AND created_at >= ? ORDER BY id DESC LIMIT 4",
+        (task_id, cutoff),
+    ).fetchall()
+    for event in rows:
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        status = payload.get("http_status")
+        code = str(payload.get("error_code") or "").casefold()
+        if status == 429 or "rate_limit" in code or "quota" in code:
+            return True
+    return False
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -11905,7 +11941,11 @@ def fallback_simple_route(
         # that merely observe its global cooldown must not append the same
         # provider-reset evidence every ten seconds.
         return False
-    capture_claude_provider_reset(conn, task_id, error)
+    # A dispatcher tick observing the durable cooldown is not new provider
+    # evidence. The worker already recorded the actual 429/reset clock; adding
+    # another empty observation on every routing tick creates noisy history.
+    if safe_error != "provider_cooldown":
+        capture_claude_provider_reset(conn, task_id, error)
     if idx + 1 >= len(chain):
         return False  # already on the last hop (Coder) -- nothing further to try
     next_assignee, next_model = chain[idx + 1]
@@ -12030,6 +12070,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            if kind in {"unknown", "nonzero_exit"} and _recent_provider_limit_observed(
+                conn,
+                row["id"],
+                run_started_at=started_at,
+            ):
+                # The explicit worker hook is stronger evidence than a missing
+                # wait-status. Preserve the quota semantics and retry budget.
+                kind, code = "rate_limited", KANBAN_RATE_LIMIT_EXIT_CODE
             rate_limited_exit = False
             guardrail_halt_exit = False
             interrupted_exit = False
