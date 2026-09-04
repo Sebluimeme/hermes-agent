@@ -1179,6 +1179,57 @@ def test_notifier_classifies_prompt_timeout_as_internal_authorization_failure(
     assert "Action requise" not in message
 
 
+def test_classifier_refusal_wakes_orchestrator_without_asking_user_again(
+    tmp_path, monkeypatch,
+):
+    """Claude auto-mode refusals are internal routing failures.
+
+    The origin session must still wake so it can recover the existing card,
+    but Telegram must not render that synthetic wake as another permission
+    request for an operation the user may already have approved.
+    """
+    db_path = tmp_path / "blocked-auto-classifier.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="deploy authorized Firebase rules",
+            assignee="claude2",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="dm",
+            delivery_mode="notify+wake",
+        )
+        assert kb.block_task(
+            conn,
+            tid,
+            reason=(
+                "gate:credentials — Permission for this action was denied by "
+                "the Claude Code auto mode classifier"
+            ),
+            kind="capability",
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].metadata["user_delivery_policy"] == "silent"
+    assert adapter.handled[0].metadata["kanban_event_kind"] == "blocked"
+
+
 def test_notifier_recovers_blocked_task_when_durable_grant_already_exists(
     tmp_path, monkeypatch,
 ):

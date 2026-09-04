@@ -10054,6 +10054,64 @@ def _ready_task_just_fallback_routed(
     return isinstance(payload, dict) and payload.get("to_assignee") == assignee
 
 
+# Auto-routing sources: 'assigned' events the dispatcher itself wrote while
+# placing a card that had no operator-chosen home yet. Anything else --
+# ``created`` already carrying an assignee, or a plain ``assigned`` event from
+# ``assign_task``/the CLI/API (no ``source`` key) -- reflects a deliberate
+# human/orchestrator placement.
+_AUTO_ROUTING_ASSIGNED_SOURCES = frozenset({
+    "routing_tier_chain", "kanban.default_assignee", "generalist_pool_free_capacity",
+})
+
+
+def _ready_task_has_explicit_assignee(
+    conn: sqlite3.Connection,
+    task_id: str,
+    assignee: str,
+) -> bool:
+    """True when ``assignee`` reflects a deliberate placement, not a value
+    the dispatcher's own pool/tier auto-routing stamped on the card.
+
+    ``kanban_create``'s ``assignee`` argument is documented as "optional
+    explicit profile -- omit it to let the central dispatcher choose"
+    (see ``KANBAN_CREATE_SCHEMA``), and ``create_task``'s ``routing_tier``
+    docstring is explicit that the tier chain is only consumed by "an
+    auto-routed (no explicit assignee) task". A card created with -- or
+    later manually reassigned to (``assign_task``) -- a specific profile is
+    a deliberate operator choice (a capability, licence, or environment
+    picked for a reason) and must stay pinned there; the opportunistic
+    ``generalist_pool_free_capacity`` reroute below exists only for cards
+    the dispatcher itself placed. Incident: a card explicitly assigned to
+    ``coder`` was immediately rerouted to ``claude2`` by this same
+    "fresh pool card" branch, repeatedly defeating the operator's choice
+    (t_b940d7ff).
+
+    The most recent ``created``/``assigned`` event for the task reflects how
+    its current assignee got there (the ``tasks.assignee`` column and this
+    event are always written in the same transaction). Auto-routing events
+    always carry a recognized ``source`` tag; their absence means a
+    human/API caller made the call directly.
+    """
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN ('created', 'assigned') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        # No provenance to reason from -- be conservative and pin rather
+        # than silently reroute a card whose history we can't establish.
+        return True
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict) or payload.get("assignee") != assignee:
+        # Stale/unrelated event (shouldn't happen given the same-transaction
+        # write, but don't guess if it does) -- pin conservatively.
+        return True
+    return payload.get("source") not in _AUTO_ROUTING_ASSIGNED_SOURCES
+
+
 def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None) -> Optional[str]:
     """Block Claude only when telemetry proves an active provider cooldown.
 
@@ -13756,6 +13814,9 @@ def _dispatch_once_locked(
             and not _ready_task_just_fallback_routed(
                 conn, row["id"], row_assignee,
             )
+            and not _ready_task_has_explicit_assignee(
+                conn, row["id"], row_assignee,
+            )
             and (
                 row["model_override"] is None
                 or row["model_override"] in {
@@ -13768,9 +13829,11 @@ def _dispatch_once_locked(
         ):
             # A fresh pool card has no worker context to preserve. Select the
             # first capable lane with free capacity on every tick, even if the
-            # card was initially stamped with the default assignee. This lets
-            # Spark lead simple work and lets Claude 1/Coder absorb work while
-            # earlier healthy lanes are merely busy.
+            # card was initially stamped by the dispatcher's own auto-routing
+            # (``_ready_task_has_explicit_assignee`` above keeps a genuinely
+            # operator-chosen assignee out of this branch entirely). This
+            # lets Spark lead simple work and lets Claude 1/Coder absorb work
+            # while earlier healthy lanes are merely busy.
             _pool_assignee, _pool_model, _pool_trace = resolve_first_available_route(
                 row["routing_tier"],
                 _per_profile_running,

@@ -117,6 +117,8 @@ _INTERNAL_AUTHORIZATION_REASON_MARKERS = (
     "authorize-instruction-edit",
     "approval prompt timed out",
     "approval request could not be delivered",
+    "permission for this action was denied by the claude code auto mode classifier",
+    "blocked by classifier",
     "no interactive user or gateway",
     "worker-side timeout",
     "no response within the approval window",
@@ -1664,6 +1666,33 @@ class GatewayKanbanWatchersMixin:
                             _delivery_policy = (
                                 "concise" if _wake_kinds & _visible_kinds else "silent"
                             )
+                            # A provider-side auto-mode classifier refusal is
+                            # an internal execution/routing failure, not a new
+                            # decision for the operator.  The wake must still
+                            # reach the owning session so it can recover the
+                            # existing card, but it must not be surfaced in
+                            # Telegram as if Sébastien had to authorize the
+                            # same operation again.  Keep mixed batches visible
+                            # when they contain any genuinely terminal outcome.
+                            _block_wake_kinds = {"blocked", "block_loop_detected"}
+                            if (
+                                _delivery_policy == "concise"
+                                and _wake_kinds <= _block_wake_kinds
+                            ):
+                                _block_events = [
+                                    ev for ev in d["events"]
+                                    if ev.kind in _block_wake_kinds
+                                ]
+                                if _block_events and all(
+                                    _classify_authorization_block(
+                                        ev.payload,
+                                        has_instruction_grant=bool(
+                                            d.get("has_instruction_grant")
+                                        ),
+                                    ) == "internal_authorization_sync_failure"
+                                    for ev in _block_events
+                                ):
+                                    _delivery_policy = "silent"
                             _primary_kind = next(
                                 (
                                     candidate for candidate in (

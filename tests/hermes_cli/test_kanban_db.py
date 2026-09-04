@@ -1681,10 +1681,20 @@ def test_fresh_assigned_pool_task_moves_to_first_free_claude_lane(
         assert first.spawned[0][0] == busy
 
         candidate = kb.create_task(
-            conn, title="first free claude", assignee="claude2",
+            conn, title="first free claude", assignee=None,
             routing_tier="complex", workspace_kind="dir",
             workspace_path=str(candidate_workspace),
         )
+        # Simulate a prior tick's tier-chain auto-route (dispatcher-placed,
+        # not operator-chosen) so the pool-capacity reroute below is allowed
+        # to move it: an explicitly-assigned card must stay pinned instead
+        # (t_b940d7ff), so the reroute guard now requires this provenance.
+        conn.execute(
+            "UPDATE tasks SET assignee = 'claude2' WHERE id = ?", (candidate,),
+        )
+        kb._append_event(conn, candidate, "assigned", {
+            "assignee": "claude2", "source": "routing_tier_chain",
+        })
         second = kb.dispatch_once(
             conn, spawn_fn=lambda *_args, **_kwargs: 41002,
             max_in_progress_per_profile=1,
@@ -1723,7 +1733,7 @@ def test_fresh_assigned_pool_task_uses_coder_when_both_claudes_are_busy(
             workspace_kind="dir", workspace_path=str(tmp_path / "workspace-0"),
         )
         second_id = kb.create_task(
-            conn, title="second", assignee="claude2", routing_tier="complex",
+            conn, title="second", assignee=None, routing_tier="complex",
             workspace_kind="dir", workspace_path=str(tmp_path / "workspace-1"),
         )
         first_wave = kb.dispatch_once(
@@ -1733,9 +1743,17 @@ def test_fresh_assigned_pool_task_uses_coder_when_both_claudes_are_busy(
         assert [entry[1] for entry in first_wave.spawned] == ["claude2", "claude1"]
 
         candidate = kb.create_task(
-            conn, title="third", assignee="claude2", routing_tier="complex",
+            conn, title="third", assignee=None, routing_tier="complex",
             workspace_kind="dir", workspace_path=str(tmp_path / "workspace-2"),
         )
+        # Same simulated prior-tick tier-chain placement as above -- an
+        # explicitly-assigned card would stay pinned instead (t_b940d7ff).
+        conn.execute(
+            "UPDATE tasks SET assignee = 'claude2' WHERE id = ?", (candidate,),
+        )
+        kb._append_event(conn, candidate, "assigned", {
+            "assignee": "claude2", "source": "routing_tier_chain",
+        })
         second_wave = kb.dispatch_once(
             conn, spawn_fn=lambda *_args, **_kwargs: 42003,
             max_in_progress_per_profile=1,
@@ -1761,7 +1779,7 @@ def test_fresh_simple_pool_task_prefers_available_spark(
     workspace.mkdir()
     with kb.connect() as conn:
         task_id = kb.create_task(
-            conn, title="simple", assignee="claude2", routing_tier="simple",
+            conn, title="simple", assignee=None, routing_tier="simple",
             workspace_kind="dir", workspace_path=str(workspace),
         )
         result = kb.dispatch_once(
@@ -1775,6 +1793,78 @@ def test_fresh_simple_pool_task_prefers_available_spark(
         assert (row["assignee"], row["model_override"]) == (
             "spark", TEST_SPARK_MODEL_OVERRIDE,
         )
+
+
+def test_explicitly_assigned_card_is_not_pool_rerouted(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
+    tmp_path,
+):
+    """t_b940d7ff: a card explicitly assigned to ``coder`` at creation must
+    stay on ``coder`` even though claude2 (earlier in the complex chain) has
+    free capacity. Before the fix, the ``generalist_pool_free_capacity``
+    reroute treated any assignee found in the configured chain as a "fresh
+    pool card" and walked it back to the first free lane -- silently
+    overriding a deliberate operator placement (repeated 3x on the real
+    incident, blocking an explicitly authorized Firebase deploy). Only
+    dispatcher-placed assignees (tier-chain / default_assignee / an earlier
+    pool reroute) are eligible for this opportunistic reroute; an assignee
+    named directly in ``kanban_create``/``assign_task`` is not."""
+    from hermes_cli import config
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"generalist_worker_pool_routing": True}},
+    )
+    workspace = tmp_path / "explicit-coder"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="explicit coder", assignee="coder",
+            routing_tier="complex", workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: 45001,
+            max_in_progress_per_profile=1,
+        )
+        assert result.rerouted_for_capacity == []
+        assert result.spawned[0][0:2] == (task_id, "coder")
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        assert row["assignee"] == "coder"
+
+
+def test_manually_reassigned_card_is_not_pool_rerouted(
+    kanban_home, all_assignees_spawnable, monkeypatch, configured_handoff_routes,
+    tmp_path,
+):
+    """Same guarantee as above, but for a card an operator reassigns later
+    via ``assign_task`` (the CLI/API path) rather than at creation time --
+    both are deliberate placements, not dispatcher auto-routing."""
+    from hermes_cli import config
+
+    monkeypatch.setattr(
+        config,
+        "load_config",
+        lambda: {"kanban": {"generalist_worker_pool_routing": True}},
+    )
+    workspace = tmp_path / "manual-reassign"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="manually reassigned", assignee=None,
+            routing_tier="complex", workspace_kind="dir",
+            workspace_path=str(workspace),
+        )
+        assert kb.assign_task(conn, task_id, "coder") is True
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: 45002,
+            max_in_progress_per_profile=1,
+        )
+        assert result.rerouted_for_capacity == []
+        assert result.spawned[0][0:2] == (task_id, "coder")
 
 
 def test_ready_checkpoint_preserves_exact_worker_even_when_another_lane_is_free(
