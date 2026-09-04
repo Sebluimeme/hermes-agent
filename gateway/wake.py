@@ -83,6 +83,14 @@ async def deliver_wake(
             message_type=MessageType.TEXT,
             source=source,
             internal=True,
+            # A Kanban wake is controller input, never a human reply.  In
+            # particular it must not resolve a pending clarify prompt: an
+            # open-ended clarify accepts arbitrary text, so the synthetic
+            # "[kanban] Task ..." message used to be recorded as the user's
+            # answer and silently discard the real question.  The gateway
+            # still queues/processes this internal event through its normal
+            # non-control path.
+            allow_gateway_control=False,
             metadata=dict(metadata or {}),
         )
         await adapter.handle_message(synth_event)

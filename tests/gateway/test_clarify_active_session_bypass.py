@@ -88,6 +88,46 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
 
 
 @pytest.mark.asyncio
+async def test_internal_kanban_wake_cannot_resolve_pending_clarify():
+    """Synthetic task updates are not answers to a human question.
+
+    Regression for the Univers Arrosage incident: while an open-ended clarify
+    waited for the specific subject to relaunch, a Kanban completion wake was
+    intercepted as its free-form response.  Internal wakes carry
+    ``allow_gateway_control=False`` and must follow busy-event routing without
+    reaching the clarify resolver.
+    """
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _ClarifyBypassAdapter()
+    adapter._message_handler = AsyncMock(return_value="")
+    adapter._busy_session_handler = AsyncMock(return_value=True)
+    event = _event("[kanban] Task t_example completed")
+    event.internal = True
+    event.allow_gateway_control = False
+    event.metadata = {"internal_notification_kind": "kanban"}
+    session_key = build_session_key(
+        event.source,
+        group_sessions_per_user=adapter.config.extra.get(
+            "group_sessions_per_user", True,
+        ),
+        thread_sessions_per_user=adapter.config.extra.get(
+            "thread_sessions_per_user", False,
+        ),
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+    entry = cm.register("clarify-kanban", session_key, "Which subject?", None)
+
+    await adapter.handle_message(event)
+
+    adapter._message_handler.assert_not_awaited()
+    adapter._busy_session_handler.assert_awaited_once_with(event, session_key)
+    assert entry.event.is_set() is False
+    assert entry.response is None
+
+
+@pytest.mark.asyncio
 async def test_active_session_bypass_uses_profile_namespaced_key_under_multiplex():
     """Regression for issue #82975: under a named-profile multiplex, the
     adapter's clarify bypass lookup must use the SAME profile-namespaced
@@ -138,5 +178,4 @@ async def test_active_session_bypass_uses_profile_namespaced_key_under_multiplex
     adapter._message_handler.assert_awaited_once_with(event)
     adapter._busy_session_handler.assert_not_awaited()
     assert adapter._pending_messages == {}
-
 

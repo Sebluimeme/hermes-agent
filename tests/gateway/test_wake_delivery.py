@@ -65,6 +65,7 @@ def test_push_wake_preserves_internal_delivery_policy_metadata():
 
     assert len(adapter.handled) == 1
     assert adapter.handled[0].internal is True
+    assert adapter.handled[0].allow_gateway_control is False
     assert adapter.handled[0].metadata["user_delivery_policy"] == "silent"
 
 
@@ -138,4 +139,3 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
-
