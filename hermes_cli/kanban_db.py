@@ -3094,6 +3094,109 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
         _refresh_mission_status(conn, row["mission_id"])
 
+    # Older runtimes could leave a genuinely human-blocked card without the
+    # structured fields consumed by boards and orchestrators. Recover the
+    # exact action from the durable human-action row first, then from the
+    # block event or run summary. This is idempotent: repaired cards no longer
+    # match the NULL/blank predicate on the next startup.
+    incomplete_human_blocks = (
+        conn.execute(
+            "SELECT id,block_kind,execution_status,failure_class,action_required "
+            "FROM tasks WHERE status='blocked' "
+            "AND COALESCE(block_kind,'needs_input') NOT IN ('transient','dependency') "
+            "AND (action_required IS NULL OR trim(action_required)='' "
+            "OR execution_status IS NULL OR execution_status!='blocked')"
+        ).fetchall()
+        if {"id", "status", "block_kind", "execution_status", "failure_class", "action_required"}
+        <= repair_columns
+        else []
+    )
+    for row in incomplete_human_blocks:
+        prompt_row = conn.execute(
+            "SELECT prompt FROM human_actions WHERE task_id=? AND status='open' "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        action_text = prompt_row["prompt"] if prompt_row and prompt_row["prompt"] else None
+        if not action_text:
+            for event_row in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind IN "
+                "('blocked','block_loop_detected') ORDER BY id DESC LIMIT 8",
+                (row["id"],),
+            ).fetchall():
+                try:
+                    event_payload = json.loads(event_row["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                action_text = event_payload.get("action") or event_payload.get("reason")
+                if action_text:
+                    break
+        if not action_text:
+            summary_row = conn.execute(
+                "SELECT summary FROM task_runs WHERE task_id=? AND summary IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            action_text = summary_row["summary"] if summary_row else None
+        if not action_text:
+            action_text = "Une intervention humaine est nécessaire."
+        conn.execute(
+            "UPDATE tasks SET execution_status='blocked', "
+            "failure_class=COALESCE(failure_class,block_kind,'needs_input'), "
+            "action_required=? WHERE id=? AND status='blocked'",
+            (str(action_text)[:1000], row["id"]),
+        )
+        _append_event(
+            conn,
+            row["id"],
+            "human_block_state_reconciled",
+            {"reason": "missing_structured_human_action"},
+        )
+
+    # A provider hook can record an explicit HTTP 429 even when a gateway
+    # restart causes the worker's raw wait-status to be lost. Runtimes before
+    # the exit-evidence fallback then stored the run as a crash. Correct that
+    # authoritative outcome while retaining the original crash event as audit
+    # history; the reconciliation event explains the change exactly once.
+    legacy_crashed_runs = (
+        conn.execute(
+            "SELECT id,task_id,started_at,ended_at FROM task_runs "
+            "WHERE outcome='crashed' AND ended_at IS NOT NULL"
+        ).fetchall()
+        if {"id", "task_id", "started_at", "ended_at", "outcome"} <= task_run_columns
+        else []
+    )
+    for run in legacy_crashed_runs:
+        provider_limited = False
+        for event_row in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='provider_reset_observed' AND created_at>=? "
+            "AND created_at<=? ORDER BY id DESC LIMIT 8",
+            (run["task_id"], int(run["started_at"] or 0), int(run["ended_at"] or 0) + 5),
+        ).fetchall():
+            try:
+                event_payload = json.loads(event_row["payload"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if event_payload.get("http_status") == 429:
+                provider_limited = True
+                break
+        if not provider_limited:
+            continue
+        conn.execute(
+            "UPDATE task_runs SET status='rate_limited',outcome='rate_limited',"
+            "error='provider limit observed before worker exit; requeued without counting a failure' "
+            "WHERE id=? AND outcome='crashed'",
+            (run["id"],),
+        )
+        _append_event(
+            conn,
+            run["task_id"],
+            "provider_limit_run_reconciled",
+            {"run_id": run["id"], "previous_outcome": "crashed", "outcome": "rate_limited"},
+            run_id=run["id"],
+        )
+
     # The former Gemini policy parked otherwise-accepted visual candidates
     # until a distant retry time. The hash-bound Coder/GPT fallback makes that
     # wait obsolete. Requeue only the provable legacy shape once: a review row
@@ -7707,7 +7810,7 @@ def block_task(
                 conn, task_id, "block_loop_detected",
                 {
                     "reason": reason,
-                    "action": action,
+                    "action": human_action,
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
@@ -9782,6 +9885,21 @@ def provider_error_cooldown(
     except ValueError:
         return None
     return record if (time.time() if now is None else now) < deadline else None
+
+
+def provider_cooldown_retry_at(
+    profile: Optional[str], *, now: Optional[float] = None,
+) -> Optional[int]:
+    """Return the active provider reset deadline as an epoch timestamp."""
+    record = provider_error_cooldown(profile, now=now)
+    if record is None:
+        return None
+    try:
+        return int(dt.datetime.fromisoformat(
+            str(record.get("cooldown_until", "")).replace("Z", "+00:00")
+        ).timestamp())
+    except (TypeError, ValueError):
+        return None
 
 
 # --- Routing tiers (t_8e9eedfa LOT 1) ----------------------------------
@@ -14108,12 +14226,27 @@ def _dispatch_once_locked(
                     # last hop; the next tick re-evaluates the new assignee
                     # under this same guard, so a still-dead chain cascades
                     # one confirmed hop per tick rather than all at once.
-                    fallback_simple_route(
+                    rerouted = fallback_simple_route(
                         conn,
                         row["id"],
                         quota_reason,
                         provider_proven=quota_reason == "provider_cooldown",
                     )
+                    if rerouted:
+                        conn.execute(
+                            "UPDATE tasks SET execution_status='pending', "
+                            "failure_class=NULL, next_retry_at=NULL, "
+                            "action_required=NULL WHERE id=?",
+                            (row["id"],),
+                        )
+                    else:
+                        retry_at = provider_cooldown_retry_at(row_assignee)
+                        conn.execute(
+                            "UPDATE tasks SET execution_status='waiting_quota', "
+                            "failure_class='provider_limit', next_retry_at=?, "
+                            "action_required=NULL WHERE id=?",
+                            (retry_at, row["id"]),
+                        )
             continue
         oauth_disposition = (
             claude2_oauth_dispatch_guard(conn, row["id"], row_assignee)
@@ -14306,6 +14439,12 @@ def _dispatch_once_locked(
                 with write_txn(conn):
                     _append_state_event_if_changed(
                         conn, row["id"], "provider_cooldown", {"reason": quota_reason}
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET execution_status='waiting_quota', "
+                        "failure_class='provider_limit', next_retry_at=?, "
+                        "action_required=NULL WHERE id=?",
+                        (provider_cooldown_retry_at(row["assignee"]), row["id"]),
                     )
             continue
         oauth_disposition = (

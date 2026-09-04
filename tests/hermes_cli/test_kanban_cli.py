@@ -57,6 +57,23 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_list_json_includes_operational_wait_state(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="waiting", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET execution_status='waiting_quota',"
+            "failure_class='provider_limit',next_retry_at=123456 WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+    payload = json.loads(kc.run_slash("list --json"))
+    row = next(item for item in payload if item["id"] == tid)
+    assert row["execution_status"] == "waiting_quota"
+    assert row["failure_class"] == "provider_limit"
+    assert row["next_retry_at"] == 123456
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
@@ -177,5 +194,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 

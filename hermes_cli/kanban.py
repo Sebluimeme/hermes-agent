@@ -82,6 +82,12 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
         "routing_tier": t.routing_tier,
+        "mission_id": t.mission_id,
+        "queue_class": t.queue_class,
+        "execution_status": t.execution_status,
+        "failure_class": t.failure_class,
+        "next_retry_at": t.next_retry_at,
+        "action_required": t.action_required,
     }
 
 
@@ -2959,6 +2965,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "rate_limited": res.rate_limited,
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
+            ],
+            "oauth_blocked": res.oauth_blocked,
+            "oauth_rerouted": res.oauth_rerouted,
             "strategy_required": res.strategy_required,
             "interrupted": res.interrupted,
             "promoted": res.promoted,

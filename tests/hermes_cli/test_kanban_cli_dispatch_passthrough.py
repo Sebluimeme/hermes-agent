@@ -8,6 +8,7 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -93,4 +94,25 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
         f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
     )
 
+
+def test_cli_dispatch_json_exposes_guard_reasons(
+    isolated_kanban_home, monkeypatch, capsys,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    result = kanban_db.DispatchResult(
+        respawn_guarded=[("t_wait", "provider_cooldown")],
+        oauth_blocked=["t_auth"],
+    )
+    monkeypatch.setattr(kanban_db, "dispatch_once", lambda conn, **kw: result)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=True)
+    assert kb_cli._cmd_dispatch(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["respawn_guarded"] == [
+        {"task_id": "t_wait", "reason": "provider_cooldown"}
+    ]
+    assert payload["oauth_blocked"] == ["t_auth"]
 

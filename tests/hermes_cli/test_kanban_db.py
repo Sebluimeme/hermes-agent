@@ -551,6 +551,92 @@ def test_interrupted_exit_requeues_exact_session_without_counting_failure(
     assert _kb._transient_resume_session_id(tid, board=None) == "sess-resume"
 
 
+def test_schema_reconciles_missing_structured_human_block(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs login", assignee="claude2")
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="Google Analytics write access is unavailable.",
+            kind="needs_input",
+            action="Se connecter à Google Analytics.",
+        )
+        conn.execute(
+            "UPDATE tasks SET execution_status='pending',failure_class=NULL,"
+            "action_required=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+    kb.init_db()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert task.execution_status == "blocked"
+    assert task.failure_class == "needs_input"
+    assert task.action_required == "Se connecter à Google Analytics."
+    assert any(e.kind == "human_block_state_reconciled" for e in events)
+
+
+def test_schema_reclassifies_legacy_crash_with_explicit_429(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="quota", assignee="claude2")
+        kb.claim_task(conn, tid, claimer="host:test")
+        run_id = kb.get_task(conn, tid).current_run_id
+        kb.capture_provider_reset(conn, tid, "HTTP 429: retry after 3600 seconds")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET status='crashed',outcome='crashed',ended_at=?,"
+            "error='pid not alive' WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready',claim_lock=NULL,claim_expires=NULL,"
+            "worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+    kb.init_db()
+    with kb.connect() as conn:
+        run = conn.execute(
+            "SELECT status,outcome,error FROM task_runs WHERE id=?", (run_id,),
+        ).fetchone()
+        events = kb.list_events(conn, tid)
+
+    assert run["status"] == "rate_limited"
+    assert run["outcome"] == "rate_limited"
+    assert "provider limit observed" in run["error"]
+    assert any(e.kind == "provider_limit_run_reconciled" for e in events)
+
+
+def test_pinned_opus_cooldown_persists_visible_retry_time(
+    kanban_home, all_assignees_spawnable,
+):
+    observed = dt.datetime.now(tz=dt.timezone.utc)
+    reset_at = observed + dt.timedelta(hours=1)
+    kb._persist_provider_error_cooldown(
+        "claude1", reset_at=reset_at, observed_at=observed, source="test",
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="opus",
+            assignee="claude1",
+            model_override="claude-opus-5",
+        )
+        result = kb.dispatch_once(conn, dry_run=False)
+        task = kb.get_task(conn, tid)
+
+    assert (tid, "provider_cooldown") in result.respawn_guarded
+    assert task.status == "ready"
+    assert task.execution_status == "waiting_quota"
+    assert task.failure_class == "provider_limit"
+    assert task.next_retry_at == int(reset_at.timestamp())
+    assert task.action_required is None
+
+
 def test_protocol_violation_elapsed_uses_current_run_start(
     kanban_home, monkeypatch,
 ):

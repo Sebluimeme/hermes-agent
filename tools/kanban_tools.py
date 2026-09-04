@@ -553,6 +553,12 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "mission_id": task.mission_id,
+        "queue_class": task.queue_class,
+        "execution_status": task.execution_status,
+        "failure_class": task.failure_class,
+        "next_retry_at": task.next_retry_at,
+        "action_required": task.action_required,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -620,6 +626,9 @@ def _handle_show(args: dict, **kw) -> str:
                 last_run_id,
                 str(task.status),
                 task.current_run_id,
+                task.execution_status,
+                task.next_retry_at,
+                task.action_required,
             )
             if (
                 detail == "compact"
@@ -660,6 +669,12 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "mission_id": t.mission_id,
+                    "queue_class": t.queue_class,
+                    "execution_status": t.execution_status,
+                    "failure_class": t.failure_class,
+                    "next_retry_at": t.next_retry_at,
+                    "action_required": t.action_required,
                 }
                 payload["body"] = body
                 return payload
