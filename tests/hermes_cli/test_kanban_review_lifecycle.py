@@ -165,6 +165,7 @@ def test_active_reviewer_cannot_wait_for_or_request_itself(
         assert reviewer is not None and reviewer.current_run_id is not None
 
         context = kb.build_worker_context(conn, tid)
+        review_run = next(run for run in kb.list_runs(conn, tid) if run.id == reviewer.current_run_id)
         ok, reason = kb.request_review(
             conn,
             tid,
@@ -182,6 +183,9 @@ def test_active_reviewer_cannot_wait_for_or_request_itself(
         current = kb.get_task(conn, tid)
 
     assert "You are the active reviewer" in context
+    assert kb.VISUAL_REVIEW_POLICY_VERSION in context
+    assert "Never call Gemini" in context
+    assert review_run.metadata["policy_versions"]["visual_review"] == kb.VISUAL_REVIEW_POLICY_VERSION
     assert ok is False
     assert reason is not None and "already the active reviewer" in reason
     assert dependency_wait is False

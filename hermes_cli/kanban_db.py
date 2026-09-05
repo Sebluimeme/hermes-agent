@@ -457,6 +457,17 @@ def _fire_dispatch_tick_hook(
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+# Increment whenever the durable rules for the visual-review lane change.
+# Every newly claimed review run records this value and every resumed session
+# receives it in the fresh task context, so old conversation history can never
+# silently keep an obsolete provider workflow authoritative.
+VISUAL_REVIEW_POLICY_VERSION = "2026-09-05-gpt-only-v1"
+
+# This is a visibility threshold, not a kill timeout.  A worker may still be
+# thinking or waiting on a legitimate long call, but after two minutes without
+# a useful tool/event the board must stop pretending that progress is proven.
+SILENT_PROGRESS_WARNING_SECONDS = 120
+
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
 # as wedged and reclaim regardless of PID liveness (#29747 gap 3).
@@ -5866,8 +5877,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -5877,6 +5888,14 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(
+                    {
+                        "policy_versions": {
+                            "visual_review": VISUAL_REVIEW_POLICY_VERSION,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
             ),
         )
         run_id = run_cur.lastrowid
@@ -10609,6 +10628,10 @@ class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
     reclaimed: int = 0
+    progress_stalled: list[str] = field(default_factory=list)
+    """Running task ids made visibly stalled after two minutes without a
+    useful activity.  This is diagnostic state only; normal activity clears it
+    and the existing bounded stale/runtime recovery remains authoritative."""
     promoted: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
@@ -11267,10 +11290,103 @@ def append_activity_event(
                     {"action": safe_action, "target": safe_target},
                     run_id=run_id,
                 )
+                if safe_action != "other":
+                    row = conn.execute(
+                        "SELECT execution_status FROM tasks WHERE id=? AND status='running'",
+                        (tid,),
+                    ).fetchone()
+                    if row and row["execution_status"] == "progress_stalled":
+                        source_status = _retry_status_for_run(conn, tid, run_id)
+                        resumed_status = "reviewing" if source_status == "review" else "running"
+                        conn.execute(
+                            "UPDATE tasks SET execution_status=?,failure_class=NULL "
+                            "WHERE id=? AND status='running' AND execution_status='progress_stalled'",
+                            (resumed_status, tid),
+                        )
+                        _append_event(
+                            conn,
+                            tid,
+                            "progress_resumed",
+                            {"action": safe_action, "target": safe_target},
+                            run_id=run_id,
+                        )
         finally:
             conn.close()
     except Exception:
         pass
+
+
+def detect_silent_progress(
+    conn: sqlite3.Connection,
+    *,
+    warning_after_seconds: int = SILENT_PROGRESS_WARNING_SECONDS,
+    now: Optional[int] = None,
+) -> list[str]:
+    """Expose running cards that have no evidence of useful progress.
+
+    Heartbeats and generic ``other`` activity prove process liveness only and
+    deliberately do not reset this clock.  The function is idempotent: one
+    ``progress_stalled`` event is emitted until a useful activity records the
+    matching ``progress_resumed`` transition.
+    """
+    if warning_after_seconds <= 0:
+        return []
+    current = int(time.time()) if now is None else int(now)
+    stalled: list[str] = []
+    rows = conn.execute(
+        "SELECT t.id,t.current_run_id,t.execution_status,r.started_at "
+        "FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.status='running' AND r.ended_at IS NULL"
+    ).fetchall()
+    for row in rows:
+        run_id = int(row["current_run_id"])
+        useful_at = int(row["started_at"] or current)
+        events = conn.execute(
+            "SELECT kind,payload,created_at FROM task_events "
+            "WHERE task_id=? AND run_id=? ORDER BY id",
+            (row["id"], run_id),
+        ).fetchall()
+        for event in events:
+            useful = event["kind"] in {
+                "visual_checked", "commented", "attached", "progress_checkpoint"
+            }
+            if event["kind"] == "activity":
+                try:
+                    payload = json.loads(event["payload"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                useful = str(payload.get("action") or "other") != "other"
+            if useful:
+                useful_at = max(useful_at, int(event["created_at"] or useful_at))
+        stalled_for = current - useful_at
+        if stalled_for < warning_after_seconds:
+            continue
+        if row["execution_status"] == "progress_stalled":
+            continue
+        with write_txn(conn):
+            changed = conn.execute(
+                "UPDATE tasks SET execution_status='progress_stalled',"
+                "failure_class='progress_stalled',action_required=NULL "
+                "WHERE id=? AND status='running' AND current_run_id=? "
+                "AND execution_status!='progress_stalled'",
+                (row["id"], run_id),
+            )
+            if changed.rowcount != 1:
+                continue
+            _append_event(
+                conn,
+                row["id"],
+                "progress_stalled",
+                {
+                    "stalled_seconds": stalled_for,
+                    "last_useful_at": useful_at,
+                    "action_required": None,
+                    "message": "aucun progrès utile observé; surveillance et reprise automatiques",
+                },
+                run_id=run_id,
+            )
+        stalled.append(str(row["id"]))
+    return stalled
 
 
 def enforce_max_runtime(
@@ -13749,6 +13865,8 @@ def _dispatch_once_locked(
         )
         if barrier.get("workspace_path")
     )
+    if not dry_run:
+        result.progress_stalled = detect_silent_progress(conn)
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -15372,13 +15490,17 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         and _retry_status_for_run(conn, task.id, task.current_run_id) == "review"
     ):
         lines.append("## Current assignment — independent reviewer")
+        lines.append(f"Visual-review policy: {VISUAL_REVIEW_POLICY_VERSION}")
         lines.append(
             f"You are the active reviewer in run #{task.current_run_id}; any "
             "active reviewer shown for this card is this process, not a "
             "dependency to wait for. Inspect the latest review_requested "
             "handoff and choose exactly one terminal verdict: approve with "
             "kanban_complete, return defects with kanban_request_changes, or "
-            "use kanban_defer_review for a transient visual-provider delay. "
+            "The final visual verdict is GPT/Coder native only. Never call "
+            "Gemini, gemini_review_image.py, wait for a Gemini quota, or defer "
+            "this card for Gemini, even if resumed conversation history says "
+            "otherwise. Treat this policy version as newer and authoritative. "
             "Establish the candidate's exact diff and baseline before judging "
             "screenshots. Request implementation changes only when a finding "
             "violates an acceptance criterion or is a regression introduced by "

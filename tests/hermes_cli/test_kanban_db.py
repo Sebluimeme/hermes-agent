@@ -4096,6 +4096,35 @@ def test_append_activity_event_writes_action_and_target(kanban_home, monkeypatch
         assert payload["target"] == "scripts/kanban_board_sync.py"
 
 
+def test_silent_progress_becomes_visible_and_useful_activity_clears_it(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="long work", assignee="coder")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        conn.execute("UPDATE task_runs SET started_at=800 WHERE id=?", (run_id,))
+        conn.execute("UPDATE tasks SET last_heartbeat_at=990 WHERE id=?", (task_id,))
+        kb._append_event(conn, task_id, "heartbeat", None, run_id=run_id)
+
+        assert kb.detect_silent_progress(conn, warning_after_seconds=120, now=1000) == [task_id]
+        assert kb.detect_silent_progress(conn, warning_after_seconds=120, now=1010) == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.execution_status == "progress_stalled"
+        assert task.failure_class == "progress_stalled"
+        stalled_events = [event for event in kb.list_events(conn, task_id) if event.kind == "progress_stalled"]
+        assert len(stalled_events) == 1
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        kb.append_activity_event(action="read_file", target="report.md")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.execution_status == "running"
+        assert task.failure_class is None
+        assert any(event.kind == "progress_resumed" for event in kb.list_events(conn, task_id))
+
+
 def test_append_activity_event_masks_a_secret_in_target(kanban_home, monkeypatch):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

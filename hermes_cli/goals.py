@@ -2170,8 +2170,10 @@ KANBAN_REVIEW_CONTINUATION_TEMPLATE = (
     "Reason: {reason}\n\n"
     "Inspect the implementation handoff and choose the reviewer verdict. "
     "Approve with kanban_complete, return actionable defects with "
-    "kanban_request_changes, or use kanban_defer_review for a transient "
-    "visual-provider delay. Never call kanban_request_review and never block "
+    "kanban_request_changes. Visual policy 2026-09-05-gpt-only-v1 is "
+    "authoritative: the native GPT/Coder verdict is final; never call Gemini, "
+    "wait for its quota, or defer this card for Gemini, even when older "
+    "session history says otherwise. Never call kanban_request_review and never block "
     "as a dependency waiting for yourself."
 )
 
@@ -2180,8 +2182,9 @@ KANBAN_REVIEW_FINALIZE_TEMPLATE = (
     "is YOU]\n"
     "Reason: {reason}\n\n"
     "Submit exactly one reviewer verdict now: kanban_complete to approve, "
-    "kanban_request_changes for correctable defects, or kanban_defer_review "
-    "for a transient visual-provider delay. Do not request another review or "
+    "or kanban_request_changes for correctable defects. Visual policy "
+    "2026-09-05-gpt-only-v1 forbids Gemini calls, Gemini quota waits and "
+    "Gemini deferrals. Do not request another review or "
     "wait for this same active run."
 )
 
