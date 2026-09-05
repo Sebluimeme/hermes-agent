@@ -1357,8 +1357,8 @@ def test_coder_lane_config_rejects_a_fourth_coder_profile(monkeypatch):
     assert kb.resolve_parallel_routes("complex", 5) == ([], [])
 
 
-def test_coder_profile_canary_requires_local_auth_file(tmp_path, monkeypatch):
-    """A numbered Coder lane with no auth.json is not silently fail-open."""
+def test_coder_profile_canary_requires_local_or_global_auth(kanban_home, tmp_path, monkeypatch):
+    """A numbered Coder lane with neither a local nor a global session is not fail-open."""
     from hermes_cli import profiles as profiles_mod
 
     profile_dir = tmp_path / "coder2"
@@ -1373,15 +1373,93 @@ def test_coder_profile_canary_requires_local_auth_file(tmp_path, monkeypatch):
     ok, reason = kb.coder_profile_canary("coder2")
     assert (ok, reason) == (False, "coder_auth_missing")
 
+    # A corrupt/empty local auth.json with no usable global fallback either
+    # still reports "not ready" -- it never fakes readiness.
     (profile_dir / "auth.json").write_text("not json")
     ok, reason = kb.coder_profile_canary("coder2")
-    assert (ok, reason) == (False, "coder_auth_unreadable")
+    assert (ok, reason) == (False, "coder_auth_missing")
 
     (profile_dir / "auth.json").write_text("{}")
     ok, reason = kb.coder_profile_canary("coder2")
-    assert (ok, reason) == (False, "coder_auth_empty")
+    assert (ok, reason) == (False, "coder_auth_missing")
 
-    (profile_dir / "auth.json").write_text('{"tokens": {"access_token": "x"}}')
+    (profile_dir / "auth.json").write_text(
+        '{"providers": {"openai-codex": {"tokens": {'
+        '"access_token": "x", "refresh_token": "y"}}}}'
+    )
+    ok, reason = kb.coder_profile_canary("coder2")
+    assert (ok, reason) == (True, "coder_auth_present")
+
+
+def test_coder_profile_canary_accepts_global_oauth_fallback_for_cloned_profile(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A profile cloned via ``--clone-from coder`` has no auth.json of its own
+    (secrets are deliberately excluded from clones) but shares Hermes' already
+    -connected Codex session through the global-root auth store. Regression
+    for t_1d6b3aa2: the first canary treated this as "not ready" and would
+    have asked Sébastien for a redundant re-login.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    profile_dir = tmp_path / "coder2"
+    profile_dir.mkdir()
+    (profile_dir / "config.yaml").write_text("model:\n  provider: openai-codex\n")
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda name: profile_dir)
+    # No auth.json under profile_dir at all -- exactly what --clone-from
+    # coder produces.
+    assert not (profile_dir / "auth.json").exists()
+
+    (kanban_home / "auth.json").write_text(json.dumps({
+        "providers": {"openai-codex": {"tokens": {
+            "access_token": "global-x", "refresh_token": "global-y",
+        }}},
+    }))
+    ok, reason = kb.coder_profile_canary("coder2")
+    assert (ok, reason) == (True, "coder_auth_present")
+
+
+def test_coder_profile_canary_accepts_global_credential_pool_fallback(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """The global fallback also covers the credential_pool shape, not just
+    the singleton ``providers.openai-codex.tokens`` entry."""
+    from hermes_cli import profiles as profiles_mod
+
+    profile_dir = tmp_path / "coder3"
+    profile_dir.mkdir()
+    (profile_dir / "config.yaml").write_text("model:\n  provider: openai-codex\n")
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda name: profile_dir)
+
+    (kanban_home / "auth.json").write_text(json.dumps({
+        "credential_pool": {"openai-codex": [
+            {"source": "manual:device_code", "access_token": "pool-token"},
+        ]},
+    }))
+    ok, reason = kb.coder_profile_canary("coder3")
+    assert (ok, reason) == (True, "coder_auth_present")
+
+
+def test_coder_profile_canary_local_session_wins_over_global(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """A profile-local session always resolves first; the canary never needs
+    the global fallback when the profile already has its own credentials."""
+    from hermes_cli import profiles as profiles_mod
+
+    profile_dir = tmp_path / "coder2"
+    profile_dir.mkdir()
+    (profile_dir / "config.yaml").write_text("model:\n  provider: openai-codex\n")
+    (profile_dir / "auth.json").write_text(json.dumps({
+        "providers": {"openai-codex": {"tokens": {
+            "access_token": "local-x", "refresh_token": "local-y",
+        }}},
+    }))
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda name: profile_dir)
+    # No global auth.json at all -- the local session must be sufficient on
+    # its own.
+    assert not (kanban_home / "auth.json").exists()
+
     ok, reason = kb.coder_profile_canary("coder2")
     assert (ok, reason) == (True, "coder_auth_present")
 
@@ -1394,8 +1472,8 @@ def test_route_preflight_fails_closed_for_unauthenticated_numbered_coder_lane(
     Unlike the historical single ``coder`` lane (fail-open by design: no live
     GPT quota measurement is wired up, and it is known to already carry a
     working session), a freshly created numbered lane starts with no OAuth
-    session. route_preflight_ok must refuse it instead of handing it real
-    cards that can never spawn.
+    session anywhere (local or global). route_preflight_ok must refuse it
+    instead of handing it real cards that can never spawn.
     """
     from hermes_cli import profiles as profiles_mod
 
@@ -1411,7 +1489,33 @@ def test_route_preflight_fails_closed_for_unauthenticated_numbered_coder_lane(
     ok, reason = kb.route_preflight_ok("coder2")
     assert (ok, reason) == (False, "coder_auth_missing")
 
-    (profile_dir / "auth.json").write_text('{"tokens": {"access_token": "x"}}')
+    (profile_dir / "auth.json").write_text(json.dumps({
+        "providers": {"openai-codex": {"tokens": {
+            "access_token": "x", "refresh_token": "y",
+        }}},
+    }))
+    ok, reason = kb.route_preflight_ok("coder2")
+    assert ok is True
+
+
+def test_route_preflight_accepts_numbered_coder_lane_via_global_oauth_only(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """route_preflight_ok end-to-end: a cloned coder2 with no local auth.json
+    but a valid global Codex session is real, spawnable capacity."""
+    from hermes_cli import profiles as profiles_mod
+
+    profile_dir = tmp_path / "coder2"
+    profile_dir.mkdir()
+    (profile_dir / "config.yaml").write_text("model:\n  provider: openai-codex\n")
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda name: profile_dir)
+    monkeypatch.setattr(kb, "provider_error_cooldown", lambda *_a, **_k: None)
+
+    (kanban_home / "auth.json").write_text(json.dumps({
+        "providers": {"openai-codex": {"tokens": {
+            "access_token": "global-x", "refresh_token": "global-y",
+        }}},
+    }))
     ok, reason = kb.route_preflight_ok("coder2")
     assert ok is True
 

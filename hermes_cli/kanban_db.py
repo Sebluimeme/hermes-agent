@@ -10026,13 +10026,24 @@ def coder_profile_canary(profile: str) -> tuple[bool, str]:
     because no live GPT quota measurement is wired up -- a reasonable default
     when the profile is known to already carry a working OAuth session. A
     freshly created lane (``coder2``, ``coder3``, ...) starts with no session
-    at all: fail-open there would let the dispatcher repeatedly hand it real
-    cards that can never spawn, burning the task's retry budget instead of
-    surfacing the missing login. This canary reads only the profile's local
-    ``config.yaml`` / ``auth.json`` -- never a network call, never a paid
-    turn -- and reports a missing/empty/unreadable auth file as a hard
-    "not ready" rather than the generic fail-open used for genuinely
-    unmeasured-but-authenticated lanes.
+    of its own: fail-open there would let the dispatcher repeatedly hand it
+    real cards that can never spawn, burning the task's retry budget instead
+    of surfacing the missing login.
+
+    Sébastien's 2026-09-06 correction (t_1d6b3aa2): ``hermes profile create
+    --clone --clone-from coder`` deliberately excludes ``auth.json`` from the
+    clone (no secret copying), so a freshly cloned ``coder2``/``coder3`` never
+    has a profile-local auth file -- that is not the same as "unauthenticated".
+    Hermes' own Codex credential resolution (``hermes_cli.auth``) already
+    falls back to the global-root auth store's ``providers.openai-codex`` /
+    ``credential_pool.openai-codex`` whenever the profile has no entry of its
+    own, so a numbered lane legitimately shares the already-connected Codex
+    session without any new login. The first version of this canary only
+    checked the profile's own ``auth.json`` file and reported these lanes
+    "not ready" even though a real spawn would have resolved credentials via
+    that global fallback fine. This replicates the exact same profile-then-
+    global resolution the runtime uses at spawn time -- purely local JSON
+    reads, no refresh, no network call, no paid turn.
     """
     try:
         from hermes_cli.profiles import get_profile_dir
@@ -10042,16 +10053,47 @@ def coder_profile_canary(profile: str) -> tuple[bool, str]:
         return False, "profile_unresolved"
     if not (profile_dir / "config.yaml").exists():
         return False, "profile_missing"
-    auth_path = profile_dir / "auth.json"
-    if not auth_path.exists():
-        return False, "coder_auth_missing"
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli import auth as auth_mod
+
+    override_token = set_hermes_home_override(str(profile_dir))
     try:
-        payload = json.loads(auth_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False, "coder_auth_unreadable"
-    if not isinstance(payload, dict) or not payload:
-        return False, "coder_auth_empty"
-    return True, "coder_auth_present"
+        try:
+            auth_store = auth_mod._load_auth_store()
+        except Exception:
+            auth_store = {"providers": {}}
+        try:
+            state = auth_mod._load_provider_state(auth_store, "openai-codex")
+        except Exception:
+            state = None
+        if isinstance(state, dict):
+            tokens = state.get("tokens")
+            if (
+                isinstance(tokens, dict)
+                and str(tokens.get("access_token") or "").strip()
+                and str(tokens.get("refresh_token") or "").strip()
+            ):
+                return True, "coder_auth_present"
+        try:
+            pool_entries = auth_mod.read_credential_pool("openai-codex")
+        except Exception:
+            pool_entries = None
+        if isinstance(pool_entries, list):
+            now = time.time()
+            for entry in pool_entries:
+                if not isinstance(entry, dict):
+                    continue
+                access_token = str(entry.get("access_token") or "").strip()
+                if not access_token:
+                    continue
+                reset_at = entry.get("last_error_reset_at")
+                if isinstance(reset_at, (int, float)) and reset_at > now:
+                    continue
+                return True, "coder_auth_present"
+        return False, "coder_auth_missing"
+    finally:
+        reset_hermes_home_override(override_token)
 
 
 def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool, str]:
