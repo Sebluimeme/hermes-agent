@@ -2969,6 +2969,37 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "WHERE status IN ('done','archived')"
         )
 
+    # Older review completions could store their durable proof under
+    # ``reviewer_checks`` (or another supported closure-evidence shape) while
+    # the task row was classified using only ``metadata.evidence``. Reconcile
+    # those terminal rows through the same normalizer used by new completions
+    # and output delivery. This is intentionally monotonic: it only upgrades a
+    # proven historical row to ``verified`` and never downgrades one.
+    if (
+        {"id", "status", "verification_status"}
+        <= {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+        and conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+        ).fetchone()
+        is not None
+    ):
+        legacy_unverified = conn.execute(
+            "SELECT t.id, (SELECT r.metadata FROM task_runs r "
+            "WHERE r.task_id=t.id ORDER BY r.started_at DESC, r.id DESC LIMIT 1) "
+            "AS metadata FROM tasks t WHERE t.status IN ('done','archived') "
+            "AND t.verification_status != 'verified'"
+        ).fetchall()
+        for row in legacy_unverified:
+            try:
+                run_metadata = json.loads(row["metadata"]) if row["metadata"] else None
+            except (TypeError, ValueError):
+                run_metadata = None
+            if classify_closure_evidence(metadata=run_metadata).satisfied:
+                conn.execute(
+                    "UPDATE tasks SET verification_status='verified' WHERE id=?",
+                    (row["id"],),
+                )
+
     # A successful retry used to retain ``next_retry_at``; a worker completing
     # on its final allowed model turn could also receive a late timeout a few
     # seconds later.  Keep the historical events as audit evidence, but restore

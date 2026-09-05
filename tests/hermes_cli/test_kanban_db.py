@@ -3005,6 +3005,28 @@ def test_complete_task_promotes_reviewer_checks_into_event_evidence(kanban_home)
     assert task.verification_status == "verified"
 
 
+def test_init_reconciles_legacy_reviewer_checks_verification(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy reviewed task")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="approved",
+            metadata={"reviewer_checks": ["live API returned HTTP 200"]},
+        )
+        conn.execute(
+            "UPDATE tasks SET verification_status='unverified' WHERE id=?",
+            (task_id,),
+        )
+
+    kb.init_db()
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.verification_status == "verified"
+
+
 
 
 # ---------------------------------------------------------------------------
