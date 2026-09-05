@@ -7912,11 +7912,22 @@ def block_task(
 
 
 def redact_review_value(value: Any) -> Any:
-    """Redact secrets at the domain boundary for durable review handoffs."""
+    """Redact secrets at the domain boundary for durable review handoffs.
+
+    ``redact_phone=False``: review summaries/reasons routinely CITE a phone
+    number already present and verifiable in the diff/file under review (a
+    public business line, for instance). The generic E.164 pattern is tuned
+    for personal contacts leaking through messaging platforms, not for this
+    boundary — applying it here made a reviewer's own tool mask the number
+    it was quoting as proof, and the reviewer then mistook that masking for
+    a defect in the code, looping changes_requested on an already-correct
+    candidate (2026-09-05). Every other secret pattern (API keys, JWTs, auth
+    headers, DB connection strings, …) still applies via force=True.
+    """
     if isinstance(value, str):
         from agent.redact import redact_sensitive_text
 
-        return redact_sensitive_text(value, force=True)
+        return redact_sensitive_text(value, force=True, redact_phone=False)
     if isinstance(value, dict):
         return {key: redact_review_value(item) for key, item in value.items()}
     if isinstance(value, list):

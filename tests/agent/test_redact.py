@@ -1051,3 +1051,32 @@ class TestMaskSecretControlStripping:
     def test_all_control_value_returns_empty_fallback(self):
         assert mask_secret("\n\x85\u200b") == ""
         assert mask_secret("\n\x85\u200b", empty="(not set)") == "(not set)"
+
+
+class TestPhoneRedactionOptOut:
+    """redact_phone=False (2026-09-05, t_8bf3a7b8): the E.164 phone pattern
+    exists to protect personal contacts leaking through Signal/WhatsApp/
+    Telegram logs. Applied to a Kanban review handoff that only CITES a
+    number already present and verifiable in the reviewed diff/file (e.g. a
+    public business line), it instead masks the reviewer's own evidence \u2014
+    the reviewer then reads back its own tool's redaction and mistakes it
+    for a defect in the code, looping changes_requested on an
+    already-correct candidate."""
+
+    def test_phone_masked_by_default(self):
+        text = "call the pro line at +33665045727 to confirm"
+        out = redact_sensitive_text(text, force=True)
+        assert "+33665045727" not in out
+        assert "+336****5727" in out
+
+    def test_phone_survives_with_redact_phone_false(self):
+        text = "call the pro line at +33665045727 to confirm"
+        out = redact_sensitive_text(text, force=True, redact_phone=False)
+        assert out == text
+
+    def test_redact_phone_false_still_redacts_other_secrets(self):
+        secret = "ghp_" + "E" * 40
+        text = f"number +33665045727 and token {secret}"
+        out = redact_sensitive_text(text, force=True, redact_phone=False)
+        assert "+33665045727" in out
+        assert secret not in out

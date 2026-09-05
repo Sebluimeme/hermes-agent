@@ -778,6 +778,7 @@ def redact_sensitive_text(
     code_file: bool = False,
     file_read: bool = False,
     redact_url_credentials: bool = False,
+    redact_phone: bool = True,
 ) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -790,6 +791,19 @@ def redact_sensitive_text(
     additionally redact credential-named query parameters and ``user:pass@``
     URL userinfo. The default remains False because actionable OAuth callback,
     magic-link, and pre-signed URLs must survive ordinary tool flows unchanged.
+
+    Set redact_phone=False for durable review-handoff text (Kanban review
+    summaries, change-request reasons, completion summaries) that only CITES
+    content already present and independently verifiable in the diff/file
+    under review. The E.164 phone pattern below exists to protect personal
+    contacts leaking through Signal/WhatsApp/Telegram message logs — applying
+    it to a review handoff instead masks a business/public number quoted from
+    the reviewed code itself, so the reviewer (human or autonomous) reads back
+    its own tool's redaction and mistakes it for a defect in the code, driving
+    an infinite changes_requested loop on an already-correct candidate
+    (issue: redact_review_value over-masking, 2026-09-05). All other secret
+    patterns (API keys, JWTs, auth headers, DB connection strings, …) are
+    unaffected by this flag and stay redacted even with force=True.
 
     Set code_file=True to skip the ENV-assignment and JSON-field regex
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
@@ -998,7 +1012,7 @@ def redact_sensitive_text(
         text = _redact_form_body(text)
 
     # E.164 phone numbers (Signal, WhatsApp)
-    if "+" in text:
+    if redact_phone and "+" in text:
         def _redact_phone(m):
             phone = m.group(1)
             if len(phone) <= 8:

@@ -825,13 +825,18 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    # redact_phone=False: this durable summary/result may cite a phone
+    # number already present and verifiable in the reviewed diff/file (e.g.
+    # a public business line) — masking it here made a reviewer read back
+    # its own tool's redaction and mistake it for a code defect (2026-09-05,
+    # t_8bf3a7b8). Other secret patterns are unaffected.
     if summary:
-        summary = redact_sensitive_text(str(summary), force=True)
+        summary = redact_sensitive_text(str(summary), force=True, redact_phone=False)
     if result:
-        result = redact_sensitive_text(str(result), force=True)
+        result = redact_sensitive_text(str(result), force=True, redact_phone=False)
     if metadata is not None and isinstance(metadata, dict):
         meta_json = json.dumps(metadata)
-        meta_json = redact_sensitive_text(meta_json, force=True)
+        meta_json = redact_sensitive_text(meta_json, force=True, redact_phone=False)
         try:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
@@ -1188,14 +1193,20 @@ def _handle_request_review(args: dict, **kw) -> str:
             "summary is required — describe what was implemented and how it "
             "was verified so the reviewer has context"
         )
-    summary = redact_sensitive_text(str(summary), force=True)
+    # redact_phone=False: a review summary legitimately CITES phone numbers
+    # already present and verifiable in the reviewed diff/file (e.g. a
+    # public business line) as evidence — masking that citation made the
+    # reviewer read back its own tool's redaction and mistake it for a
+    # defect in the code, looping changes_requested on an already-correct
+    # candidate (2026-09-05, t_8bf3a7b8). Other secret patterns still apply.
+    summary = redact_sensitive_text(str(summary), force=True, redact_phone=False)
     metadata = args.get("metadata")
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     if metadata is not None:
-        metadata_json = redact_sensitive_text(json.dumps(metadata), force=True)
+        metadata_json = redact_sensitive_text(json.dumps(metadata), force=True, redact_phone=False)
         try:
             metadata = json.loads(metadata_json)
         except json.JSONDecodeError:
@@ -1205,7 +1216,7 @@ def _handle_request_review(args: dict, **kw) -> str:
     if reviewer:
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
-        reviewer = redact_sensitive_text(str(reviewer), force=True)
+        reviewer = redact_sensitive_text(str(reviewer), force=True, redact_phone=False)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1264,7 +1275,10 @@ def _handle_request_changes(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — describe the changes needed")
-    reason = redact_sensitive_text(str(reason), force=True)
+    # redact_phone=False: same review-handoff class as kanban_request_review
+    # above — a rework reason legitimately cites diff content (2026-09-05,
+    # t_8bf3a7b8).
+    reason = redact_sensitive_text(str(reason), force=True, redact_phone=False)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1326,7 +1340,9 @@ def _handle_defer_review(args: dict, **kw) -> str:
             ok, detail = kb.defer_review_task(
                 conn,
                 tid,
-                reason=redact_sensitive_text(reason, force=True),
+                # redact_phone=False: same review-handoff class (2026-09-05,
+                # t_8bf3a7b8) — a defer reason can cite diff content.
+                reason=redact_sensitive_text(reason, force=True, redact_phone=False),
                 retry_at=int(retry_at),
                 expected_run_id=_worker_run_id(tid),
                 metadata=metadata,

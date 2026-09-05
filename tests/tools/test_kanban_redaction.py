@@ -163,3 +163,87 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     assert run is not None
     stored = run.summary or run.result if hasattr(run, "result") else run.summary or ""
     assert secret not in (stored or "")
+
+
+# ---------------------------------------------------------------------------
+# Regression — review-handoff text must not mask cited phone numbers
+# (2026-09-05, t_8bf3a7b8): redact_sensitive_text's generic E.164 pattern
+# was masking a business phone number quoted verbatim from the reviewed
+# diff/file, so the reviewer read back its own tool's redaction and mistook
+# it for a code defect, looping changes_requested on an already-correct
+# candidate. Other secret classes must still be caught in the same text.
+# ---------------------------------------------------------------------------
+
+_PHONE = "+33665045727"
+
+
+def test_kanban_request_review_summary_keeps_cited_phone(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, worker_env)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    secret = "ghp_" + "F" * 40
+    summary = f"verified pro phone {_PHONE} in page.tsx; unrelated token {secret}"
+    result = json.loads(kt._handle_request_review({
+        "task_id": worker_env, "summary": summary,
+    }))
+    assert result["ok"] is True
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, worker_env)
+    assert run is not None
+    stored = run.summary or ""
+    assert _PHONE in stored
+    assert secret not in stored
+
+
+def test_kanban_request_changes_reason_keeps_cited_phone(worker_env):
+    """Reviewer's rework reason quoting the same diff content must survive
+    unmasked, or an autonomous reviewer reads its own redaction as proof of
+    a defect that was never actually in the code."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert kb.request_review(
+            conn, worker_env,
+            summary="ready for independent review",
+            reviewer="test-worker",
+            expected_run_id=run.id,
+        )
+        assert kb.claim_review_task(conn, worker_env) is not None
+    finally:
+        conn.close()
+    reason = f"the number {_PHONE} looks masked — please confirm"
+    result = json.loads(kt._handle_request_changes({
+        "task_id": worker_env, "reason": reason,
+    }))
+    assert result["ok"] is True
+    with kb.connect_closing() as conn:
+        events = [e for e in kb.list_events(conn, worker_env) if e.kind == "changes_requested"]
+    assert events, "expected a changes_requested event"
+    stored_reason = str(events[-1].payload.get("reason") or "")
+    assert _PHONE in stored_reason
+
+
+def test_kanban_complete_summary_keeps_cited_phone(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    summary = f"confirmed real number is {_PHONE}, no masking bug in code"
+    result = json.loads(kt._handle_complete({
+        "task_id": worker_env, "summary": summary,
+    }))
+    assert result["ok"] is True
+    with kb.connect_closing() as conn:
+        run = kb.latest_run(conn, worker_env)
+    assert run is not None
+    assert _PHONE in (run.summary or "")
+
+
+def test_kanban_db_request_review_keeps_cited_phone_cli_path():
+    """Same regression via the CLI-facing kanban_db.request_review path
+    (``hermes kanban request-review --summary``), independent of the
+    kanban_tools MCP-tool layer."""
+    from hermes_cli import kanban_db as kb
+    assert kb.redact_review_value(f"test {_PHONE}") == f"test {_PHONE}"
