@@ -30,7 +30,7 @@ def classify_closure_evidence(
     ``prior_status`` is accepted for source compatibility with the former
     runtime gate API.  The current implementation only reads metadata already
     attached to a completed run: explicit ``metadata.evidence`` first, then
-    durable artifacts, then review handoff facts.
+    durable artifacts, then review handoff facts and reviewer checks.
     """
     data = metadata if isinstance(metadata, Mapping) else {}
     evidence = data.get("evidence")
@@ -53,6 +53,17 @@ def classify_closure_evidence(
         detail = _clean(review.get("summary") or review.get("detail"))
         if detail:
             return ClosureEvidence(True, kind="review", detail=detail)
+
+    reviewer_checks = data.get("reviewer_checks")
+    if isinstance(reviewer_checks, (list, tuple)):
+        checks = [_clean(item) for item in reviewer_checks]
+        checks = [item for item in checks if item]
+        if checks:
+            return ClosureEvidence(
+                True,
+                kind="review",
+                detail=" | ".join(checks),
+            )
 
     visual = data.get("visual_review")
     if isinstance(visual, Mapping):

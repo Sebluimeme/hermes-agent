@@ -92,6 +92,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.closure_evidence import classify_closure_evidence
 from toolsets import get_toolset_names
 from agent.redact import redact_sensitive_text
 
@@ -6762,12 +6763,19 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        _closure_evidence = classify_closure_evidence(
+            prior_status=prior_status,
+            metadata=metadata,
+        )
         completed_payload["evidence"] = (
-            metadata.get("evidence")
-            if isinstance(metadata, dict) and isinstance(metadata.get("evidence"), dict)
+            {
+                "kind": _closure_evidence.kind,
+                "detail": _closure_evidence.detail,
+            }
+            if _closure_evidence.satisfied
             else None
         )
-        _verified = completed_payload["evidence"] is not None
+        _verified = _closure_evidence.satisfied
         if completed_payload["evidence"] is None:
             completed_payload.pop("evidence")
         _completion_meta = metadata if isinstance(metadata, dict) else {}

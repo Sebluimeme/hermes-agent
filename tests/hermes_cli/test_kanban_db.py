@@ -2977,6 +2977,34 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def test_complete_task_promotes_reviewer_checks_into_event_evidence(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review GA4")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="GA4 approved",
+            metadata={
+                "reviewer_checks": [
+                    "GA4 live API: devis_form_submit custom=True",
+                    "origin/main == 0dc5047",
+                ]
+            },
+        )
+
+        completed = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "completed"
+        ][-1]
+        task = kb.get_task(conn, task_id)
+
+    assert completed.payload["evidence"]["kind"] == "review"
+    assert "devis_form_submit" in completed.payload["evidence"]["detail"]
+    assert task is not None
+    assert task.verification_status == "verified"
+
+
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,33 @@ def test_verified_kanban_completion_is_rendered_from_database(tmp_path):
     assert "output-proof-guard" not in rendered
 
 
+def test_verified_kanban_completion_accepts_reviewer_checks(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(conn, title="valider GA4")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="GA4 validé par la revue finale",
+            metadata={
+                "reviewer_checks": [
+                    "API GA4 live : devis_form_submit custom=True",
+                    "commit 0dc5047 présent sur origin/main",
+                ]
+            },
+        )
+        assert kb.mark_task_delivered(conn, task_id)
+
+    rendered = verified_kanban_completion_message(
+        f"[kanban] Task {task_id} completed.", db_path=db_path
+    )
+
+    assert rendered is not None
+    assert "GA4 validé" in rendered
+    assert "devis_form_submit" in rendered
+    assert "0dc5047" in rendered
+
+
 def test_verified_kanban_completion_reports_the_whole_delivered_mission(tmp_path):
     db_path = tmp_path / "kanban.db"
     with kb.connect(db_path) as conn:

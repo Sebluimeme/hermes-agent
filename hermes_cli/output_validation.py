@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from hermes_cli.closure_evidence import classify_closure_evidence
+
 
 # A plugin may return this exact value from ``transform_llm_output`` to ask the
 # runtime for one same-session repair turn. The turn finalizer converts it to
@@ -106,11 +108,8 @@ def verified_kanban_completion_message(
         for item in active_tasks:
             run = kb.latest_run(conn, item.id)
             metadata = run.metadata if run and isinstance(run.metadata, dict) else {}
-            evidence = metadata.get("evidence")
-            detail = _sentence_fragment(
-                evidence.get("detail") if isinstance(evidence, dict) else "",
-                limit=900,
-            )
+            evidence = classify_closure_evidence(metadata=metadata)
+            detail = _sentence_fragment(evidence.detail, limit=900)
             summary = _sentence_fragment(
                 (run.summary if run else None) or item.result,
                 limit=900,
