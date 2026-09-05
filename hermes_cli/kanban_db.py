@@ -10004,6 +10004,56 @@ def normalize_routing_tier(value: Optional[str]) -> str:
     return normalized if normalized in VALID_ROUTING_TIERS else DEFAULT_ROUTING_TIER
 
 
+# Additional Coder lanes beyond the historical single ``coder`` profile are
+# named ``coder2``, ``coder3``, ... (t_1d6b3aa2: 2 Claude + up to 3 Coder
+# lanes filled by real independent capacity). Hard cap at 3 total Coder
+# lanes -- Sébastien's explicit "limite stricte à 3 Coder simultanés" -- so a
+# future config typo (or an over-eager decomposition) can never silently
+# grow the pool.
+MAX_CODER_LANES = 3
+_CODER_LANE_RE = re.compile(r"^coder([2-9]|[1-9][0-9]+)?$")
+
+
+def _is_coder_lane(route: str) -> bool:
+    """True for the historical ``coder`` profile and its numbered siblings."""
+    return bool(_CODER_LANE_RE.match(route or ""))
+
+
+def coder_profile_canary(profile: str) -> tuple[bool, str]:
+    """Free, local, network-free canary proving a Coder lane can actually spawn.
+
+    The historical single ``coder`` lane fails OPEN in ``route_preflight_ok``
+    because no live GPT quota measurement is wired up -- a reasonable default
+    when the profile is known to already carry a working OAuth session. A
+    freshly created lane (``coder2``, ``coder3``, ...) starts with no session
+    at all: fail-open there would let the dispatcher repeatedly hand it real
+    cards that can never spawn, burning the task's retry budget instead of
+    surfacing the missing login. This canary reads only the profile's local
+    ``config.yaml`` / ``auth.json`` -- never a network call, never a paid
+    turn -- and reports a missing/empty/unreadable auth file as a hard
+    "not ready" rather than the generic fail-open used for genuinely
+    unmeasured-but-authenticated lanes.
+    """
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        profile_dir = get_profile_dir(profile)
+    except Exception:
+        return False, "profile_unresolved"
+    if not (profile_dir / "config.yaml").exists():
+        return False, "profile_missing"
+    auth_path = profile_dir / "auth.json"
+    if not auth_path.exists():
+        return False, "coder_auth_missing"
+    try:
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "coder_auth_unreadable"
+    if not isinstance(payload, dict) or not payload:
+        return False, "coder_auth_empty"
+    return True, "coder_auth_present"
+
+
 def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool, str]:
     """Free, local, uniform preflight for one real dispatch route.
 
@@ -10018,21 +10068,28 @@ def route_preflight_ok(route: str, *, now: Optional[float] = None) -> tuple[bool
       refreshed for free by ``quota_preflight.py``). Only a measured active
       cooldown is red; absent, stale, or failed telemetry lets the real worker
       attempt establish availability.
-    * ``spark`` / ``coder`` -- the OpenAI Codex lanes. They fail OPEN
+    * ``spark`` / ``coder`` (and numbered Coder lanes ``coder2``, ``coder3``)
+      -- the OpenAI Codex lanes. They fail OPEN
       (ok=True) unless a
       local cache explicitly records it as cooling down, so "no live GPT
       quota measurement wired up yet" can never strand every route when
       both Claude lanes are genuinely down. A local launcher/spawn error
       is NEVER a signal this function consumes (decision (d)): that kind
       of failure is handled entirely by the existing respawn-guard /
-      consecutive-failures machinery, never by this preflight.
+      consecutive-failures machinery, never by this preflight. A numbered
+      Coder lane additionally requires ``coder_profile_canary`` to prove a
+      local OAuth session exists before it is allowed to fail open.
     """
     if provider_error_cooldown(route, now=now) is not None:
         return (False, "provider_cooldown")
     if route in ("claude1", "claude2"):
         reason = quota_dispatch_guard(route, now=now)
         return (reason is None, reason or "fresh_available")
-    if route in {"spark", "coder"}:
+    if route == "spark" or _is_coder_lane(route):
+        if _is_coder_lane(route) and route != "coder":
+            auth_ok, auth_reason = coder_profile_canary(route)
+            if not auth_ok:
+                return (False, auth_reason)
         path = Path(
             os.environ.get("HERMES_KANBAN_QUOTA_ROUTING_PATH", "").strip()
             or str(kanban_home() / QUOTA_ROUTING_STATE_PATH)
@@ -10100,6 +10157,7 @@ def _configured_handoff_routes() -> dict[str, tuple[tuple[str, Optional[str]], .
             continue
         route: list[tuple[str, Optional[str]]] = []
         seen: set[str] = set()
+        coder_lane_count = 0
         for entry in entries:
             if isinstance(entry, str):
                 profile = entry.strip()
@@ -10114,6 +10172,15 @@ def _configured_handoff_routes() -> dict[str, tuple[tuple[str, Optional[str]], .
             if not profile or profile in seen:
                 route = []
                 break
+            if _is_coder_lane(profile):
+                coder_lane_count += 1
+                if coder_lane_count > MAX_CODER_LANES:
+                    # Sébastien's explicit "limite stricte à 3 Coder
+                    # simultanés": a config that lists a 4th Coder lane is a
+                    # misconfiguration, fail closed the same way a duplicate
+                    # entry does rather than silently accept extra capacity.
+                    route = []
+                    break
             seen.add(profile)
             route.append((profile, model or None))
         if route:
@@ -10190,6 +10257,12 @@ def resolve_parallel_routes(
 
     Missing/invalid config yields no routes. If every configured lane is
     explicitly refused, use the final configured profile as the terminal route.
+
+    The number of distinct lanes filled is bounded by ``len(roles)`` (the
+    configured chain length for this tier), not a hardcoded constant: a
+    3-hop chain (Claude 2, Claude 1, Coder) still tops out at 3 as before,
+    while a 5-hop chain (2 Claude + up to 3 Coder lanes, t_1d6b3aa2) can fill
+    all 5 for a genuinely 5-way independent batch.
     """
     if task_count <= 0:
         return [], []
@@ -10205,7 +10278,7 @@ def resolve_parallel_routes(
                 role,
                 model_override,
             ))
-        if len(selected) >= min(task_count, 3):
+        if len(selected) >= min(task_count, len(roles)):
             break
     if not selected and roles:
         selected = [roles[-1]]
@@ -11875,6 +11948,8 @@ def _route_label(profile: str) -> str:
         return "Spark"
     if profile == "coder":
         return "Coder"
+    if _is_coder_lane(profile):
+        return f"Coder {profile[len('coder'):]}"
     return profile
 
 
@@ -12080,7 +12155,11 @@ def capture_provider_reset(
     if task is None:
         return None
     role = _route_role_for_assignment(task["assignee"], task["model_override"])
-    if role not in ("claude2", "claude1", "spark", "coder"):
+    # Generalized from a hardcoded 4-name tuple so numbered Coder lanes
+    # (``coder2``, ``coder3``, t_1d6b3aa2) get the same cooldown bookkeeping
+    # as the historical single ``coder`` profile instead of being silently
+    # dropped here.
+    if role not in ("claude2", "claude1", "spark") and not _is_coder_lane(role or ""):
         return None
     received = float(time.time() if received_at is None else received_at)
     received_dt = dt.datetime.fromtimestamp(received, tz=dt.timezone.utc)
@@ -12265,7 +12344,7 @@ def fallback_simple_route(
             "reason": safe_error,
         },
     )
-    if next_assignee == "coder":
+    if _is_coder_lane(next_assignee or ""):
         already_relayed = conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'relayed_to_coder' LIMIT 1",
             (task_id,),

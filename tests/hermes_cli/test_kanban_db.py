@@ -1282,6 +1282,153 @@ def test_parallel_complex_routes_use_coder_when_a_claude_is_unavailable(
     assert routes == [("claude1", None), ("coder", None)]
 
 
+# t_1d6b3aa2: 2 Claude + up to 3 Coder lanes filled by real, independent
+# capacity. A 5-hop complex chain (Claude 2, Claude 1, Coder, Coder 2,
+# Coder 3) must fill exactly Sébastien's documented matrix for 1/2/3/5
+# genuinely independent lots, while the historical 3-hop chain (covered by
+# the tests above) keeps behaving exactly as before.
+FIVE_LANE_HANDOFF_ROUTES = {
+    kb.ROUTING_TIER_COMPLEX: (
+        ("claude2", None),
+        ("claude1", None),
+        ("coder", None),
+        ("coder2", None),
+        ("coder3", None),
+    ),
+}
+
+
+@pytest.fixture
+def five_lane_handoff_routes(monkeypatch):
+    monkeypatch.setattr(kb, "_configured_handoff_routes", lambda: FIVE_LANE_HANDOFF_ROUTES)
+    return FIVE_LANE_HANDOFF_ROUTES
+
+
+@pytest.mark.parametrize(
+    "task_count, expected",
+    [
+        (1, [("claude2", None)]),
+        (2, [("claude2", None), ("claude1", None)]),
+        (3, [("claude2", None), ("claude1", None), ("coder", None)]),
+        (
+            5,
+            [
+                ("claude2", None), ("claude1", None), ("coder", None),
+                ("coder2", None), ("coder3", None),
+            ],
+        ),
+    ],
+)
+def test_parallel_routes_fill_five_lane_matrix_by_real_capacity(
+    five_lane_handoff_routes, task_count, expected,
+):
+    """1/2/3/5 independent lots fill exactly 2 Claude + up to 3 Coder lanes."""
+    routes, _ = kb.resolve_parallel_routes(
+        "complex", task_count, preflight_fn=lambda route: (True, "green"),
+    )
+    assert routes == expected
+
+
+def test_parallel_routes_open_third_coder_only_when_all_five_lanes_needed(
+    five_lane_handoff_routes,
+):
+    """4 independent lots use only the first 4 configured lanes, not all 5."""
+    routes, _ = kb.resolve_parallel_routes(
+        "complex", 4, preflight_fn=lambda route: (True, "green"),
+    )
+    assert routes == [
+        ("claude2", None), ("claude1", None), ("coder", None), ("coder2", None),
+    ]
+
+
+def test_coder_lane_config_rejects_a_fourth_coder_profile(monkeypatch):
+    """A config listing 4 Coder lanes fails closed (Sébastien's strict cap of 3)."""
+    from hermes_cli import config
+
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"handoff_routes": {
+        "complex": [
+            {"profile": "claude2"}, {"profile": "claude1"},
+            {"profile": "coder"}, {"profile": "coder2"},
+            {"profile": "coder3"}, {"profile": "coder4"},
+        ],
+    }}})
+
+    assert kb._configured_handoff_routes() == {}
+    assert kb.resolve_parallel_routes("complex", 5) == ([], [])
+
+
+def test_coder_profile_canary_requires_local_auth_file(tmp_path, monkeypatch):
+    """A numbered Coder lane with no auth.json is not silently fail-open."""
+    from hermes_cli import profiles as profiles_mod
+
+    profile_dir = tmp_path / "coder2"
+    profile_dir.mkdir()
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda name: profile_dir)
+
+    # No config.yaml at all: the profile itself was never created.
+    ok, reason = kb.coder_profile_canary("coder2")
+    assert (ok, reason) == (False, "profile_missing")
+
+    (profile_dir / "config.yaml").write_text("model:\n  provider: openai-codex\n")
+    ok, reason = kb.coder_profile_canary("coder2")
+    assert (ok, reason) == (False, "coder_auth_missing")
+
+    (profile_dir / "auth.json").write_text("not json")
+    ok, reason = kb.coder_profile_canary("coder2")
+    assert (ok, reason) == (False, "coder_auth_unreadable")
+
+    (profile_dir / "auth.json").write_text("{}")
+    ok, reason = kb.coder_profile_canary("coder2")
+    assert (ok, reason) == (False, "coder_auth_empty")
+
+    (profile_dir / "auth.json").write_text('{"tokens": {"access_token": "x"}}')
+    ok, reason = kb.coder_profile_canary("coder2")
+    assert (ok, reason) == (True, "coder_auth_present")
+
+
+def test_route_preflight_fails_closed_for_unauthenticated_numbered_coder_lane(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """An unauthenticated coder2/coder3 must not be counted as available capacity.
+
+    Unlike the historical single ``coder`` lane (fail-open by design: no live
+    GPT quota measurement is wired up, and it is known to already carry a
+    working session), a freshly created numbered lane starts with no OAuth
+    session. route_preflight_ok must refuse it instead of handing it real
+    cards that can never spawn.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    profile_dir = tmp_path / "coder2"
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda name: profile_dir)
+    monkeypatch.setattr(kb, "provider_error_cooldown", lambda *_a, **_k: None)
+
+    ok, reason = kb.route_preflight_ok("coder2")
+    assert (ok, reason) == (False, "profile_missing")
+
+    profile_dir.mkdir()
+    (profile_dir / "config.yaml").write_text("model:\n  provider: openai-codex\n")
+    ok, reason = kb.route_preflight_ok("coder2")
+    assert (ok, reason) == (False, "coder_auth_missing")
+
+    (profile_dir / "auth.json").write_text('{"tokens": {"access_token": "x"}}')
+    ok, reason = kb.route_preflight_ok("coder2")
+    assert ok is True
+
+
+def test_route_preflight_keeps_historical_coder_fail_open_without_canary(
+    kanban_home, configured_handoff_routes, monkeypatch,
+):
+    """The pre-existing single ``coder`` lane keeps its fail-open contract."""
+    monkeypatch.setattr(kb, "provider_error_cooldown", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        kb, "coder_profile_canary",
+        lambda profile: (_ for _ in ()).throw(AssertionError("must not be called for 'coder'")),
+    )
+    ok, reason = kb.route_preflight_ok("coder")
+    assert (ok, reason) == (True, "fail_open_last_resort")
+
+
 def test_first_available_route_skips_busy_lanes_in_configured_order(
     configured_handoff_routes,
 ):
