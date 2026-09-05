@@ -104,6 +104,7 @@ def test_cli_dispatch_json_exposes_guard_reasons(
     result = kanban_db.DispatchResult(
         respawn_guarded=[("t_wait", "provider_cooldown")],
         oauth_blocked=["t_auth"],
+        progress_stalled=["t_stalled"],
     )
     monkeypatch.setattr(kanban_db, "dispatch_once", lambda conn, **kw: result)
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
@@ -115,4 +116,4 @@ def test_cli_dispatch_json_exposes_guard_reasons(
         {"task_id": "t_wait", "reason": "provider_cooldown"}
     ]
     assert payload["oauth_blocked"] == ["t_auth"]
-
+    assert payload["progress_stalled"] == ["t_stalled"]

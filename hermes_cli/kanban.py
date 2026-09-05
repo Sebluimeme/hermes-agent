@@ -2960,6 +2960,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
+            "progress_stalled": res.progress_stalled,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
             "stale": res.stale,
@@ -2999,6 +3000,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
+    print(f"Progress stalled: {len(res.progress_stalled)}")
+    if res.progress_stalled:
+        print(f"  {', '.join(res.progress_stalled)}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
