@@ -76,6 +76,27 @@ def test_file_path_alone_is_not_closure_evidence():
     assert evidence.kind == ""
 
 
+def test_classifies_tests_metadata_from_no_code_change_verification():
+    """t_7ad89d6a: a read-only verification closure with no commit to cite.
+
+    The worker recorded real proof under ``tests``/``commands_run`` (its own
+    checkpoint shape) rather than ``verification``/``evidence``, which raised
+    a permanent false ``delivered_without_proof`` critical in the compliance
+    scan (t_7456fcbc) even though 151 real tests were run and reported.
+    """
+    evidence = classify_closure_evidence(
+        metadata={
+            "changed_files": [],
+            "commands_run": ["python3 scripts/todo_hub.py show"],
+            "tests": {"targeted": "151 passed in 5.34s"},
+        }
+    )
+
+    assert evidence.satisfied is True
+    assert evidence.kind == "tests"
+    assert "151 passed" in evidence.detail
+
+
 def test_refuses_empty_metadata():
     evidence = classify_closure_evidence(prior_status="review", metadata={})
 

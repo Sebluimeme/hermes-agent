@@ -53,6 +53,10 @@ def classify_closure_evidence(
     if verification:
         return ClosureEvidence(True, kind="verification", detail=verification)
 
+    tests = _verification_detail(data.get("tests"))
+    if tests:
+        return ClosureEvidence(True, kind="tests", detail=tests)
+
     proof = _clean(data.get("proof"))
     if proof:
         return ClosureEvidence(True, kind="proof", detail=proof)
