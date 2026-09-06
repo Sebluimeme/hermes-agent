@@ -10434,6 +10434,21 @@ def resolve_first_available_route(
     return None, None, trace
 
 
+def _running_counts_by_profile(conn: sqlite3.Connection) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND assignee IS NOT NULL "
+        "GROUP BY assignee"
+    ):
+        counts[row["assignee"]] = int(row["n"])
+    return counts
+
+
+def _normalized_per_profile_cap(value: Optional[int]) -> Optional[int]:
+    return value if isinstance(value, int) and value > 0 else None
+
+
 def _ready_task_has_resumable_worker_session(
     conn: sqlite3.Connection,
     task_id: str,
@@ -12327,7 +12342,9 @@ def capture_claude_provider_reset(
     return capture_provider_reset(conn, task_id, error, received_at=received_at)
 
 
-def _relay_to_coder_message(conn: sqlite3.Connection, task_id: str) -> str:
+def _relay_to_coder_message(
+    conn: sqlite3.Connection, task_id: str, to_route: str = "Coder",
+) -> str:
     """Build the sole Coder relay message from API evidence recorded for this task."""
     rows = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'claude_provider_reset' "
@@ -12350,7 +12367,7 @@ def _relay_to_coder_message(conn: sqlite3.Connection, task_id: str) -> str:
             estimates[role] = parsed.astimezone(ZoneInfo("Europe/Paris")).strftime("%H:%M")
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
-    lines = ["Relais automatique vers Coder."]
+    lines = [f"Relais automatique vers {to_route}."]
     for role, label in (("claude2", "Claude 2"), ("claude1", "Claude 1")):
         if role in estimates:
             lines.append(f"Retour estimé {label} : {estimates[role]}")
@@ -12358,7 +12375,13 @@ def _relay_to_coder_message(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def fallback_simple_route(
-    conn: sqlite3.Connection, task_id: str, error: str, *, provider_proven: bool = True,
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+    *,
+    provider_proven: bool = True,
+    running_by_profile: Optional[Mapping[str, int]] = None,
+    max_in_progress_per_profile: Optional[int] = None,
 ) -> bool:
     """Arm the next real route in a failed card's ordered fallback chain.
 
@@ -12414,20 +12437,89 @@ def fallback_simple_route(
     if safe_error != "provider_cooldown":
         capture_claude_provider_reset(conn, task_id, error)
     if idx + 1 >= len(chain):
-        return False  # already on the last hop (Coder) -- nothing further to try
-    next_assignee, next_model = chain[idx + 1]
+        return False  # already on the last hop -- nothing further to try
     from_route = _route_label(current_role)
-    to_route = _route_label(next_assignee)
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         profile_exists = None  # type: ignore[assignment]
-    if profile_exists is not None and not profile_exists(next_assignee):
+    cap = _normalized_per_profile_cap(max_in_progress_per_profile)
+    running_counts = (
+        dict(running_by_profile)
+        if running_by_profile is not None
+        else _running_counts_by_profile(conn) if cap is not None else {}
+    )
+    trace: list[dict[str, Any]] = []
+    next_assignee: Optional[str] = None
+    next_model: Optional[str] = None
+    for candidate_assignee, candidate_model in chain[idx + 1:]:
+        if profile_exists is not None and not profile_exists(candidate_assignee):
+            trace.append({
+                "route": candidate_assignee,
+                "model_override": candidate_model,
+                "ok": False,
+                "reason": "profile_missing",
+                "running": int(running_counts.get(candidate_assignee, 0)),
+                "capacity_available": False,
+            })
+            continue
+        if is_opus and candidate_assignee != "claude1":
+            trace.append({
+                "route": candidate_assignee,
+                "model_override": candidate_model,
+                "ok": False,
+                "reason": "opus_no_degrade",
+                "running": int(running_counts.get(candidate_assignee, 0)),
+                "capacity_available": False,
+            })
+            continue
+        ok, reason = route_preflight_ok(candidate_assignee)
+        provider_eligible = ok or reason in {
+            "quota_measurement_unknown",
+            "quota_preflight_required",
+        }
+        running = int(running_counts.get(candidate_assignee, 0))
+        capacity_available = cap is None or running < cap
+        trace.append({
+            "route": candidate_assignee,
+            "model_override": candidate_model,
+            "ok": ok,
+            "reason": reason,
+            "running": running,
+            "capacity_available": capacity_available,
+        })
+        if provider_eligible and capacity_available:
+            next_assignee = candidate_assignee
+            next_model = row["model_override"] if is_opus else candidate_model
+            break
+    if next_assignee is None:
+        if trace and any(item.get("reason") != "profile_missing" for item in trace):
+            conn.execute(
+                "UPDATE tasks SET assignee = NULL, model_override = NULL, "
+                "provider_override = NULL, execution_status = 'pending', "
+                "failure_class = NULL, next_retry_at = NULL, action_required = NULL, "
+                "last_failure_error = ? WHERE id = ?",
+                (
+                    f"{from_route} failed; all fallback lanes unavailable: {safe_error}"[:500],
+                    task_id,
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "simple_route_fallback_waiting",
+                {
+                    "from_route": from_route,
+                    "from_assignee": row["assignee"],
+                    "from_model": row["model_override"],
+                    "reason": safe_error,
+                    "trace": trace,
+                    "message": "Aucune lane de relais disponible; attente d'une capacité libre.",
+                },
+            )
+            return True
         return False
-    if is_opus:
-        if next_assignee != "claude1":
-            return False
-        next_model = row["model_override"]
+    to_route = _route_label(next_assignee)
     conn.execute(
         "UPDATE tasks SET assignee = ?, model_override = ?, provider_override = NULL, "
         "consecutive_failures = 0, last_failure_error = ? WHERE id = ?",
@@ -12446,6 +12538,7 @@ def fallback_simple_route(
             "from_model": row["model_override"],
             "to_model": next_model,
             "reason": safe_error,
+            "trace": trace,
         },
     )
     if _is_coder_lane(next_assignee or ""):
@@ -12456,12 +12549,16 @@ def fallback_simple_route(
         if already_relayed is None:
             _append_event(
                 conn, task_id, "relayed_to_coder",
-                {"message": _relay_to_coder_message(conn, task_id)},
+                {"message": _relay_to_coder_message(conn, task_id, to_route)},
             )
     return True
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    max_in_progress_per_profile: Optional[int] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
@@ -12719,7 +12816,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # assignee is not on the route chain and remains on the
                     # existing cooldown path.
                     fallback_simple_route(
-                        conn, row["id"], error_text, provider_proven=True,
+                        conn,
+                        row["id"],
+                        error_text,
+                        provider_proven=True,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
                     )
                     rate_limited.append(row["id"])
                 elif guardrail_halt_exit:
@@ -14098,7 +14199,10 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(
+        conn,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -14582,6 +14686,8 @@ def _dispatch_once_locked(
                         row["id"],
                         quota_reason,
                         provider_proven=quota_reason == "provider_cooldown",
+                        running_by_profile=_per_profile_running,
+                        max_in_progress_per_profile=_per_profile_cap,
                     )
                     if rerouted:
                         conn.execute(

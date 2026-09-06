@@ -2769,6 +2769,128 @@ def test_fallback_route_both_claude_lanes_dead_moves_to_coder_with_one_event(
         assert payload["to_assignee"] == "coder"
 
 
+def test_fallback_route_skips_busy_coder_to_coder2(
+    kanban_home, all_assignees_spawnable, five_lane_handoff_routes, monkeypatch,
+):
+    """t_a31c185c: after both Claude lanes are cooling down, a fallback must
+    not pin the card on a saturated Coder lane when Coder 2 is executable."""
+    monkeypatch.setattr(kb, "route_preflight_ok", lambda route: (True, "green"))
+    with kb.connect() as conn:
+        busy = kb.create_task(conn, title="busy coder", assignee="coder")
+        kb.claim_task(conn, busy)
+        task_id = kb.create_task(
+            conn, title="work", assignee="claude1", routing_tier="complex",
+        )
+
+        assert kb.fallback_simple_route(
+            conn,
+            task_id,
+            "HTTP status: 429 code: rate_limit Retry-After: 120 seconds",
+            provider_proven=True,
+            max_in_progress_per_profile=1,
+        ) is True
+        row = conn.execute(
+            "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'simple_route_fallback' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        relay = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'relayed_to_coder' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert (row["assignee"], row["model_override"]) == ("coder2", None)
+    payload = json.loads(event["payload"])
+    assert payload["to_route"] == "Coder 2"
+    assert payload["trace"][0]["route"] == "coder"
+    assert payload["trace"][0]["capacity_available"] is False
+    assert payload["trace"][1]["route"] == "coder2"
+    assert json.loads(relay["payload"])["message"].startswith(
+        "Relais automatique vers Coder 2."
+    )
+
+
+def test_fallback_route_skips_busy_coder2_to_coder3(
+    kanban_home, all_assignees_spawnable, five_lane_handoff_routes, monkeypatch,
+):
+    """t_a31c185c: the same fallback chain continues beyond Coder 2."""
+    monkeypatch.setattr(kb, "route_preflight_ok", lambda route: (True, "green"))
+    with kb.connect() as conn:
+        busy = kb.create_task(conn, title="busy coder2", assignee="coder2")
+        kb.claim_task(conn, busy)
+        task_id = kb.create_task(
+            conn, title="work", assignee="coder", routing_tier="complex",
+        )
+
+        assert kb.fallback_simple_route(
+            conn,
+            task_id,
+            "HTTP status: 429 code: rate_limit Retry-After: 120 seconds",
+            provider_proven=True,
+            max_in_progress_per_profile=1,
+        ) is True
+        row = conn.execute(
+            "SELECT assignee, model_override FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'simple_route_fallback' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert (row["assignee"], row["model_override"]) == ("coder3", None)
+    payload = json.loads(event["payload"])
+    assert payload["to_route"] == "Coder 3"
+    assert payload["trace"][0]["route"] == "coder2"
+    assert payload["trace"][0]["capacity_available"] is False
+    assert payload["trace"][1]["route"] == "coder3"
+
+
+def test_fallback_route_all_lanes_unavailable_waits_unassigned(
+    kanban_home, all_assignees_spawnable, five_lane_handoff_routes, monkeypatch,
+):
+    """If no later lane has capacity, the card waits for the pool instead of
+    being durably pinned to an occupied Coder lane."""
+    monkeypatch.setattr(kb, "route_preflight_ok", lambda route: (True, "green"))
+    with kb.connect() as conn:
+        for assignee in ("coder", "coder2", "coder3"):
+            busy = kb.create_task(conn, title=f"busy {assignee}", assignee=assignee)
+            kb.claim_task(conn, busy)
+        task_id = kb.create_task(
+            conn, title="work", assignee="claude1", routing_tier="complex",
+        )
+
+        assert kb.fallback_simple_route(
+            conn,
+            task_id,
+            "HTTP status: 429 code: rate_limit Retry-After: 120 seconds",
+            provider_proven=True,
+            max_in_progress_per_profile=1,
+        ) is True
+        row = conn.execute(
+            "SELECT assignee, model_override, execution_status, last_failure_error "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        waiting = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'simple_route_fallback_waiting' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert row["assignee"] is None
+    assert row["model_override"] is None
+    assert row["execution_status"] == "pending"
+    assert "all fallback lanes unavailable" in row["last_failure_error"]
+    payload = json.loads(waiting["payload"])
+    assert payload["message"] == "Aucune lane de relais disponible; attente d'une capacité libre."
+    assert [item["capacity_available"] for item in payload["trace"]] == [False, False, False]
+
+
 def test_claude_provider_reset_capture_and_final_coder_relay_are_api_evidence_only(
     kanban_home, all_assignees_spawnable, configured_handoff_routes,
 ):
