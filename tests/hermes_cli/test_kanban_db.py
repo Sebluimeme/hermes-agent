@@ -1715,6 +1715,55 @@ def test_workspace_wait_events_are_deduplicated_and_measure_duration(kanban_home
     assert ended[0].payload["wait_seconds"] >= 0
 
 
+def test_ignored_nested_git_repo_does_not_conflict_with_parent(tmp_path):
+    parent = tmp_path / "parent"
+    child = parent / "projects" / "child"
+    parent.mkdir()
+    subprocess.run(["git", "init", "-q", str(parent)], check=True)
+    (parent / ".gitignore").write_text("projects/\n", encoding="utf-8")
+    child.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(child)], check=True)
+
+    assert kb._workspace_occupancy_conflict(str(parent), str(child)) is False
+
+
+def test_tracked_nested_repo_remains_serialized(tmp_path):
+    parent = tmp_path / "parent"
+    child = parent / "projects" / "child"
+    parent.mkdir()
+    subprocess.run(["git", "init", "-q", str(parent)], check=True)
+    child.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(child)], check=True)
+
+    assert kb._workspace_occupancy_conflict(str(parent), str(child)) is True
+
+
+def test_capacity_wait_records_sla_once_and_closes_with_duration(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="queued", assignee="coder")
+        conn.execute(
+            "UPDATE tasks SET created_at=created_at-120 WHERE id=?", (task_id,)
+        )
+
+        kb._record_capacity_wait(
+            conn, task_id, reason="profile_capacity", assignee="coder"
+        )
+        kb._record_capacity_wait(
+            conn, task_id, reason="profile_capacity", assignee="coder"
+        )
+        events = kb.list_events(conn, task_id)
+        assert len([event for event in events if event.kind == "capacity_wait"]) == 1
+        assert len([event for event in events if event.kind == "ready_sla_exceeded"]) == 1
+
+        kb._end_capacity_wait(conn, task_id)
+        ended = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "capacity_wait_ended"
+        ]
+        assert len(ended) == 1
+        assert ended[0].payload["wait_seconds"] >= 0
+
+
 def test_health_probe_ignores_ready_work_for_a_profile_at_capacity(
     kanban_home, all_assignees_spawnable,
 ):
@@ -1897,7 +1946,7 @@ def test_dispatch_keeps_nested_sibling_repositories_parallel(
 def test_dispatch_serializes_parent_and_ignored_nested_repository(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """Only Git-root overlap matters; ignore rules do not bypass the lock."""
+    """A proven autonomous ignored nested repo does not share the parent lock."""
     monkeypatch.setattr(kb, "_memory_pressure_level", lambda *_args: "ok")
     repository = kanban_home / "repository"
     _init_git_repo(repository)
@@ -1925,11 +1974,12 @@ def test_dispatch_serializes_parent_and_ignored_nested_repository(
         )
         result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
 
-    assert result.spawned == [(parent, "researcher", str(parent_workspace.resolve()))]
-    assert result.skipped_workspace_busy == [
-        (nested, str(nested_repository.resolve()), parent),
-    ]
-    assert spawned == [(parent, str(parent_workspace.resolve()))]
+    assert result.skipped_workspace_busy == []
+    assert {task_id for task_id, _assignee, _workspace in result.spawned} == {
+        parent,
+        nested,
+    }
+    assert len(spawned) == 2
 
 
 def test_dispatch_waits_one_tick_for_terminal_worker_exit_barrier(

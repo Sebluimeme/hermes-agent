@@ -14169,10 +14169,114 @@ def _workspace_occupancy_conflict(left: str, right: str) -> bool:
     if left_path == right_path:
         return True
     if left_path in right_path.parents:
-        return True
+        return not _nested_repo_is_independent(left_path, right_path)
     if right_path in left_path.parents:
-        return True
+        return not _nested_repo_is_independent(right_path, left_path)
     return False
+
+
+def _nested_repo_is_independent(parent: Path, child: Path) -> bool:
+    """Prove that *child* is an autonomous ignored repository of *parent*.
+
+    Ancestor/descendant serialization remains fail-closed unless the nested
+    checkout has its own Git metadata, is ignored by the parent and is not a
+    tracked gitlink/path. This is the only safe exception to the broad lock.
+    """
+    try:
+        if not (child / ".git").exists():
+            return False
+        relative = child.relative_to(parent).as_posix()
+    except (OSError, ValueError):
+        return False
+    tracked, _ = _git_output(parent, "ls-files", "--error-unmatch", "--", relative)
+    if tracked == 0:
+        return False
+    ignored, _ = _git_output(parent, "check-ignore", "-q", "--", relative)
+    return ignored == 0
+
+
+def _record_capacity_wait(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    assignee: Optional[str] = None,
+) -> None:
+    """Persist one stable capacity reason and the >60s ready SLA breach."""
+    row = conn.execute(
+        "SELECT created_at FROM tasks WHERE id=? AND status IN ('ready','review')",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    age = max(0, int(time.time()) - int(row["created_at"] or time.time()))
+    payload = {"reason": reason, "assignee": assignee}
+    with write_txn(conn):
+        latest_wait = conn.execute(
+            "SELECT kind,payload FROM task_events WHERE task_id=? "
+            "AND kind IN ('capacity_wait','capacity_wait_ended') ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        encoded = json.dumps(payload, ensure_ascii=False)
+        if not (
+            latest_wait is not None
+            and latest_wait["kind"] == "capacity_wait"
+            and latest_wait["payload"] == encoded
+        ):
+            _append_event(conn, task_id, "capacity_wait", payload)
+        if age > 60:
+            already_reported = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? AND kind='ready_sla_exceeded' "
+                "AND payload=? ORDER BY id DESC LIMIT 1",
+                (
+                    task_id,
+                    json.dumps(
+                        {"threshold_seconds": 60, **payload}, ensure_ascii=False
+                    ),
+                ),
+            ).fetchone()
+            if already_reported is None:
+                _append_event(
+                    conn,
+                    task_id,
+                    "ready_sla_exceeded",
+                    {"threshold_seconds": 60, **payload},
+                )
+
+
+def _record_global_capacity_waits(conn: sqlite3.Connection, reason: str) -> None:
+    rows = conn.execute(
+        "SELECT id,assignee FROM tasks WHERE status IN ('ready','review') "
+        "AND claim_lock IS NULL AND queue_class='active'"
+    ).fetchall()
+    for row in rows:
+        _record_capacity_wait(
+            conn, row["id"], reason=reason, assignee=row["assignee"]
+        )
+
+
+def _end_capacity_wait(conn: sqlite3.Connection, task_id: str) -> None:
+    latest = conn.execute(
+        "SELECT kind,payload,created_at FROM task_events WHERE task_id=? "
+        "AND kind IN ('capacity_wait','capacity_wait_ended') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is None or latest["kind"] != "capacity_wait":
+        return
+    try:
+        payload = json.loads(latest["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "capacity_wait_ended",
+            {
+                **payload,
+                "wait_seconds": max(0, int(time.time()) - int(latest["created_at"])),
+            },
+        )
 
 
 def _occupied_workspace_owner(
@@ -14466,6 +14570,8 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            if not dry_run:
+                _record_global_capacity_waits(conn, "board_concurrency_capacity")
             return result
         spawn_budget = max_spawn - running_count
 
@@ -14482,6 +14588,8 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            if not dry_run:
+                _record_global_capacity_waits(conn, "host_concurrency_capacity")
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -14501,6 +14609,8 @@ def _dispatch_once_locked(
             "kanban dispatch: system memory pressure is critical; "
             "spawning no new workers this tick (deferred, not dropped)"
         )
+        if not dry_run:
+            _record_global_capacity_waits(conn, "critical_memory_pressure")
         return result
     if pressure == "elevated":
         result.memory_pressure = pressure
@@ -14709,6 +14819,12 @@ def _dispatch_once_locked(
                     # This is healthy queued work, not an unassigned-card
                     # configuration error; leave it untouched for a later tick.
                     result.deferred_no_free_lane.append(row["id"])
+                    if not dry_run:
+                        _record_capacity_wait(
+                            conn,
+                            row["id"],
+                            reason="all_compatible_lanes_busy",
+                        )
                     continue
                 # Dry-run: show what WOULD happen (auto-assign + spawn) without
                 # mutating the DB. Real run: mutate the row + emit the
@@ -14811,6 +14927,13 @@ def _dispatch_once_locked(
             )
             if not _pool_assignee:
                 result.deferred_no_free_lane.append(row["id"])
+                if not dry_run:
+                    _record_capacity_wait(
+                        conn,
+                        row["id"],
+                        reason="all_compatible_lanes_busy",
+                        assignee=row_assignee,
+                    )
                 continue
             if _pool_assignee != row_assignee or _pool_model != row["model_override"]:
                 previous_assignee = row_assignee
@@ -14942,6 +15065,13 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
+                if not dry_run:
+                    _record_capacity_wait(
+                        conn,
+                        row["id"],
+                        reason="profile_capacity",
+                        assignee=row_assignee,
+                    )
                 continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -14982,6 +15112,7 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         _end_workspace_wait(conn, claimed.id)
+        _end_capacity_wait(conn, claimed.id)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -15135,6 +15266,13 @@ def _dispatch_once_locked(
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
                 )
+                if not dry_run:
+                    _record_capacity_wait(
+                        conn,
+                        row["id"],
+                        reason="reviewer_capacity",
+                        assignee=row["assignee"],
+                    )
                 continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
@@ -15160,6 +15298,7 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         _end_workspace_wait(conn, claimed.id)
+        _end_capacity_wait(conn, claimed.id)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
