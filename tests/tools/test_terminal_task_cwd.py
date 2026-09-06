@@ -76,6 +76,50 @@ def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
     assert calls == [{"timeout": 60, "cwd": "/explicit/workdir", "bounded_capture": True}]
 
 
+def test_kanban_worker_skips_exact_reusable_verification(monkeypatch):
+    calls = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            calls.append(command)
+            return {"output": "should not run", "returncode": 0}
+
+    task_id = "kanban-proof-cache"
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/acp"}})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+    import agent.verification_evidence as verification_evidence
+
+    monkeypatch.setattr(
+        verification_evidence,
+        "reusable_terminal_result",
+        lambda **kwargs: {
+            "created_at": "2026-09-06T12:00:00+00:00",
+            "kind": "test",
+            "scope": "targeted",
+            "canonical_command": "pytest",
+            "commit_sha": "abc123",
+            "workspace_fingerprint": "fingerprint",
+        },
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="pytest", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    assert result["validation_reused"] is True
+    assert result["verification_evidence"]["commit_sha"] == "abc123"
+    assert calls == []
+
+
 def test_explicit_workdir_does_not_persist_into_session_cwd(monkeypatch):
     """A per-command ``workdir`` must not hijack the durable session cwd.
 
@@ -171,6 +215,8 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
         "session_key": task_id,
         "env_vars": {},
         "use_pty": False,
+        "temp_process": False,
+        "temp_process_reason": "",
     }]
 
 

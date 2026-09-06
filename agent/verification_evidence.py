@@ -8,8 +8,10 @@ blocks completion, and never upgrades targeted checks into "repo green".
 from __future__ import annotations
 
 import json
+import hashlib
 import shlex
 import sqlite3
+import subprocess
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -27,7 +29,7 @@ _MAX_EVIDENCE_AGE_DAYS = 30
 _MAX_EVENTS_PER_SESSION_ROOT = 100
 _MAX_TOTAL_UNREFERENCED_EVENTS = 10_000
 _AD_HOC_SCRIPT_NAME_PREFIXES = ("hermes-verify-", "hermes-ad-hoc-")
-_VERIFY_SCHEMA_VERSION = 1
+_VERIFY_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,8 @@ class VerificationEvidence:
     root: str
     session_id: str
     output_summary: str = ""
+    commit_sha: str = ""
+    workspace_fingerprint: str = ""
 
 
 def _utc_now() -> str:
@@ -129,6 +133,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    event_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(verification_events)")
+    }
+    if "commit_sha" not in event_columns:
+        conn.execute("ALTER TABLE verification_events ADD COLUMN commit_sha TEXT NOT NULL DEFAULT ''")
+    if "workspace_fingerprint" not in event_columns:
+        conn.execute(
+            "ALTER TABLE verification_events ADD COLUMN workspace_fingerprint TEXT NOT NULL DEFAULT ''"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS verification_state (
@@ -334,6 +347,20 @@ def _find_canonical_match(
     return None
 
 
+def _dependency_install_command(command: str) -> Optional[str]:
+    """Recognize a single reproducible JavaScript dependency install."""
+    segments = _split_shell_segments(command)
+    if len(segments) != 1 or segments[0].following_operator is not None:
+        return None
+    tokens = _strip_command_prefix(segments[0].tokens)
+    if tokens[:2] == ["npm", "ci"]:
+        return "npm ci"
+    if tokens[:2] in (["pnpm", "install"], ["yarn", "install"], ["bun", "install"]):
+        if "--frozen-lockfile" in tokens[2:]:
+            return f"{tokens[0]} install --frozen-lockfile"
+    return None
+
+
 def _kind_for_command(canonical: str) -> str:
     lowered = canonical.lower()
     if any(word in lowered for word in ("lint", "eslint", "ruff")):
@@ -451,6 +478,42 @@ def _summarize_output(output: str) -> str:
     )
 
 
+def _workspace_identity(root: str | Path) -> tuple[str, str]:
+    """Return ``(commit, fingerprint)`` for exact proof invalidation."""
+    path = Path(root).expanduser().resolve()
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        status = subprocess.check_output(
+            ["git", "-C", str(path), "status", "--porcelain=v1", "-z"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    digest = hashlib.sha256()
+    digest.update(commit.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(status)
+    for name in (
+        "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb",
+        "uv.lock", "poetry.lock", "Pipfile.lock",
+    ):
+        candidate = path / name
+        if candidate.is_file():
+            try:
+                digest.update(name.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(candidate.read_bytes())
+            except OSError:
+                return commit, ""
+    return commit, digest.hexdigest()
+
+
 def _prune_old_events(conn: sqlite3.Connection, *, session_id: str, root: str) -> None:
     """Bound ledger growth without deleting the current state pointer."""
     cutoff = _retention_cutoff()
@@ -535,6 +598,7 @@ def classify_verification_command(
         return None
 
     verify_commands = list(facts.get("verifyCommands") or [])
+    dependency_install = _dependency_install_command(command)
     match = _find_canonical_match(command, verify_commands, int(exit_code))
     is_ad_hoc = False
     if match is None and not verify_commands:
@@ -542,21 +606,29 @@ def classify_verification_command(
         if ad_hoc_args is not None:
             match = ("ad-hoc verification script", ad_hoc_args)
             is_ad_hoc = True
-    if match is None:
+    if match is None and dependency_install is None:
         return None
 
-    canonical, trailing_args = match
+    canonical, trailing_args = match or (dependency_install, [])
+    root = str(facts.get("root") or Path(cwd or ".").resolve())
+    commit_sha, workspace_fingerprint = _workspace_identity(root)
     return VerificationEvidence(
         command=command,
         canonical_command=canonical,
-        kind="ad_hoc" if is_ad_hoc else _kind_for_command(canonical),
+        kind=(
+            "ad_hoc" if is_ad_hoc
+            else "dependencies" if dependency_install is not None
+            else _kind_for_command(canonical)
+        ),
         scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),
         status="passed" if int(exit_code) == 0 else "failed",
         exit_code=int(exit_code),
         cwd=str(Path(cwd or ".").resolve()),
-        root=str(facts.get("root") or Path(cwd or ".").resolve()),
+        root=root,
         session_id=str(session_id or "default"),
         output_summary=_summarize_output(output),
+        commit_sha=commit_sha,
+        workspace_fingerprint=workspace_fingerprint,
     )
 
 
@@ -580,6 +652,61 @@ def record_terminal_result(
     if evidence is None:
         return None
     return _insert_evidence(evidence)
+
+
+def reusable_terminal_result(
+    *,
+    command: str,
+    cwd: str | Path | None,
+    session_id: str | None,
+    max_age_hours: int = 24,
+) -> Optional[dict[str, Any]]:
+    """Return a fresh exact-workspace proof instead of rerunning a check.
+
+    Builds and deployment commands are intentionally excluded: their ignored
+    output artifacts may have been removed even when Git state is unchanged.
+    Only deterministic test/lint/typecheck/check commands can be reused.
+    """
+    candidate = classify_verification_command(
+        command,
+        cwd=cwd,
+        session_id=session_id,
+        exit_code=0,
+    )
+    reusable_kinds = {"test", "lint", "typecheck", "check", "dependencies"}
+    if candidate is None or candidate.kind not in reusable_kinds:
+        return None
+    if candidate.kind == "dependencies" and not (Path(candidate.root) / "node_modules").is_dir():
+        return None
+    if not candidate.commit_sha or not candidate.workspace_fingerprint:
+        return None
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=max(1, int(max_age_hours)))
+    ).isoformat()
+    with _DB_LOCK:
+        with _transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM verification_events
+                WHERE session_id=? AND root=? AND command=?
+                  AND canonical_command=? AND status='passed'
+                  AND commit_sha=? AND workspace_fingerprint=?
+                  AND created_at>=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (
+                    candidate.session_id,
+                    candidate.root,
+                    candidate.command,
+                    candidate.canonical_command,
+                    candidate.commit_sha,
+                    candidate.workspace_fingerprint,
+                    cutoff,
+                ),
+            ).fetchone()
+    if row is None:
+        return None
+    return {**dict(row), "reused": True}
 
 
 def record_verify_run(
@@ -636,8 +763,9 @@ def _insert_evidence(evidence: VerificationEvidence) -> dict[str, Any]:
                 """
                 INSERT INTO verification_events(
                     created_at, session_id, cwd, root, command, canonical_command,
-                    kind, scope, status, exit_code, output_summary
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    kind, scope, status, exit_code, output_summary, commit_sha,
+                    workspace_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -651,6 +779,8 @@ def _insert_evidence(evidence: VerificationEvidence) -> dict[str, Any]:
                     evidence.status,
                     evidence.exit_code,
                     evidence.output_summary,
+                    evidence.commit_sha,
+                    evidence.workspace_fingerprint,
                 ),
             )
             if cur.lastrowid is None:

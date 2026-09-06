@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from agent.verification_evidence import (
     classify_verification_command,
     mark_workspace_edited,
     record_terminal_result,
+    reusable_terminal_result,
     verification_status,
 )
 
@@ -26,6 +28,93 @@ def _node_project(root: Path) -> None:
 
 def _python_project(root: Path) -> None:
     (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+
+
+def _git_commit(root: Path, message: str = "initial") -> str:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@hermes.local"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Hermes Tests"], cwd=root, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", message], cwd=root, check=True)
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+
+
+def test_exact_passing_check_is_reused_only_for_same_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project = tmp_path / "project"
+    project.mkdir()
+    _python_project(project)
+    first_commit = _git_commit(project)
+
+    recorded = record_terminal_result(
+        command="pytest tests/unit",
+        cwd=project,
+        session_id="task-1",
+        exit_code=0,
+        output="12 passed",
+    )
+
+    reused = reusable_terminal_result(
+        command="pytest tests/unit", cwd=project, session_id="task-1"
+    )
+    assert recorded is not None
+    assert reused is not None
+    assert reused["reused"] is True
+    assert reused["commit_sha"] == first_commit
+
+    (project / "changed.py").write_text("changed = True\n")
+    assert reusable_terminal_result(
+        command="pytest tests/unit", cwd=project, session_id="task-1"
+    ) is None
+
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-qm", "change"], cwd=project, check=True)
+    assert reusable_terminal_result(
+        command="pytest tests/unit", cwd=project, session_id="task-1"
+    ) is None
+
+
+def test_build_proof_is_never_reused(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.json").write_text(
+        json.dumps({"scripts": {"build": "vite build"}}), encoding="utf-8"
+    )
+    (project / "package-lock.json").write_text("{}", encoding="utf-8")
+    _git_commit(project)
+    assert record_terminal_result(
+        command="npm run build", cwd=project, session_id="task-1", exit_code=0
+    ) is not None
+    assert reusable_terminal_result(
+        command="npm run build", cwd=project, session_id="task-1"
+    ) is None
+
+
+def test_locked_dependency_install_reuse_requires_node_modules(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "package.json").write_text("{}", encoding="utf-8")
+    (project / "package-lock.json").write_text("{}", encoding="utf-8")
+    (project / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    _git_commit(project)
+    assert record_terminal_result(
+        command="npm ci", cwd=project, session_id="task-1", exit_code=0
+    ) is not None
+    assert reusable_terminal_result(
+        command="npm ci", cwd=project, session_id="task-1"
+    ) is None
+
+    (project / "node_modules").mkdir()
+    assert reusable_terminal_result(
+        command="npm ci", cwd=project, session_id="task-1"
+    ) is not None
+
+    (project / "package-lock.json").write_text('{"changed":true}', encoding="utf-8")
+    assert reusable_terminal_result(
+        command="npm ci", cwd=project, session_id="task-1"
+    ) is None
 
 
 

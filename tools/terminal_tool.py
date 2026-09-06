@@ -3618,6 +3618,45 @@ def terminal_tool(
                         session_key=session_key,
                         env_type=env_type,
                     )
+                    evidence_session_id = (
+                        os.environ.get("HERMES_KANBAN_TASK")
+                        or session_id
+                        or task_id
+                        or effective_task_id
+                        or "default"
+                    )
+                    if os.environ.get("HERMES_KANBAN_TASK"):
+                        try:
+                            from agent.verification_evidence import reusable_terminal_result
+
+                            reusable = reusable_terminal_result(
+                                command=command,
+                                cwd=command_cwd,
+                                session_id=evidence_session_id,
+                            )
+                        except Exception:
+                            logger.debug("verification evidence reuse lookup failed", exc_info=True)
+                            reusable = None
+                        if reusable:
+                            return json.dumps({
+                                "output": (
+                                    "Skipped duplicate verification: this exact command already "
+                                    "passed on the same commit and workspace fingerprint at "
+                                    f"{reusable.get('created_at')}."
+                                ),
+                                "exit_code": 0,
+                                "error": None,
+                                "validation_reused": True,
+                                "verification_evidence": {
+                                    "status": "passed",
+                                    "kind": reusable.get("kind"),
+                                    "scope": reusable.get("scope"),
+                                    "canonical_command": reusable.get("canonical_command"),
+                                    "reused": True,
+                                    "commit_sha": reusable.get("commit_sha"),
+                                    "workspace_fingerprint": reusable.get("workspace_fingerprint"),
+                                },
+                            }, ensure_ascii=False)
                     execute_kwargs = {
                         "timeout": effective_timeout,
                         "cwd": command_cwd,
@@ -3862,7 +3901,13 @@ def terminal_tool(
                 evidence = record_terminal_result(
                     command=command,
                     cwd=command_cwd,
-                    session_id=session_id or task_id or effective_task_id or "default",
+                    session_id=(
+                        os.environ.get("HERMES_KANBAN_TASK")
+                        or session_id
+                        or task_id
+                        or effective_task_id
+                        or "default"
+                    ),
                     exit_code=returncode,
                     output=output,
                 )
