@@ -99,6 +99,128 @@ from agent.redact import redact_sensitive_text
 _log = logging.getLogger(__name__)
 
 
+def _completion_requires_integration(task: "Task", metadata: Mapping[str, Any]) -> bool:
+    contract = metadata.get("integration")
+    if isinstance(contract, Mapping) and "required" in contract:
+        return bool(contract.get("required"))
+    text = f"{task.title or ''} {task.body or ''}".lower()
+    if "[no-integration]" in text or task.workspace_kind == "scratch":
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "origin/main", "commit/push", "push hermes-production",
+            "branche de production", "déploiement", "deploiement", "deploy",
+        )
+    )
+
+
+def _git_output(repo: Path, *args: str, timeout: int = 12) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+        return proc.returncode, (proc.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 124, str(exc)
+
+
+def _integration_delivery_projection(
+    task: "Task", metadata: Optional[dict]
+) -> tuple[Optional[str], dict]:
+    """Verify that a claimed delivery commit is truly on the target remote.
+
+    Candidate worktree commits remain valid review artifacts, but they cannot
+    close a card whose contract explicitly requires integration/production.
+    The check uses the remote's advertised branch head, then verifies both Git
+    ancestry and equality of the local target branch with that remote head.
+    """
+    projected = dict(metadata or {})
+    if not _completion_requires_integration(task, projected):
+        return None, projected
+    raw_contract = projected.get("integration")
+    contract = dict(raw_contract) if isinstance(raw_contract, Mapping) else {}
+    repo = Path(
+        str(contract.get("repo_path") or task.workspace_path or "")
+    ).expanduser()
+    if not repo.is_dir():
+        return "integration required but repo_path is missing or invalid", projected
+    remote = str(contract.get("target_remote") or "origin").strip()
+    branch = str(contract.get("target_branch") or "").strip()
+    if not branch:
+        code, symbolic = _git_output(repo, "symbolic-ref", "--short", f"refs/remotes/{remote}/HEAD")
+        if code == 0 and symbolic.startswith(f"{remote}/"):
+            branch = symbolic.split("/", 1)[1]
+    if not branch:
+        text = f"{task.title or ''} {task.body or ''}"
+        explicit = re.search(r"(?:origin/|push\s+)(main|master|hermes-production)\b", text, re.I)
+        branch = explicit.group(1) if explicit else ""
+    if not remote or not branch:
+        return "integration required but target_remote/target_branch is not declared", projected
+    commit = str(
+        contract.get("commit")
+        or projected.get("commit_sha")
+        or projected.get("commit")
+        or ""
+    ).strip()
+    if not commit:
+        return "integration required but no delivered commit was declared", projected
+    code, resolved_commit = _git_output(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+    if code != 0:
+        return f"declared delivery commit is not resolvable: {commit}", projected
+    code, advertised = _git_output(
+        repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}"
+    )
+    remote_sha = advertised.split()[0] if code == 0 and advertised else ""
+    if not remote_sha:
+        return f"could not verify remote target {remote}/{branch}", projected
+    code, _ = _git_output(repo, "merge-base", "--is-ancestor", resolved_commit, remote_sha)
+    if code != 0:
+        return (
+            f"candidate commit {resolved_commit[:12]} is not integrated in "
+            f"{remote}/{branch} ({remote_sha[:12]})"
+        ), projected
+    code, local_target = _git_output(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+    if code != 0 or local_target != remote_sha:
+        return (
+            f"local target {branch} is not synchronized with {remote}/{branch} "
+            f"({local_target[:12] if local_target else 'missing'} != {remote_sha[:12]})"
+        ), projected
+    requires_deployment = bool(contract.get("requires_deployment"))
+    if not requires_deployment:
+        text = f"{task.title or ''} {task.body or ''}".lower()
+        requires_deployment = any(
+            marker in text for marker in ("déploiement", "deploiement", "deploy", "production")
+        ) and "[no-prod-proof]" not in text
+    if requires_deployment:
+        proof = contract.get("production_proof") or projected.get("production_proof")
+        if not isinstance(proof, Mapping):
+            return "deployment required but production_proof is missing", projected
+        proof_commit = str(proof.get("commit") or proof.get("commit_sha") or "").strip()
+        deployment_id = str(proof.get("deployment_id") or "").strip()
+        declared_deployment = str(contract.get("deployment_id") or "").strip()
+        if proof_commit != resolved_commit:
+            return "production_proof does not match the delivered commit", projected
+        if declared_deployment and deployment_id != declared_deployment:
+            return "production_proof does not match the declared deployment_id", projected
+    contract.update({
+        "required": True,
+        "repo_path": str(repo.resolve()),
+        "target_remote": remote,
+        "target_branch": branch,
+        "commit": resolved_commit,
+        "remote_head": remote_sha,
+        "status": "integrated",
+    })
+    projected["integration"] = contract
+    return None, projected
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -6698,6 +6820,47 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    task = get_task(conn, task_id)
+    integration_error, metadata = _integration_delivery_projection(task, metadata) if task else (
+        "task not found", dict(metadata or {})
+    )
+    if integration_error is not None:
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT status,current_run_id FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            if row and row["status"] in {"running", "ready", "blocked", "review"}:
+                run_id = row["current_run_id"]
+                conn.execute(
+                    "UPDATE tasks SET status='review', integration_status='awaiting_integration', "
+                    "execution_status='awaiting_integration', claim_lock=NULL, claim_expires=NULL, "
+                    "worker_pid=NULL, action_required=NULL WHERE id=?",
+                    (task_id,),
+                )
+                if run_id is not None:
+                    _end_run(
+                        conn,
+                        task_id,
+                        outcome="integration_pending",
+                        status="review",
+                        summary=summary if summary is not None else result,
+                        metadata={
+                            **dict(metadata or {}),
+                            "integration_error": integration_error,
+                        },
+                    )
+                _append_event(
+                    conn,
+                    task_id,
+                    "awaiting_integration",
+                    {"reason": integration_error, "source_status": row["status"]},
+                    run_id=int(run_id) if run_id is not None else None,
+                )
+        raise CompletionValidationError(
+            f"candidate kept in review/awaiting_integration: {integration_error}",
+            code="awaiting_integration",
+        )
     validation_error, metadata = _completion_validation_projection_result(
         conn,
         task_id,
@@ -6839,9 +7002,13 @@ def complete_task(
         if completed_payload["evidence"] is None:
             completed_payload.pop("evidence")
         _completion_meta = metadata if isinstance(metadata, dict) else {}
+        _integration_meta = _completion_meta.get("integration")
         _integrated = any(
             _completion_meta.get(key)
             for key in ("commit_sha", "commit", "merged", "pushed", "pr_url")
+        ) or (
+            isinstance(_integration_meta, dict)
+            and _integration_meta.get("status") == "integrated"
         )
         conn.execute(
             "UPDATE tasks SET verification_status = ?, integration_status = ? "
