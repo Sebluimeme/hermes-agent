@@ -191,8 +191,9 @@ def _integration_delivery_projection(
             f"local target {branch} is not synchronized with {remote}/{branch} "
             f"({local_target[:12] if local_target else 'missing'} != {remote_sha[:12]})"
         ), projected
-    requires_deployment = bool(contract.get("requires_deployment"))
-    if not requires_deployment:
+    if "requires_deployment" in contract:
+        requires_deployment = bool(contract.get("requires_deployment"))
+    else:
         text = f"{task.title or ''} {task.body or ''}".lower()
         requires_deployment = any(
             marker in text for marker in ("déploiement", "deploiement", "deploy", "production")
