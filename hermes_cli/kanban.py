@@ -440,10 +440,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "Ignored without --goal.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
-                          default="running",
-                          help="Initial card status. Use 'blocked' for cards "
-                               "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                          default="ready",
+                          help="Initial card status. Ordinary cards default "
+                               "to 'ready' so they first appear in the agent "
+                               "waiting bucket; use 'blocked' for cards that "
+                               "require immediate human ops (R3 gate).")
     p_create.add_argument("--routing-tier", choices=sorted(kb.VALID_ROUTING_TIERS),
                           default=None, dest="routing_tier",
                           help="Persistent routing hint for auto-routed "
@@ -1789,7 +1790,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
+            initial_status=getattr(args, "initial_status", "ready"),
             routing_tier=getattr(args, "routing_tier", None),
         )
         task = kb.get_task(conn, task_id)

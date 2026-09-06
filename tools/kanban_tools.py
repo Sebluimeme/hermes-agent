@@ -1743,7 +1743,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
-    initial_status = args.get("initial_status") or "running"
+    initial_status = args.get("initial_status") or "ready"
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -2000,7 +2000,7 @@ def _handle_create_many(args: dict, **kw) -> str:
                         int(merged["goal_max_turns"])
                         if merged.get("goal_max_turns") is not None else None
                     ),
-                    "initial_status": str(merged.get("initial_status") or "running"),
+                    "initial_status": str(merged.get("initial_status") or "ready"),
                     "created_by": created_by,
                     "session_id": session_id,
                     "routing_tier": merged.get("routing_tier"),
@@ -2995,12 +2995,12 @@ KANBAN_CREATE_SCHEMA = {
             },
             "initial_status": {
                 "type": "string",
-                "enum": ["running", "blocked"],
+                "enum": ["ready", "running", "blocked"],
                 "description": (
-                    "Initial card status. Use 'blocked' for tasks that "
-                    "require immediate human ops (R3 gate) to skip the "
-                    "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
+                    "Initial card status. Ordinary cards default to 'ready' "
+                    "so they first appear in the agent waiting bucket before "
+                    "the dispatcher claims them. Use 'blocked' for tasks "
+                    "that require immediate human ops (R3 gate)."
                 ),
             },
             "skills": {

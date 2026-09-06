@@ -104,7 +104,7 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_INITIAL_STATUSES = {"ready", "running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3953,7 +3953,7 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
-    initial_status: str = "running",
+    initial_status: str = "ready",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,

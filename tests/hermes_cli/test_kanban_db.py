@@ -2053,6 +2053,9 @@ def test_dispatch_once_applies_routing_tier_chain_to_unassigned_ready_task(
     }}))
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="auto-routed", routing_tier="simple")
+        row = conn.execute("SELECT status, assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row["status"] == "ready"
+        assert row["assignee"] is None
         result = kb.dispatch_once(conn, dry_run=True)
         assert task_id in result.auto_assigned_default
         assert task_id in [row[0] for row in result.spawned]
