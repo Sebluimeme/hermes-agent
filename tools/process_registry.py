@@ -451,6 +451,9 @@ class ProcessSession:
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
+    temp_process: bool = False                  # True for worker-owned temporary QA/preview servers
+    temp_process_reason: str = ""               # Human-readable temporary-process contract/reap reason
+    last_control_at: float = 0.0                # Last process-tool control/read activity (wall clock)
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -1098,6 +1101,8 @@ class ProcessRegistry:
         env_vars: dict = None,
         use_pty: bool = False,
         owner_task_id: str = "",
+        temp_process: bool = False,
+        temp_process_reason: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1126,6 +1131,9 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            temp_process=bool(temp_process),
+            temp_process_reason=temp_process_reason or "",
+            last_control_at=time.time(),
         )
 
         pty_scope_attempted = False
@@ -1343,6 +1351,8 @@ class ProcessRegistry:
         session_key: str = "",
         timeout: int = 10,
         owner_task_id: str = "",
+        temp_process: bool = False,
+        temp_process_reason: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1365,6 +1375,9 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            temp_process=bool(temp_process),
+            temp_process_reason=temp_process_reason or "",
+            last_control_at=time.time(),
         )
 
         # Run the command in the sandbox with output capture
@@ -1758,6 +1771,67 @@ class ProcessRegistry:
             if session._watch_hits > 0:
                 return False
         return True
+
+    def touch_control(self, session_id: str) -> None:
+        """Record active control/read activity for a tracked process."""
+        session = self.get(session_id)
+        if session is None:
+            return
+        with session._lock:
+            session.last_control_at = time.time()
+
+    def reap_stale_temp_processes(
+        self,
+        task_id: Optional[str] = None,
+        *,
+        idle_seconds: Optional[float] = None,
+        source: str = "temp_process_idle_reaper",
+    ) -> int:
+        """Terminate idle worker-owned temporary QA/preview server sessions.
+
+        Only sessions explicitly registered with ``temp_process=True`` are
+        eligible. A task_id filter keeps lifecycle handoffs from touching user
+        servers or unrelated workers.
+        """
+        if idle_seconds is None:
+            idle_seconds = self._temp_process_idle_seconds()
+        try:
+            idle_seconds = max(float(idle_seconds), 0.0)
+        except (TypeError, ValueError):
+            idle_seconds = self._temp_process_idle_seconds()
+        now = time.time()
+        with self._lock:
+            targets = [
+                s.id
+                for s in self._running.values()
+                if s.temp_process
+                and not s.exited
+                and (task_id is None or s.task_id == task_id)
+                and (now - (s.last_control_at or s.started_at or now)) >= idle_seconds
+            ]
+        killed = 0
+        for session_id in targets:
+            result = self.kill_process(
+                session_id,
+                source=source,
+                consume_output=True,
+            )
+            if result.get("status") in {"killed", "already_exited"}:
+                killed += 1
+        return killed
+
+    @staticmethod
+    def _temp_process_idle_seconds() -> float:
+        """Bounded idle lease for worker-owned temporary QA servers."""
+        try:
+            from hermes_cli.config import cfg_get, read_raw_config
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "terminal", "qa_temp_process_idle_seconds")
+            if val is None:
+                val = os.getenv("HERMES_QA_TEMP_PROCESS_IDLE_SECONDS", "900")
+            return max(float(val), 1.0)
+        except Exception:
+            return 900.0
 
     def wait_for_pending_completions(
         self,
@@ -2683,7 +2757,11 @@ class ProcessRegistry:
         with self._lock:
             all_sessions = list(self._running.values()) + list(self._finished.values())
 
-        all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
+        all_sessions = [
+            refreshed
+            for s in all_sessions
+            if (refreshed := self._refresh_detached_session(s)) is not None
+        ]
 
         if task_id or session_key:
             all_sessions = [
@@ -2717,6 +2795,14 @@ class ProcessRegistry:
                 entry["watch_hit"] = s._watch_hits > 0
             if s.notify_on_complete:
                 entry["notify_on_complete"] = True
+            if s.temp_process:
+                entry["temp_process"] = True
+                if s.temp_process_reason:
+                    entry["temp_process_reason"] = s.temp_process_reason
+                entry["last_control_at"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%S",
+                    time.localtime(s.last_control_at or s.started_at),
+                )
             if s.exited:
                 entry["exit_code"] = s.exit_code
             if s.detached:
@@ -2933,6 +3019,9 @@ class ProcessRegistry:
                             "parent_session_id": s.parent_session_id,
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
+                            "temp_process": s.temp_process,
+                            "temp_process_reason": s.temp_process_reason,
+                            "last_control_at": s.last_control_at,
                         })
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
@@ -3031,6 +3120,9 @@ class ProcessRegistry:
                 parent_session_id=entry.get("parent_session_id", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
+                temp_process=bool(entry.get("temp_process", False)),
+                temp_process_reason=entry.get("temp_process_reason", ""),
+                last_control_at=entry.get("last_control_at") or entry.get("started_at", time.time()),
             )
             with self._lock:
                 self._running[session.id] = session
@@ -3558,6 +3650,8 @@ def _handle_process(args, **kw):
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        if action in {"poll", "log", "wait", "write", "submit", "close"}:
+            process_registry.touch_control(session_id)
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":

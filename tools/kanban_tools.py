@@ -58,6 +58,27 @@ _COMPLETION_READY_HANDOFFS: dict[str, dict[str, Any]] = {}
 _COMPLETION_READY_LOCK = threading.Lock()
 
 
+def _reap_task_temp_processes(tid: str, *, source: str) -> int:
+    """Best-effort cleanup of worker-owned temporary QA servers.
+
+    The process registry only reaps sessions that were explicitly tagged as
+    temporary by terminal_tool, so this lifecycle hook cannot touch user
+    servers or unrelated worker PIDs. Failures are logged but never mask the
+    Kanban transition; dispatcher-level cleanup remains the outer safety net.
+    """
+    try:
+        from tools.process_registry import process_registry
+
+        return process_registry.reap_stale_temp_processes(
+            tid,
+            idle_seconds=0,
+            source=source,
+        )
+    except Exception:
+        logger.debug("Kanban temporary process cleanup failed", exc_info=True)
+        return 0
+
+
 def hydrate_completion_args_from_readiness(args: dict[str, Any]) -> dict[str, Any]:
     """Reuse the exact handoff accepted by ``kanban_completion_ready``.
 
@@ -971,6 +992,7 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
+            _reap_task_temp_processes(tid, source="kanban_complete")
             with _COMPLETION_READY_LOCK:
                 _COMPLETION_READY_HANDOFFS.pop(tid, None)
             run = kb.latest_run(conn, tid)
@@ -1155,6 +1177,7 @@ def _handle_block(args: dict, **kw) -> str:
                     f"could not block {tid} (unknown id or not in "
                     f"running/ready)"
                 )
+            _reap_task_temp_processes(tid, source="kanban_block")
             run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
@@ -1243,6 +1266,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not request review for {tid}: {detail}"
                 )
+            _reap_task_temp_processes(tid, source="kanban_request_review")
             run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
             return _ok(

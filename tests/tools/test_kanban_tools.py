@@ -210,6 +210,48 @@ def test_completion_reuses_exact_ready_handoff_when_model_sends_wrong_args(worke
         conn.close()
 
 
+def test_completion_reaps_worker_temp_processes(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_reap_task_temp_processes",
+        lambda tid, *, source: calls.append((tid, source)) or 1,
+    )
+
+    completed = json.loads(kt._handle_complete({"summary": "implemented"}))
+
+    assert completed["ok"] is True
+    assert calls == [(worker_env, "kanban_complete")]
+
+
+def test_request_review_reaps_worker_temp_processes(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    finally:
+        conn.close()
+
+    calls = []
+    monkeypatch.setattr(
+        kt,
+        "_reap_task_temp_processes",
+        lambda tid, *, source: calls.append((tid, source)) or 1,
+    )
+
+    reviewed = json.loads(kt._handle_request_review({"summary": "ready for review"}))
+
+    assert reviewed["ok"] is True
+    assert reviewed["status"] == "review"
+    assert calls == [(worker_env, "kanban_request_review")]
+
+
 def test_defer_review_tool_keeps_review_retryable(worker_env):
     import time
 

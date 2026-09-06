@@ -3,7 +3,7 @@
 import pytest
 
 from tools.approval import _hardline_block_result, _PARSER_LIMIT_DESCRIPTION, _MALFORMED_EXEC_DESCRIPTION
-from tools.terminal_tool import _foreground_background_guidance
+from tools.terminal_tool import _foreground_background_guidance, _qa_temp_process_contract
 
 
 class TestParserLimitRecovery:
@@ -79,3 +79,15 @@ class TestBackgroundGuidanceRecipes:
 
     def test_quoted_ampersand_not_flagged(self):
         assert _foreground_background_guidance('git commit -m "a & b"') is None
+
+    def test_kanban_qa_server_gets_temp_process_contract(self, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_qa")
+
+        msg = _qa_temp_process_contract("npm run dev -- --host 127.0.0.1")
+
+        assert msg == "kanban QA/preview server auto-cleanup contract"
+
+    def test_non_kanban_server_is_not_temp_process(self, monkeypatch):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+        assert _qa_temp_process_contract("npm run dev") is None

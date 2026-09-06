@@ -2228,6 +2228,11 @@ def _cleanup_thread_worker():
         try:
             config = _get_env_config()
             _cleanup_inactive_envs(config["lifetime_seconds"])
+            try:
+                from tools.process_registry import process_registry
+                process_registry.reap_stale_temp_processes()
+            except Exception:
+                logger.debug("Temporary QA process cleanup failed", exc_info=True)
         except Exception as e:
             logger.warning("Error in cleanup thread: %s", e, exc_info=True)
 
@@ -2746,6 +2751,25 @@ def _foreground_background_guidance(command: str) -> str | None:
                 "then execute tests in a separate command."
             )
 
+    return None
+
+
+def _qa_temp_process_contract(command: str) -> str | None:
+    """Return a temporary-server contract reason for worker QA servers.
+
+    Dispatcher-spawned Kanban workers commonly launch preview/dev servers for
+    browser capture and then need to close the task.  Only mark commands that
+    already match Hermes' long-lived server/watch detector, and only inside a
+    Kanban worker context, so user-started background processes are untouched.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    if _looks_like_help_or_version_command(command):
+        return None
+    unquoted = _strip_quotes(command)
+    for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
+        if pattern.search(unquoted):
+            return "kanban QA/preview server auto-cleanup contract"
     return None
 
 
@@ -3305,6 +3329,9 @@ def terminal_tool(
                 env_type=env_type,
             )
             try:
+                temp_process_reason = (
+                    _qa_temp_process_contract(command) if background else None
+                )
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
@@ -3314,6 +3341,8 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        temp_process=bool(temp_process_reason),
+                        temp_process_reason=temp_process_reason or "",
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3323,6 +3352,8 @@ def terminal_tool(
                         task_id=effective_task_id,
                         owner_task_id=task_id or effective_task_id,
                         session_key=session_key,
+                        temp_process=bool(temp_process_reason),
+                        temp_process_reason=temp_process_reason or "",
                     )
 
                 result_data = {
@@ -3339,6 +3370,14 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if temp_process_reason:
+                    result_data["temp_process"] = True
+                    result_data["temp_process_reason"] = temp_process_reason
+                    result_data["cleanup_contract"] = (
+                        "This worker-owned QA/preview server will be terminated "
+                        "when the Kanban task completes/blocks/enters review, or "
+                        "after the configured idle control window."
+                    )
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to

@@ -441,6 +441,12 @@ DEFAULT_CONFIG = {
         # background processes without notify_on_complete (servers, daemons)
         # are never waited on. 0 disables the linger.
         "oneshot_completion_wait_seconds": 600.0,
+        # Idle lease for Kanban-worker-owned QA/preview servers started with
+        # terminal(background=true). Only processes explicitly tagged by the
+        # worker contract are eligible; user servers and unrelated PIDs are
+        # never touched. Lifecycle handoffs (complete/review/block) reap those
+        # tagged sessions immediately, this value covers abandoned idle checks.
+        "qa_temp_process_idle_seconds": 900.0,
         # Environment variables to pass through to sandboxed execution
         # (terminal and execute_code).  Skill-declared required_environment_variables
         # are passed through automatically; this list is for non-skill use cases.

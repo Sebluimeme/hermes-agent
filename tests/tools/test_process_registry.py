@@ -181,6 +181,59 @@ def test_kill_all_backward_compat_and_exclude_ids(registry):
     assert sorted(c[0] for c in calls) == ["proc_a", "proc_b"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process cleanup semantics")
+def test_reap_stale_temp_processes_kills_only_tagged_task_processes(registry):
+    temp = registry.spawn_local(
+        command=f"{sys.executable} -m http.server 0",
+        cwd="/tmp",
+        task_id="t_qa",
+        temp_process=True,
+        temp_process_reason="test qa server",
+    )
+    normal = registry.spawn_local(
+        command=f"{sys.executable} -c 'import time; time.sleep(30)'",
+        cwd="/tmp",
+        task_id="t_qa",
+    )
+    foreign = registry.spawn_local(
+        command=f"{sys.executable} -c 'import time; time.sleep(30)'",
+        cwd="/tmp",
+        task_id="t_other",
+        temp_process=True,
+        temp_process_reason="foreign qa server",
+    )
+    try:
+        killed = registry.reap_stale_temp_processes("t_qa", idle_seconds=0)
+
+        assert killed == 1
+        assert temp.id not in registry._running
+        assert normal.id in registry._running
+        assert foreign.id in registry._running
+    finally:
+        registry.kill_process(normal.id)
+        registry.kill_process(foreign.id)
+
+
+def test_temp_process_metadata_is_written_to_checkpoint(registry, tmp_path, monkeypatch):
+    checkpoint = tmp_path / "procs.json"
+    session = _make_session(sid="proc_tempmeta", task_id="t_qa")
+    session.pid = 123456
+    session.detached = True
+    session.temp_process = True
+    session.temp_process_reason = "qa preview"
+    session.last_control_at = session.started_at + 5
+    registry._running[session.id] = session
+
+    with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+        registry._write_checkpoint()
+
+    data = json.loads(checkpoint.read_text(encoding="utf-8"))
+    entry = next(item for item in data if item["session_id"] == session.id)
+    assert entry["temp_process"] is True
+    assert entry["temp_process_reason"] == "qa preview"
+    assert entry["last_control_at"] == session.last_control_at
+
+
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
     """Poll a predicate until it returns truthy or the timeout elapses."""
     deadline = time.monotonic() + timeout
