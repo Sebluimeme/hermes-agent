@@ -96,6 +96,55 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_specify_after_loop_escalation_resets_recurrence_breaker(
+    kanban_home: Path,
+) -> None:
+    """A card promoted out of triage after loop escalation must not bounce
+    straight back the next time it blocks for the same reason.
+
+    Regression for t_5a126d02 / t_1d6b3aa2: ``specify_triage_task`` used to
+    flip ``status`` back to ``todo`` without clearing ``block_kind`` /
+    ``block_recurrences`` / ``execution_status``. A card that had already
+    hit ``BLOCK_RECURRENCE_LIMIT`` (2) kept ``block_recurrences == 2`` after
+    being specified, so the very next same-cause block computed
+    ``recurrences = 3 >= LIMIT`` and re-escalated to ``triage`` immediately —
+    the card could never actually run again.
+    """
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="needs_input")
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.block_kind == "needs_input"
+        assert task.block_recurrences == 2
+
+        ok = kb.specify_triage_task(conn, tid, author="seb")
+        assert ok is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status in {"todo", "ready"}
+        assert task.block_kind is None
+        assert task.block_recurrences == 0
+        assert task.execution_status == "pending"
+        assert task.failure_class is None
+        assert task.action_required is None
+
+        # Drive it back to running and re-block for the *same* cause — this
+        # must behave like a first offense (recurrences == 1), not an
+        # instant re-escalation to triage.
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="needs_input")
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+        assert len(events) == 1, "should not have re-escalated on the first re-block"
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_recurrences == 1
+
+
 def test_human_block_persists_exact_action_separately(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _running_task(conn, title="Ecobloc API")

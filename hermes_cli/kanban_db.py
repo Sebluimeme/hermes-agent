@@ -9061,6 +9061,21 @@ def specify_triage_task(
     dispatcher tick, which keeps the normal parent-gating behaviour intact
     for specified tasks that happen to have open parents.
 
+    A task can land in ``triage`` two ways: a fresh user/worker idea (no
+    block history), or the unblock-loop breaker's ``block_loop_detected``
+    escalation (see :data:`BLOCK_RECURRENCE_LIMIT`), which stamps
+    ``block_kind`` / ``block_recurrences`` / ``execution_status='blocked'`` /
+    ``failure_class`` / ``action_required`` on the row before parking it here.
+    This promotion is the general "a human decided the card is dispatchable
+    as-is" escape hatch for *both* origins, so it always clears that stale
+    loop/failure state alongside the status flip — otherwise a card promoted
+    out of triage keeps its old ``block_kind`` and ``block_recurrences``
+    counter already at the limit, and the very next same-cause block would
+    re-trigger ``block_loop_detected`` immediately (bouncing straight back to
+    triage) instead of giving the card a real chance to run. A plain
+    fresh-idea triage card already has these fields at their defaults, so the
+    reset is a no-op for that path.
+
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
@@ -9068,6 +9083,7 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
+    now = int(time.time())
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -9075,7 +9091,23 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("triage",), now=now,
+            note="triage specify recovery",
+        )
+        sets: list[str] = [
+            "status = 'todo'",
+            "claim_lock = NULL",
+            "claim_expires = NULL",
+            "worker_pid = NULL",
+            "current_run_id = NULL",
+            "block_kind = NULL",
+            "block_recurrences = 0",
+            "execution_status = 'pending'",
+            "failure_class = NULL",
+            "action_required = NULL",
+            "next_retry_at = NULL",
+        ]
         params: list[Any] = []
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -9098,6 +9130,15 @@ def specify_triage_task(
         )
         if cur.rowcount != 1:
             return False
+        # Mirror unblock_task: a promotion out of triage is itself the human
+        # decision that any open "needs a human" prompt was waiting on. Leaving
+        # it 'open' would keep the card showing as awaiting a decision even
+        # after it's back in the dispatchable pool.
+        conn.execute(
+            "UPDATE human_actions SET status = 'resolved', resolved_at = ? "
+            "WHERE task_id = ? AND status = 'open'",
+            (now, task_id),
+        )
         if changed_fields and author and author.strip():
             # Inline INSERT (rather than ``add_comment``) because we're
             # already inside this function's write_txn — nested BEGIN
