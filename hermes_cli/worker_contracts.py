@@ -51,21 +51,35 @@ def ensure_schema(conn: Any) -> None:
     )
 
 
-def proc_start_identity(pid: int) -> str | None:
-    """Linux /proc starttime ticks; PID alone is never a kill authority."""
+def sys_platform_linux() -> bool:
+    return os.path.isdir("/proc")
+
+
+def _proc_stat_tail(pid: int) -> list[str] | None:
+    """Return /proc/<pid>/stat fields after ``comm``.
+
+    The process name is wrapped in parentheses and may contain whitespace, so a
+    bare ``split()`` can shift every numeric field.  Parse from the final ``)``
+    before indexing Linux's stable stat fields.
+    """
     if pid <= 0 or not sys_platform_linux():
         return None
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
-            fields = handle.read().split()
-        # /proc/<pid>/stat field 22 (starttime), zero-indexed after splitting.
-        return fields[21] if len(fields) > 21 and fields[21].isdigit() else None
+            data = handle.read()
     except OSError:
         return None
+    _head, sep, tail = data.rpartition(")")
+    if not sep:
+        return None
+    return tail.strip().split()
 
 
-def sys_platform_linux() -> bool:
-    return os.path.isdir("/proc")
+def proc_start_identity(pid: int) -> str | None:
+    """Linux /proc starttime ticks; PID alone is never a kill authority."""
+    fields = _proc_stat_tail(pid)
+    # After removing pid+comm, Linux stat field 22 (starttime) is at tail index 19.
+    return fields[19] if fields and len(fields) > 19 and fields[19].isdigit() else None
 
 
 def process_group(pid: int) -> int | None:
@@ -73,6 +87,52 @@ def process_group(pid: int) -> int | None:
         return os.getpgid(pid)
     except OSError:
         return None
+
+
+def process_group_alive(pgid: int | None) -> bool:
+    """Return True while any non-zombie member of a recorded group exists.
+
+    Dispatcher workers are launched with ``start_new_session=True``.  Some
+    provider wrappers can exit before their CLI child; the original PID's start
+    identity then disappears even though the owned process group is still
+    writing in the task checkout.  The group is therefore part of the durable
+    ownership contract and keeps the workspace occupied until the last member
+    exits.
+    """
+    if pgid is None:
+        return False
+    try:
+        group_id = int(pgid)
+    except (TypeError, ValueError):
+        return False
+    if group_id <= 0:
+        return False
+    if sys_platform_linux():
+        try:
+            proc_entries = os.listdir("/proc")
+        except OSError:
+            proc_entries = []
+        for entry in proc_entries:
+            if not entry.isdigit():
+                continue
+            fields = _proc_stat_tail(int(entry))
+            if not fields or len(fields) <= 2:
+                continue
+            # tail index 0 is state; tail index 2 is Linux stat field 5 (pgrp).
+            if fields[0] == "Z":
+                continue
+            try:
+                member_group = int(fields[2])
+            except ValueError:
+                continue
+            if member_group == group_id:
+                return True
+        return False
+    try:
+        os.kill(-group_id, 0)
+    except OSError:
+        return False
+    return True
 
 
 def process_alive(pid: int) -> bool:
@@ -83,6 +143,23 @@ def process_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def contract_has_live_process(contract: Any) -> bool:
+    """True when the recorded leader or its process group still exists."""
+    pid = int(contract["pid"])
+    if proc_start_identity(pid) == contract["start_identity"]:
+        return True
+    return process_group_alive(contract["process_group"])
+
+
+def task_has_live_contract(conn: Any, task_id: str) -> bool:
+    """Return True if a prior dispatcher-owned worker for this card lives."""
+    row = conn.execute(
+        "SELECT * FROM worker_contracts WHERE task_id=? AND state IN ('active','stopped')",
+        (task_id,),
+    ).fetchone()
+    return bool(row is not None and contract_has_live_process(row))
 
 
 def register(
@@ -148,18 +225,20 @@ def _safe_signal(
 ) -> bool:
     """Signal only the exact recorded process group after identity validation."""
     pid = int(contract["pid"])
-    if proc_start_identity(pid) != contract["start_identity"]:
+    pgid = contract["process_group"]
+    leader_matches = proc_start_identity(pid) == contract["start_identity"]
+    group_alive = process_group_alive(pgid)
+    if not leader_matches and not group_alive:
         return False
     if kill is None:
         kill = os.kill
-    pgid = contract["process_group"]
     try:
-        if pgid and process_group(pid) == int(pgid):
+        if pgid and (group_alive or process_group(pid) == int(pgid)):
             kill(-int(pgid), sig)
         else:
             kill(pid, sig)
     except OSError:
-        return not process_alive(pid)
+        return not contract_has_live_process(contract)
     return True
 
 
@@ -179,10 +258,10 @@ def live_exit_barriers(
     Reconciliation sends SIGTERM asynchronously.  A fixed one-tick barrier is
     insufficient when an agent is still draining parallel tool calls: the next
     worker can otherwise enter the same checkout while the old PID is alive.
-    Keep the workspace occupied until the recorded start identity disappears.
-    If the process outlives a bounded grace period, SIGKILL the exact recorded
-    process group; the barrier remains for this tick and is released only after
-    the process table confirms exit.
+    Keep the workspace occupied until the recorded start identity or process
+    group disappears.  If the process outlives a bounded grace period, SIGKILL
+    the exact recorded process group; the barrier remains for this tick and is
+    released only after the process table confirms exit.
     """
     current = int(now or time.time())
     barriers: list[dict[str, Any]] = []
@@ -191,7 +270,7 @@ def live_exit_barriers(
     ).fetchall()
     for contract in rows:
         pid = int(contract["pid"])
-        if proc_start_identity(pid) != contract["start_identity"]:
+        if not contract_has_live_process(contract):
             continue
         forced = False
         stopped_at = int(contract["stopped_at"] or current)
@@ -226,7 +305,10 @@ def reconcile(conn: Any, *, now: int | None = None, stale_seconds: int = CHECKPO
         elif task["current_run_id"] != c["run_id"]:
             reason = "run_mismatch"
         elif proc_start_identity(int(c["pid"])) != c["start_identity"]:
-            reason = "pid_identity_mismatch"
+            if process_group_alive(c["process_group"]):
+                reason, should_stop = "process_group_survivor", True
+            else:
+                reason = "pid_identity_mismatch"
         else:
             checkpoint = latest_descriptive_checkpoint(conn, c["task_id"])
             # A new worker needs time to produce its first descriptive

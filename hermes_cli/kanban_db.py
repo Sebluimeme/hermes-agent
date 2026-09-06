@@ -5750,6 +5750,18 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        # A card can be requeued while the dispatcher-owned wrapper PID has
+        # exited but its provider child is still alive in the same process
+        # group.  The durable worker contract is stronger than the task phase:
+        # do not create a second writer for the same card/worktree until the
+        # prior owned process group is gone.
+        from hermes_cli import worker_contracts as _worker_contracts
+        if _worker_contracts.task_has_live_contract(conn, task_id):
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "active_worker_contract"},
+            )
+            return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -5878,6 +5890,15 @@ def claim_review_task(
                         "source_status": "review",
                     },
                 )
+            return None
+        # Do not start an independent reviewer while the implementer process
+        # group for this same card is still alive and capable of writing.
+        from hermes_cli import worker_contracts as _worker_contracts
+        if _worker_contracts.task_has_live_contract(conn, task_id):
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "active_worker_contract", "lane": "review"},
+            )
             return None
         cur = conn.execute(
             """

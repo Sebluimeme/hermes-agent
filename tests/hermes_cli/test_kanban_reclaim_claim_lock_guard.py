@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import worker_contracts as wc
 
 
 @pytest.fixture
@@ -88,6 +89,34 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
         assert final["claim_lock"] == f"{host}:B"
     finally:
         sleeper.terminate()
+
+
+def test_claim_rejected_while_prior_worker_contract_still_lives(conn, monkeypatch):
+    """A ready requeue must not spawn a duplicate while the old group writes."""
+    tid = kb.create_task(conn, title="duplicate", assignee="w")
+    first = kb.claim_task(conn, tid, claimer="host:A")
+    assert first is not None and first.current_run_id is not None
+    conn.execute(
+        "INSERT INTO worker_contracts "
+        "(task_id,run_id,profile,pid,start_identity,process_group,workspace_path,created_at,state) "
+        "VALUES (?,?,?,?,?,?,?,?, 'active')",
+        (tid, first.current_run_id, "w", 12345, "start-12345", 12345, "/tmp/work", 1),
+    )
+    conn.execute(
+        "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+        "worker_pid=NULL, current_run_id=NULL WHERE id=?",
+        (tid,),
+    )
+    conn.commit()
+    monkeypatch.setattr(wc, "contract_has_live_process", lambda _contract: True)
+
+    assert kb.claim_task(conn, tid, claimer="host:B") is None
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "ready"
+    rejected = [event for event in kb.list_events(conn, tid) if event.kind == "claim_rejected"]
+    assert rejected and isinstance(rejected[-1].payload, dict)
+    assert rejected[-1].payload["reason"] == "active_worker_contract"
 
 
 def test_genuine_crash_still_reclaims(conn):

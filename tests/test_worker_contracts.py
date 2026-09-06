@@ -87,6 +87,27 @@ class WorkerContractsTests(unittest.TestCase):
         with patch.object(wc, "proc_start_identity", return_value=None):
             self.assertEqual(wc.live_exit_barriers(self.conn, now=102), [])
 
+    def test_exit_barrier_persists_for_surviving_process_group(self) -> None:
+        self.register()
+        self.conn.execute(
+            "UPDATE worker_contracts SET state='stopped', stopped_at=101 WHERE task_id='t1'"
+        )
+        with patch.object(wc, "proc_start_identity", return_value=None), patch.object(wc, "process_group_alive", return_value=True):
+            barriers = wc.live_exit_barriers(self.conn, now=102)
+        self.assertEqual(barriers[0]["task_id"], "t1")
+        self.assertFalse(barriers[0]["forced"])
+
+    def test_exit_barrier_force_kills_surviving_process_group(self) -> None:
+        self.register()
+        self.conn.execute(
+            "UPDATE worker_contracts SET state='stopped', stopped_at=101 WHERE task_id='t1'"
+        )
+        with patch.object(wc, "proc_start_identity", return_value=None), patch.object(wc, "process_group_alive", return_value=True):
+            with patch.object(wc.os, "kill", side_effect=lambda pid, sig: self.kills.append((pid, sig))):
+                barriers = wc.live_exit_barriers(self.conn, now=101 + wc.EXIT_GRACE_SECONDS)
+        self.assertTrue(barriers[0]["forced"])
+        self.assertEqual(self.kills, [(-42, wc.signal.SIGKILL)])
+
     def test_pid_reuse_identity_mismatch_is_never_killed(self) -> None:
         self.register()
         with patch.object(wc, "proc_start_identity", return_value="new-process"):
@@ -94,6 +115,15 @@ class WorkerContractsTests(unittest.TestCase):
         self.assertEqual(actions[0]["reason"], "pid_identity_mismatch")
         self.assertFalse(actions[0]["stopped"])
         self.assertEqual(self.kills, [])
+
+    def test_provider_child_surviving_wrapper_is_stopped_as_owned_group(self) -> None:
+        self.register()
+        with patch.object(wc, "proc_start_identity", return_value=None), patch.object(wc, "process_group_alive", return_value=True):
+            with patch.object(wc.os, "kill", side_effect=lambda pid, sig: self.kills.append((pid, sig))):
+                actions = wc.reconcile(self.conn, now=101)
+        self.assertEqual(actions[0]["reason"], "process_group_survivor")
+        self.assertTrue(actions[0]["stopped"])
+        self.assertEqual(self.kills, [(-42, wc.signal.SIGTERM)])
 
     def test_missing_descriptive_checkpoint_stops_once_and_is_durable(self) -> None:
         self.register()
