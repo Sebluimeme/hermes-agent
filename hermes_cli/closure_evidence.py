@@ -30,7 +30,8 @@ def classify_closure_evidence(
     ``prior_status`` is accepted for source compatibility with the former
     runtime gate API.  The current implementation only reads metadata already
     attached to a completed run: explicit ``metadata.evidence`` first, then
-    durable artifacts, then review handoff facts and reviewer checks.
+    durable artifacts, verification/proof facts, then review handoff facts and
+    reviewer checks.
     """
     data = metadata if isinstance(metadata, Mapping) else {}
     evidence = data.get("evidence")
@@ -47,6 +48,14 @@ def classify_closure_evidence(
             kind="artifacts",
             detail=f"{len(artifacts)} artifact(s) declared",
         )
+
+    verification = _verification_detail(data.get("verification"))
+    if verification:
+        return ClosureEvidence(True, kind="verification", detail=verification)
+
+    proof = _clean(data.get("proof"))
+    if proof:
+        return ClosureEvidence(True, kind="proof", detail=proof)
 
     review = data.get("review")
     if isinstance(review, Mapping):
@@ -80,3 +89,20 @@ def classify_closure_evidence(
 
 def _clean(value: object) -> str:
     return " ".join(str(value or "").split())
+
+
+def _verification_detail(value: object) -> str:
+    """Normalize legacy structured verification metadata.
+
+    Some completed Kanban workers persisted proof under a top-level
+    ``verification`` key rather than the newer ``evidence``/``artifacts``
+    shapes.  Treat only non-empty structured verification values as proof;
+    a bare output file path still does not satisfy the classifier.
+    """
+    if isinstance(value, Mapping):
+        parts = [f"{key}: {_clean(item)}" for key, item in value.items() if _clean(item)]
+        return " | ".join(parts)
+    if isinstance(value, (list, tuple)):
+        parts = [_clean(item) for item in value if _clean(item)]
+        return " | ".join(parts)
+    return _clean(value)
