@@ -1,7 +1,7 @@
 """Regression tests for iteration-limit exit normalization (#61631)."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -219,7 +219,20 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         outcome="timed_out",
         release_claim=True,
         end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        event_payload_extra={
+            "budget_used": 60,
+            "budget_max": 60,
+            "checkpoint": {
+                "recorded_at": ANY,
+                "state": "budget_exhausted",
+                "budget_used": 60,
+                "budget_max": 60,
+                "next_action": (
+                    "resume the exact session from the durable checkpoint; inspect the "
+                    "current diff and do not repeat already recorded completed_actions"
+                ),
+            },
+        },
     )
     assert "reprend automatiquement" in result["final_response"]
     assert "aucune approbation" in result["final_response"]

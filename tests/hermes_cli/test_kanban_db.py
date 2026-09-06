@@ -4520,6 +4520,15 @@ def test_append_activity_event_writes_action_and_target(kanban_home, monkeypatch
         payload = _json.loads(row["payload"])
         assert payload["action"] == "read_file"
         assert payload["target"] == "scripts/kanban_board_sync.py"
+        run = kb.latest_run(conn, t)
+        assert run is not None
+        checkpoint = run.metadata["checkpoint"]
+        assert checkpoint["last_useful_action"] == {
+            "action": "read_file",
+            "target": "scripts/kanban_board_sync.py",
+        }
+        assert checkpoint["completed_actions"] == [checkpoint["last_useful_action"]]
+        assert "do not repeat" in checkpoint["next_action"]
 
 
 def test_silent_progress_becomes_visible_and_useful_activity_clears_it(kanban_home, monkeypatch):

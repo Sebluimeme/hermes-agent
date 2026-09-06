@@ -5436,7 +5436,15 @@ def _end_run(
     if not isinstance(_existing_metadata, dict):
         _existing_metadata = {}
     if isinstance(metadata, dict):
-        _existing_metadata.update(metadata)
+        incoming = dict(metadata)
+        incoming_checkpoint = incoming.pop("checkpoint", None)
+        if isinstance(incoming_checkpoint, dict):
+            existing_checkpoint = _existing_metadata.get("checkpoint")
+            if not isinstance(existing_checkpoint, dict):
+                existing_checkpoint = {}
+            existing_checkpoint.update(incoming_checkpoint)
+            _existing_metadata["checkpoint"] = existing_checkpoint
+        _existing_metadata.update(incoming)
     _checkpoint = _existing_metadata.get("checkpoint")
     if isinstance(_checkpoint, dict):
         _checkpoint["state"] = outcome
@@ -11521,6 +11529,41 @@ def append_activity_event(
                     {"action": safe_action, "target": safe_target},
                     run_id=run_id,
                 )
+                if run_id is not None and safe_action != "other":
+                    meta_row = conn.execute(
+                        "SELECT metadata FROM task_runs WHERE id=? AND ended_at IS NULL",
+                        (run_id,),
+                    ).fetchone()
+                    try:
+                        run_meta = json.loads(meta_row["metadata"] or "{}") if meta_row else {}
+                    except (TypeError, json.JSONDecodeError):
+                        run_meta = {}
+                    if not isinstance(run_meta, dict):
+                        run_meta = {}
+                    checkpoint = run_meta.get("checkpoint")
+                    if not isinstance(checkpoint, dict):
+                        checkpoint = {}
+                    completed = checkpoint.get("completed_actions")
+                    if not isinstance(completed, list):
+                        completed = []
+                    marker = {"action": safe_action, "target": safe_target}
+                    if marker not in completed:
+                        completed.append(marker)
+                    checkpoint.update({
+                        "recorded_at": int(time.time()),
+                        "state": "running",
+                        "last_useful_action": marker,
+                        "completed_actions": completed[-12:],
+                        "next_action": (
+                            "resume from this checkpoint; inspect current diff/state and "
+                            "do not repeat completed actions unless their inputs changed"
+                        ),
+                    })
+                    run_meta["checkpoint"] = checkpoint
+                    conn.execute(
+                        "UPDATE task_runs SET metadata=? WHERE id=? AND ended_at IS NULL",
+                        (json.dumps(run_meta, ensure_ascii=False), run_id),
+                    )
                 if safe_action != "other":
                     row = conn.execute(
                         "SELECT execution_status FROM tasks WHERE id=? AND status='running'",
@@ -13106,17 +13149,20 @@ def _record_task_failure(
             run_id = None
             if end_run:
                 # Only the spawn path has an open run to close.
+                run_metadata = {
+                    "failures": failures,
+                    "trigger_outcome": outcome,
+                    "effective_limit": effective_limit,
+                    "limit_source": limit_source,
+                    "retry_status": retry_status,
+                }
+                if event_payload_extra:
+                    run_metadata.update(event_payload_extra)
                 run_id = _end_run(
                     conn, task_id,
                     outcome="gave_up", status="gave_up",
                     error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "trigger_outcome": outcome,
-                        "effective_limit": effective_limit,
-                        "limit_source": limit_source,
-                        "retry_status": retry_status,
-                    },
+                    metadata=run_metadata,
                 )
             payload = {
                 "failures": failures,
@@ -13152,14 +13198,17 @@ def _record_task_failure(
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
+                run_metadata = {
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                if event_payload_extra:
+                    run_metadata.update(event_payload_extra)
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
+                    metadata=run_metadata,
                 )
                 _append_event(
                     conn, task_id, outcome,
@@ -15303,14 +15352,41 @@ def _run_verified_progress_marker(run: Run) -> Optional[str]:
     return None
 
 
-def adaptive_worker_turn_budget(task: Task, runs: Iterable[Run]) -> int:
-    """Bound a worker attempt by complexity, extending only after progress.
+def _worker_phase_turn_budget(task: Task, *, review_run: bool = False) -> int:
+    """Return a bounded first-run budget matched to the work phase."""
+    if review_run:
+        return 24
+    text = " ".join(
+        str(value or "")
+        for value in (getattr(task, "title", ""), getattr(task, "body", ""))
+    ).lower()
+    delivery_markers = (
+        "[visual]", "contrôle visuel", "controle visuel", "lighthouse",
+        "pa11y", "déploi", "deploy", "production", "mobile/desktop",
+    )
+    if any(marker in text for marker in delivery_markers):
+        return 48
+    read_only_markers = (
+        "[read-only]", "read_only=true", "sans écriture", "sans ecriture",
+        "audit en lecture", "recherche de preuve",
+    )
+    if getattr(task, "workspace_kind", None) == "scratch" and any(
+        marker in text for marker in ("audit", "vérifier", "verification", "recherche")
+    ):
+        return 16
+    if any(marker in text for marker in read_only_markers):
+        return 16
+    return 20 if normalize_routing_tier(task.routing_tier) == "simple" else 36
 
-    Simple cards start at 12 API/tool-loop iterations and complex cards at 30.
-    Each prior non-terminal run with a distinct durable progress marker grants
-    ten more turns. The absolute ceiling remains 90.
-    """
-    base = 12 if normalize_routing_tier(task.routing_tier) == "simple" else 30
+
+def adaptive_worker_turn_budget(
+    task: Task,
+    runs: Iterable[Run],
+    *,
+    review_run: bool = False,
+) -> int:
+    """Bound a worker attempt by phase, extending only after real progress."""
+    base = _worker_phase_turn_budget(task, review_run=review_run)
     markers: set[str] = set()
     for run in runs:
         if run.outcome == "completed":
@@ -15322,7 +15398,7 @@ def adaptive_worker_turn_budget(task: Task, runs: Iterable[Run]) -> int:
 
 
 def _worker_retry_strategy_hint(runs: Iterable[Run]) -> str:
-    """Require a changed approach after three repeated execution failures.
+    """Require a changed approach after two repeated execution failures.
 
     Resumable orchestration outcomes (for example ``interrupted``, ``stale``
     and ``reclaimed``) are deliberately excluded.  They preserve work but do
@@ -15335,14 +15411,14 @@ def _worker_retry_strategy_hint(runs: Iterable[Run]) -> str:
         if run.ended_at is not None
         and run.outcome in failure_outcomes
         and run.error
-    ][-3:]
-    if len(failures) < 3:
+    ][-2:]
+    if len(failures) < 2:
         return ""
     fingerprints = {_error_fingerprint(str(run.error)) for run in failures}
     if len(fingerprints) != 1:
         return ""
     return (
-        " Three consecutive attempts ended with the same failure. Treat the "
+        " Two consecutive attempts ended with the same failure. Treat the "
         "durable checkpoint as authoritative, do not repeat that failing call, "
         "and resume with a materially different strategy."
     )
@@ -15448,7 +15524,11 @@ def _default_spawn(
             )
     except Exception:
         prior_runs = []
-    turn_budget = adaptive_worker_turn_budget(task, prior_runs)
+    turn_budget = adaptive_worker_turn_budget(
+        task,
+        prior_runs,
+        review_run=review_run,
+    )
     strategy_hint = _worker_retry_strategy_hint(prior_runs)
     if review_run:
         prompt = (

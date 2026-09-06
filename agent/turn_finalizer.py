@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
@@ -94,6 +95,16 @@ def _record_kanban_budget_exhausted(
                 _expected_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
             except (TypeError, ValueError):
                 pass
+            _checkpoint = {
+                "recorded_at": int(time.time()),
+                "state": "budget_exhausted",
+                "budget_used": api_call_count,
+                "budget_max": max_iterations,
+                "next_action": (
+                    "resume the exact session from the durable checkpoint; inspect the "
+                    "current diff and do not repeat already recorded completed_actions"
+                ),
+            }
             _failure_kwargs = {
                 "error": (
                     f"Iteration budget exhausted "
@@ -107,6 +118,7 @@ def _record_kanban_budget_exhausted(
                 "event_payload_extra": {
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
+                    "checkpoint": _checkpoint,
                 },
             }
             if _expected_run_id is not None:
