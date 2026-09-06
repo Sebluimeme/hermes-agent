@@ -353,6 +353,19 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
 
 _FAILURE_EVENT_KINDS = ("gave_up", "crashed", "timed_out", "protocol_violation")
 
+# These transitions already have an automatic consumer (dispatcher/reviewer).
+# Waking the originating conversation makes a second model re-explain or even
+# re-decompose the same work, while a passive Telegram ping adds no action for
+# the user.  They remain durable on the card and the progress board.
+_SILENT_AUTOMATIC_EVENT_KINDS = frozenset({
+    "crashed",
+    "timed_out",
+    "review_requested",
+    "changes_requested",
+    "visual_review_deferred",
+    "relayed_to_coder",
+})
+
 
 def _failure_note(kb: Any, conn: Any, events: list) -> str:
     """One-line cause for a failing task event: outcome, duration, error.
@@ -1011,6 +1024,8 @@ class GatewayKanbanWatchersMixin:
                     wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        if kind in _SILENT_AUTOMATIC_EVENT_KINDS:
+                            continue
                         has_instruction_grant = bool(d.get("has_instruction_grant"))
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
@@ -1532,8 +1547,7 @@ class GatewayKanbanWatchersMixin:
                         # ``blocked`` does. ``status`` / ``archived`` /
                         # ``unblocked`` stay out: bookkeeping.
                         _WAKE_KINDS = (
-                            "completed", "gave_up", "crashed", "timed_out",
-                            "blocked", "review_requested", "changes_requested",
+                            "completed", "gave_up", "blocked",
                             "block_loop_detected",
                         )
                         _wake_kinds = (

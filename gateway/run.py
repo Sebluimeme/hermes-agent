@@ -13664,6 +13664,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
+            # The checkpoint is not the only durable ownership signal.  A
+            # gateway crash can leave it empty while a worker's preview server
+            # survives in that card's t_* worktree.  Reconcile those exact
+            # processes against terminal Kanban cards at boot; main-checkout
+            # servers and non-terminal cards are never eligible.
+            try:
+                from hermes_cli import kanban_db as _process_kb
+
+                _terminal_task_ids: set[str] = set()
+                for _board_meta in _process_kb.list_boards(include_archived=True):
+                    _board_slug = _board_meta.get("slug") or _process_kb.DEFAULT_BOARD
+                    with _process_kb.connect_closing(board=_board_slug) as _conn:
+                        _terminal_task_ids.update(
+                            task.id
+                            for task in _process_kb.list_tasks(
+                                _conn, include_archived=True,
+                            )
+                            if task.status in {"done", "archived"}
+                        )
+                _orphaned = process_registry.reap_orphaned_terminal_task_previews(
+                    _terminal_task_ids
+                )
+                if _orphaned:
+                    logger.info(
+                        "Reaped %s orphan QA preview process(es) from terminal task worktrees",
+                        _orphaned,
+                    )
+            except Exception as _orphan_exc:
+                logger.warning("Orphan QA preview reconciliation: %s", _orphan_exc)
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 

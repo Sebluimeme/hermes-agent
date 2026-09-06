@@ -234,6 +234,44 @@ def test_temp_process_metadata_is_written_to_checkpoint(registry, tmp_path, monk
     assert entry["last_control_at"] == session.last_control_at
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="requires procfs-shaped symlinks")
+def test_reap_orphaned_terminal_preview_requires_worktree_command_and_terminal_task(
+    registry, tmp_path, monkeypatch,
+):
+    proc_root = tmp_path / "proc"
+    killed = []
+
+    def fake_proc(pid: int, cwd: str, command: str, start: str = "123") -> None:
+        proc_dir = proc_root / str(pid)
+        proc_dir.mkdir(parents=True)
+        target = tmp_path / cwd.lstrip("/")
+        target.mkdir(parents=True, exist_ok=True)
+        (proc_dir / "cwd").symlink_to(target)
+        (proc_dir / "cmdline").write_bytes(command.encode() + b"\x00")
+        # fields 3..21 followed by starttime (field 22)
+        tail = ["S"] + ["0"] * 18 + [start] + ["0"] * 4
+        (proc_dir / "stat").write_text(f"{pid} (node) {' '.join(tail)}")
+
+    fake_proc(101, ".worktrees/t_done/app", "node next-server")
+    fake_proc(102, ".worktrees/t_live/app", "node next-server")
+    fake_proc(103, "main-checkout", "node next-server")
+    fake_proc(104, ".worktrees/t_done/app-2", "python worker.py")
+
+    def fake_kill(pid, sig):
+        killed.append((pid, sig))
+        if sig == signal.SIGTERM:
+            # Simulate a clean exit so the implementation never sleeps.
+            (proc_root / str(pid)).rename(proc_root / f"gone-{pid}")
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    count = registry.reap_orphaned_terminal_task_previews(
+        {"t_done"}, proc_root=proc_root, grace_seconds=0,
+    )
+
+    assert count == 1
+    assert killed == [(101, signal.SIGTERM)]
+
+
 def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
     """Poll a predicate until it returns truthy or the timeout elapses."""
     deadline = time.monotonic() + timeout

@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import subprocess
@@ -57,6 +58,38 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+
+# A checkpoint can legitimately be empty after a gateway restart even though a
+# dev server started by an older Kanban worker is still alive.  The worktree
+# path is the durable ownership marker in that case.  Keep this classifier
+# intentionally narrow: only task worktrees and well-known preview servers are
+# eligible, never a process in a user's main checkout.
+_TASK_WORKTREE_RE = re.compile(r"/(?:\.worktrees|worktrees)/(t_[A-Za-z0-9]+)(?:/|$)")
+_QA_PREVIEW_COMMAND_RE = re.compile(
+    r"(?:next-server|\bnext\s+(?:dev|start)\b|\bvite\b|\bastro\s+dev\b|"
+    r"\bwebpack(?:-dev-server)?\b|\bnodemon\b|\buvicorn\b|\bgunicorn\b|"
+    r"\bpython(?:3)?\s+-m\s+http\.server\b)",
+    re.IGNORECASE,
+)
+
+
+def _proc_preview_identity(proc_dir: Path) -> tuple[str, str, str, str] | None:
+    """Return stable ownership data for a narrowly identified QA server."""
+    try:
+        cwd = str((proc_dir / "cwd").resolve(strict=True))
+        match = _TASK_WORKTREE_RE.search(cwd)
+        if match is None:
+            return None
+        raw_command = (proc_dir / "cmdline").read_bytes().replace(b"\x00", b" ")
+        command = raw_command.decode("utf-8", errors="replace").strip()
+        if not command or _QA_PREVIEW_COMMAND_RE.search(command) is None:
+            return None
+        stat = (proc_dir / "stat").read_text(encoding="utf-8", errors="replace")
+        tail = stat.rsplit(") ", 1)[1].split()
+        start_time = tail[19]
+    except (OSError, IndexError, ValueError):
+        return None
+    return match.group(1), cwd, command, start_time
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -1819,6 +1852,87 @@ class ProcessRegistry:
             if result.get("status") in {"killed", "already_exited"}:
                 killed += 1
         return killed
+
+    def reap_orphaned_terminal_task_previews(
+        self,
+        terminal_task_ids: set[str],
+        *,
+        proc_root: Path = Path("/proc"),
+        grace_seconds: float = 2.0,
+    ) -> int:
+        """Reap unregistered preview servers owned by terminal task worktrees.
+
+        This is the crash/restart fallback for :meth:`reap_stale_temp_processes`.
+        It deliberately requires three independent signals before touching a
+        process: a host ``/proc`` entry, a cwd inside a ``t_*`` worktree whose
+        durable card is terminal, and a known preview-server command line.
+        PID start time and cwd are re-read immediately before each signal so a
+        recycled PID or a process that changed directories is never killed.
+        """
+        terminal = {str(task_id) for task_id in terminal_task_ids if task_id}
+        if not terminal or not proc_root.is_dir():
+            return 0
+
+        candidates: list[tuple[int, str, str, str]] = []
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == os.getpid():
+                continue
+            identity = _proc_preview_identity(entry)
+            if identity is None:
+                continue
+            task_id, cwd, command, start_time = identity
+            if task_id in terminal:
+                candidates.append((pid, cwd, command, start_time))
+
+        reaped = 0
+        for pid, cwd, command, start_time in candidates:
+            proc_dir = proc_root / str(pid)
+            current = _proc_preview_identity(proc_dir)
+            if current is None or current != (
+                _TASK_WORKTREE_RE.search(cwd).group(1), cwd, command, start_time
+            ):
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                reaped += 1
+                continue
+            except (OSError, PermissionError):
+                logger.warning(
+                    "Could not terminate orphan QA preview pid=%s cwd=%s",
+                    pid, cwd,
+                )
+                continue
+
+            deadline = time.monotonic() + max(0.0, float(grace_seconds))
+            while time.monotonic() < deadline and (proc_root / str(pid)).exists():
+                time.sleep(0.05)
+            if (proc_root / str(pid)).exists():
+                # Revalidate the immutable start time and ownership markers
+                # once more before escalation.
+                current = _proc_preview_identity(proc_root / str(pid))
+                if current == (
+                    _TASK_WORKTREE_RE.search(cwd).group(1), cwd, command, start_time
+                ):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except (OSError, PermissionError):
+                        logger.warning(
+                            "Could not force-stop orphan QA preview pid=%s cwd=%s",
+                            pid, cwd,
+                        )
+                        continue
+            reaped += 1
+            logger.info(
+                "Reaped orphan QA preview for terminal task %s: pid=%s command=%s",
+                _TASK_WORKTREE_RE.search(cwd).group(1), pid, command[:120],
+            )
+        return reaped
 
     @staticmethod
     def _temp_process_idle_seconds() -> float:

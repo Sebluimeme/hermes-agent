@@ -333,16 +333,8 @@ def test_intermediate_mission_completion_advances_silently(tmp_path, monkeypatch
     assert _unseen_terminal_events(first) == []
 
 
-def test_crashed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):
-    """t_07db0331: `crashed` must reach Sébastien exactly once, like `completed`.
-
-    Live evidence (2026-09-02/03 session on the main Telegram topic) showed
-    the same double-message shape t_62e8c688 fixed for `completed`, still
-    present for `crashed`/`timed_out`: the raw "Impact/Solution/Preuve" ping
-    was sent directly AND the owning session was woken, producing its own
-    follow-up synthesis a moment later — two messages for one auto-retried
-    crash the dispatcher already handles without any decision from him.
-    """
+def test_crashed_event_is_silent_while_dispatcher_retries(tmp_path, monkeypatch):
+    """An automatically retried crash is durable but creates no extra turn."""
     db_path = tmp_path / "crashed-defers-to-wake.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -370,11 +362,8 @@ def test_crashed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert adapter.sent == [], (
-        f"a crashed event with an owning session must defer entirely to "
-        f"the wake synthesis, got a raw ping too: {adapter.sent}"
-    )
-    assert len(adapter.handled) == 1
+    assert adapter.sent == []
+    assert adapter.handled == []
 
     conn = kb.connect()
     try:
@@ -387,8 +376,8 @@ def test_crashed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):
     assert remaining == []
 
 
-def test_timed_out_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):
-    """t_07db0331: same fix as `crashed`, applied to `timed_out`."""
+def test_timed_out_event_is_silent_while_dispatcher_retries(tmp_path, monkeypatch):
+    """An automatically retried timeout is durable but creates no extra turn."""
     db_path = tmp_path / "timedout-defers-to-wake.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -416,11 +405,8 @@ def test_timed_out_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert adapter.sent == [], (
-        f"a timed_out event with an owning session must defer entirely to "
-        f"the wake synthesis, got a raw ping too: {adapter.sent}"
-    )
-    assert len(adapter.handled) == 1
+    assert adapter.sent == []
+    assert adapter.handled == []
 
     conn = kb.connect()
     try:
@@ -598,18 +584,8 @@ class ReportedFailureAdapter:
         return SendResult(success=False, error="Not connected")
 
 
-def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
-    """A retry cycle (crashed → reclaimed → crashed) notifies the user twice.
-
-    Before #21398 the notifier auto-unsubscribed on any terminal event kind
-    (gave_up / crashed / timed_out), so the second crash in a respawn cycle
-    silently dropped — the subscription was already gone. This test pins the
-    new contract: subscription survives non-final terminal events; the
-    cursor handles dedup.
-
-    Two crashes ten seconds apart on the same task — both should land on
-    the adapter.
-    """
+def test_notifier_consumes_repeated_auto_retry_events_silently(tmp_path, monkeypatch):
+    """Repeated crashes keep the subscription but do not spend user turns."""
     db_path = tmp_path / "redeliver-cycle.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -627,10 +603,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # First crash delivered.
-    assert len(adapter.sent) == 1
-    assert "Impact : le worker s’est arrêté avant la fin." in adapter.sent[0]["text"]
-    assert "Solution : relance automatique engagée." in adapter.sent[0]["text"]
+    assert adapter.sent == []
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
@@ -649,16 +622,11 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     finally:
         conn.close()
 
-    # New tick: the second event has a fresh id past the cursor advance,
-    # so it gets claimed and delivered.
+    # New tick consumes the fresh event without a user-visible delivery.
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 2, (
-        f"Second crashed event should also notify; got {len(adapter.sent)} "
-        f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
-    )
-    assert "Preuve : processus de la carte absent." in adapter.sent[1]["text"]
+    assert adapter.sent == []
 
 
 def test_notifier_subscription_survives_done_reopen_until_archive(
@@ -976,7 +944,7 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert remaining == []
 
 
-def test_notifier_delivers_one_clean_final_coder_relay(tmp_path, monkeypatch):
+def test_notifier_keeps_coder_relay_internal(tmp_path, monkeypatch):
     db_path = tmp_path / "coder-relay.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -996,10 +964,8 @@ def test_notifier_delivers_one_clean_final_coder_relay(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["text"] == "Relais automatique vers Coder.\nRetour estimé Claude 2 : 09:30"
-    assert tid not in adapter.sent[0]["text"]
-    assert "@default" not in adapter.sent[0]["text"]
+    assert adapter.sent == []
+    assert adapter.handled == []
 
 
 def test_notifier_explains_provider_auth_action_while_fallback_continues(
@@ -1043,7 +1009,7 @@ def test_notifier_explains_provider_auth_action_while_fallback_continues(
     assert tid not in message
 
 
-def test_notifier_explains_visual_retry_requires_no_human_action(tmp_path, monkeypatch):
+def test_notifier_keeps_visual_retry_internal(tmp_path, monkeypatch):
     db_path = tmp_path / "visual-review-deferred.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -1066,12 +1032,8 @@ def test_notifier_explains_visual_retry_requires_no_human_action(tmp_path, monke
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
-    message = adapter.sent[0]["text"]
-    assert "validation visuelle finale Gemini" in message
-    assert "Reprise automatique" in message
-    assert "Aucune action requise" in message
-    assert tid not in message
+    assert adapter.sent == []
+    assert adapter.handled == []
 
 
 def test_notifier_suppresses_block_loop_ping_when_already_auto_resolved(
@@ -1409,8 +1371,7 @@ def test_notifier_resumes_delivery_after_crash_then_completion(tmp_path, monkeyp
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    assert len(adapter.sent) == 1
-    assert "Impact : le worker s’est arrêté avant la fin." in adapter.sent[0]["text"]
+    assert adapter.sent == []
 
     # Dispatcher reclaims and respawns; this run succeeds.
     conn = kb.connect()
@@ -1422,11 +1383,11 @@ def test_notifier_resumes_delivery_after_crash_then_completion(tmp_path, monkeyp
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 2, (
+    assert len(adapter.sent) == 1, (
         f"the post-crash completion must still be delivered, got: "
         f"{[d['text'] for d in adapter.sent]}"
     )
-    assert "terminé après relance" in adapter.sent[1]["text"]
+    assert "terminé après relance" in adapter.sent[0]["text"]
 
 
 def test_notifier_does_not_double_send_same_event(tmp_path, monkeypatch):
@@ -1503,8 +1464,8 @@ def _review_handoff_task(
         conn.close()
 
 
-def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
-    """A review handoff wakes the origin and carries the worker's summary."""
+def test_review_requested_is_consumed_by_dispatcher_without_origin_wake(tmp_path, monkeypatch):
+    """The review lane is automatic and must not create a second agent turn."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-wake.db"))
     kb.init_db()
     tid = _review_handoff_task()
@@ -1513,15 +1474,8 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert adapter.sent == [], "review handoff must use the wake as its sole path"
-
-    wake = _wake_text(adapter)
-    assert tid in wake
-    assert "PR ready: https://example.invalid/pr/7" in wake, (
-        "the worker's handoff must ride the wake turn like it does for "
-        "`completed`, otherwise the woken reviewer has to re-read the board"
-    )
-    assert adapter.handled[0].metadata["user_delivery_policy"] == "silent"
+    assert adapter.sent == []
+    assert adapter.handled == []
 
 
 def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
@@ -1565,10 +1519,10 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
     assert tid in _wake_text(adapter)
 
 
-def test_review_requested_does_not_wake_a_notify_only_subscription(
+def test_review_requested_is_silent_for_notify_only_subscription(
     tmp_path, monkeypatch,
 ):
-    """delivery_mode still decides whether a wake-worthy kind wakes at all."""
+    """Review handoff stays internal regardless of subscription mode."""
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-notify.db"))
     kb.init_db()
     _review_handoff_task(delivery_mode="notify")
@@ -1577,7 +1531,5 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert len(adapter.sent) == 1
-    assert adapter.handled == [], (
-        "notify-only subscriptions must not be woken by a review handoff"
-    )
+    assert adapter.sent == []
+    assert adapter.handled == []
