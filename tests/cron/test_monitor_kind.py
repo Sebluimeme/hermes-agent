@@ -313,6 +313,33 @@ def test_unchanged_output_suppresses_agent_run(hermes_env, monkeypatch):
     assert "no_change" in doc
 
 
+def test_healthy_sentinel_persists_resolution_without_agent_run(hermes_env, monkeypatch):
+    from cron.jobs import get_job
+    from cron.monitor import hash_monitor_output
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    job = _make_monitor_job(hermes_env, "echo 'incident active'\n")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    run_job(job)
+    assert observed["agent_runs"] == 1
+
+    _write_script(
+        hermes_env, "mon.sh", "echo 'AUCUNE_ANOMALIE_BOUCLE_HERMES'\n"
+    )
+    job = get_job(job["id"])
+    success, doc, final, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert final == SILENT_MARKER
+    assert observed["agent_runs"] == 1
+    refreshed = get_job(job["id"])
+    assert refreshed["monitor_state"]["last_output_hash"] == hash_monitor_output(
+        "AUCUNE_ANOMALIE_BOUCLE_HERMES"
+    )
+
+
 def test_changed_output_injects_diff(hermes_env, monkeypatch):
     from cron.jobs import get_job
     from cron.scheduler import run_job

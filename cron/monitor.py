@@ -7,6 +7,9 @@ hash stored from the last agent-triggering tick:
 
 * unchanged → the agent run is suppressed entirely (no LLM, no delivery);
   the tick is recorded as a silent ``no_change`` run.
+* an exact ``AUCUNE_ANOMALIE_BOUCLE_HERMES`` output → the new healthy
+  snapshot is persisted but the agent is suppressed even when the previous
+  snapshot contained an incident.
 * changed (or first run) → a "MONITOR CHANGE DETECTED" context block —
   unified diff of old vs new output (capped) plus the new output — is
   injected into the prompt and the agent runs normally.
@@ -49,6 +52,7 @@ URL_TIMEOUT_SECONDS = 30
 MAX_URL_BYTES = 262_144  # 256 KiB
 
 _SNAPSHOT_FILENAME = "monitor_last_output.txt"
+SUPPRESS_AGENT_OUTPUTS = frozenset({"AUCUNE_ANOMALIE_BOUCLE_HERMES"})
 
 
 @dataclass
@@ -164,6 +168,14 @@ def check_monitor(job: dict) -> MonitorOutcome:
     last_hash = state.get("last_output_hash")
 
     if last_hash is not None and new_hash == last_hash:
+        return MonitorOutcome(ok=True, changed=False)
+
+    # A monitor-specific healthy sentinel is a state transition worth
+    # persisting, but not a reason to spend a model call merely to say that
+    # nothing remains active. Persisting it also prevents stale incident
+    # snapshots from being returned by later diagnostics.
+    if output.strip() in SUPPRESS_AGENT_OUTPUTS:
+        _persist_monitor_state(job_id, new_hash, output)
         return MonitorOutcome(ok=True, changed=False)
 
     first_run = last_hash is None
