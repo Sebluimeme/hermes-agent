@@ -6740,6 +6740,73 @@ def record_visual_check(
     return True
 
 
+def declare_task_replacements(
+    conn: sqlite3.Connection,
+    resolver_task_id: str,
+    replaced_task_ids: Iterable[str],
+) -> tuple[str, ...]:
+    """Persist the blocked/triage cards explicitly replaced by a new card."""
+    targets = tuple(dict.fromkeys(
+        str(item).strip() for item in replaced_task_ids if str(item).strip()
+    ))
+    if not targets:
+        return ()
+    if resolver_task_id in targets:
+        raise ValueError("a task cannot replace itself")
+    with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (resolver_task_id,)
+        ).fetchone():
+            raise ValueError(f"unknown resolver task {resolver_task_id}")
+        placeholders = ", ".join("?" for _ in targets)
+        rows = conn.execute(
+            f"SELECT id, status FROM tasks WHERE id IN ({placeholders})",
+            targets,
+        ).fetchall()
+        states = {row["id"]: row["status"] for row in rows}
+        missing = [item for item in targets if item not in states]
+        invalid = [
+            item for item in targets
+            if item in states and states[item] not in {"blocked", "triage"}
+        ]
+        if missing:
+            raise ValueError(f"unknown replaced task(s): {', '.join(missing)}")
+        if invalid:
+            details = ", ".join(f"{item} ({states[item]})" for item in invalid)
+            raise ValueError(
+                "only blocked or triage tasks can be replaced: " + details
+            )
+        _append_event(
+            conn,
+            resolver_task_id,
+            "replacement_declared",
+            {"replaced_task_ids": list(targets)},
+        )
+    return targets
+
+
+def _declared_replaced_task_ids(
+    conn: sqlite3.Connection, resolver_task_id: str
+) -> tuple[str, ...]:
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'replacement_declared' ORDER BY id",
+        (resolver_task_id,),
+    ).fetchall()
+    targets: list[str] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        values = payload.get("replaced_task_ids")
+        if isinstance(values, list):
+            targets.extend(
+                str(item).strip() for item in values if str(item).strip()
+            )
+    return tuple(dict.fromkeys(targets))
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6786,6 +6853,7 @@ def complete_task(
     """
     now = int(time.time())
     created_cards_tuple = tuple(str(c) for c in (created_cards or ()))
+    replaced_task_ids = _declared_replaced_task_ids(conn, task_id)
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -7045,6 +7113,61 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        resolved_replacements: list[str] = []
+        for replaced_id in replaced_task_ids:
+            replaced = conn.execute(
+                "SELECT status, current_run_id, mission_id FROM tasks WHERE id = ?",
+                (replaced_id,),
+            ).fetchone()
+            if replaced is None or replaced["status"] in {"done", "archived"}:
+                continue
+            # Re-check under the completion transaction: a card that became
+            # executable after declaration must not be closed by stale work.
+            if replaced["status"] not in {"blocked", "triage"}:
+                continue
+            conn.execute(
+                "UPDATE tasks SET status='archived', completed_at=?, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "current_run_id=NULL, block_kind=NULL, block_recurrences=0, "
+                "execution_status='done', verification_status='verified', "
+                "integration_status='not_required', delivery_status='delivered', "
+                "failure_class=NULL, next_retry_at=NULL, action_required=NULL, "
+                "result=COALESCE(result, ?) WHERE id=?",
+                (now, f"Résolue par la carte de remplacement {task_id}.", replaced_id),
+            )
+            if replaced["current_run_id"] is not None:
+                conn.execute(
+                    "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
+                    "summary=COALESCE(summary, ?), ended_at=?, claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL "
+                    "WHERE id=? AND ended_at IS NULL",
+                    (
+                        f"task resolved by replacement {task_id}",
+                        now,
+                        int(replaced["current_run_id"]),
+                    ),
+                )
+            _append_event(
+                conn,
+                replaced_id,
+                "resolved_by_replacement",
+                {"resolver_task_id": task_id},
+            )
+            conn.execute(
+                "UPDATE human_actions SET status='resolved', resolved_at=? "
+                "WHERE task_id=? AND status='open'",
+                (now, replaced_id),
+            )
+            _refresh_mission_status(conn, replaced["mission_id"])
+            resolved_replacements.append(replaced_id)
+        if resolved_replacements:
+            _append_event(
+                conn,
+                task_id,
+                "replacements_resolved",
+                {"replaced_task_ids": resolved_replacements},
+                run_id=run_id,
+            )
         conn.execute(
             "UPDATE human_actions SET status = 'resolved', resolved_at = ? "
             "WHERE task_id = ? AND status = 'open'",
@@ -7079,6 +7202,8 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    for replaced_id in replaced_task_ids:
+        _cleanup_workspace(conn, replaced_id)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)

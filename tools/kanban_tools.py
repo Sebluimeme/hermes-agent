@@ -1718,6 +1718,7 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     body = args.get("body")
     parents = args.get("parents") or []
+    resolves = args.get("resolves") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
@@ -1793,6 +1794,12 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    if isinstance(resolves, str):
+        resolves = [resolves]
+    if not isinstance(resolves, (list, tuple)):
+        return tool_error(
+            f"resolves must be a list of task ids, got {type(resolves).__name__}"
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1863,6 +1870,15 @@ def _handle_create(args: dict, **kw) -> str:
                 queue_class=str(queue_class),
             )
             new_task = kb.get_task(conn, new_tid)
+            try:
+                resolved_targets = kb.declare_task_replacements(
+                    conn, new_tid, resolves
+                )
+            except ValueError:
+                # Do not leave an executable replacement card behind when its
+                # declared target is missing or no longer blocked.
+                kb.archive_task(conn, new_tid)
+                raise
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             task_status = new_task.status if new_task else None
             execution_started = bool(
@@ -1904,6 +1920,7 @@ def _handle_create(args: dict, **kw) -> str:
                 execution_state=execution_state,
                 activity_claim_allowed=execution_started,
                 operator_guidance=operator_guidance,
+                resolves=list(resolved_targets),
             )
         finally:
             conn.close()
@@ -2951,6 +2968,17 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "resolves": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Blocked or triage task ids that this new card explicitly "
+                    "replaces. When this replacement completes successfully, "
+                    "the kernel archives those stale cards and clears their "
+                    "pending human action in the same transaction. Do not use "
+                    "for ordinary dependencies; use parents for those."
                 ),
             },
             "tenant": {
