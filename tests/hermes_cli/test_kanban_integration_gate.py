@@ -132,3 +132,40 @@ def test_scratch_docs_do_not_require_integration(kanban_home):
             summary="documentation written",
             metadata={"evidence": {"kind": "test", "detail": "spellcheck passed"}},
         )
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "Ne pas commit/push.",
+        "Sans commit ni push.",
+        "Do not commit/push.",
+        "No commit/push.",
+    ],
+)
+def test_explicit_no_commit_instruction_disables_inferred_integration(
+    kanban_home, instruction
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Verify a local candidate",
+            body=f"{instruction} Vérifier le déploiement local uniquement.",
+            assignee="claude2",
+            workspace_kind="dir",
+            workspace_path=str(kanban_home),
+        )
+        kb.claim_task(conn, task_id)
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="local verification complete",
+            metadata={"evidence": {"kind": "test", "detail": "tests passed"}},
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.status == "done"
+        assert task.integration_status != "awaiting_integration"
+        assert not any(
+            event.kind == "awaiting_integration"
+            for event in kb.list_events(conn, task_id)
+        )

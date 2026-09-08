@@ -819,3 +819,37 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"
+
+
+def test_default_reviewer_is_never_the_implementer(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="independent review", assignee="claude2")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="candidate ready",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, tid).assignee == "coder"
+        event = _events(conn, tid, kind="review_requested")[0][1]
+        assert event["implementer"] == "claude2"
+        assert event["reviewer"] == "coder"
+
+
+def test_same_explicit_reviewer_is_rerouted_to_an_independent_lane(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="independent review", assignee="coder")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="candidate ready",
+            reviewer="coder",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, tid).assignee == "coder2"

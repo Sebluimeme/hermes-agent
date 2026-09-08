@@ -104,7 +104,20 @@ def _completion_requires_integration(task: "Task", metadata: Mapping[str, Any]) 
     if isinstance(contract, Mapping) and "required" in contract:
         return bool(contract.get("required"))
     text = f"{task.title or ''} {task.body or ''}".lower()
-    if "[no-integration]" in text or task.workspace_kind == "scratch":
+    explicitly_without_delivery = any(
+        re.search(pattern, text)
+        for pattern in (
+            r"\bne\s+pas\s+(?:faire\s+de\s+)?commit(?:ter)?(?:\s*/\s*push)?\b",
+            r"\bsans\s+(?:faire\s+de\s+)?commit(?:ter)?(?:\s*/\s*push)?\b",
+            r"\bdo\s+not\s+commit(?:\s*/\s*push)?\b",
+            r"\bno\s+commit(?:\s*/\s*push)?\b",
+        )
+    )
+    if (
+        "[no-integration]" in text
+        or task.workspace_kind == "scratch"
+        or explicitly_without_delivery
+    ):
         return False
     return any(
         marker in text
@@ -3891,6 +3904,36 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def _independent_reviewer_profile(
+    implementer: Optional[str], reviewer: Optional[str]
+) -> Optional[str]:
+    """Return a reviewer profile that cannot equal the implementer.
+
+    Review is a separate verification boundary, not a second pass by the same
+    profile.  Explicit or plugin-projected reviewers are preserved when they
+    are already independent; otherwise use the first deterministic review
+    lane distinct from the implementer.  Capacity and quota remain the
+    dispatcher's responsibility.
+    """
+    implementer_name = _canonical_assignee(implementer)
+    reviewer_name = _canonical_assignee(reviewer)
+    is_execution_profile = bool(
+        implementer_name in {"claude1", "claude2", "spark"}
+        or re.fullmatch(r"coder\d*", implementer_name or "")
+    )
+    # Keep the generic Kanban API neutral for installations that use their
+    # own arbitrary profile names.  The invariant applies to Hermes' concrete
+    # execution lanes, where equality has an unambiguous meaning.
+    if not is_execution_profile:
+        return reviewer_name
+    if reviewer_name and reviewer_name != implementer_name:
+        return reviewer_name
+    for candidate in ("coder", "coder2", "coder3", "claude2", "claude1", "spark"):
+        if candidate != implementer_name:
+            return candidate
+    return reviewer_name
 
 
 def ensure_mission(
@@ -8419,6 +8462,7 @@ def _review_handoff_projection_result(
                 if projected_reviewer is not None
                 else None
             )
+            reviewer = _independent_reviewer_profile(row["assignee"], reviewer)
             return None, projected_metadata, reviewer, row
 
         if reviewer is None:
@@ -8426,7 +8470,7 @@ def _review_handoff_projection_result(
             if prior_error is not None:
                 return prior_error, metadata, reviewer, row
             reviewer = prior_reviewer
-        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        reviewer = _independent_reviewer_profile(row["assignee"], reviewer)
         return None, metadata, reviewer, row
     except ValueError as exc:
         return exc, metadata, reviewer, row
