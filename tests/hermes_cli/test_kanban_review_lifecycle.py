@@ -194,6 +194,93 @@ def test_active_reviewer_cannot_wait_for_or_request_itself(
 
 
 # ---------------------------------------------------------------------------
+# Regression: a card parked in review/awaiting_integration by the
+# integration gate (never a genuine request_review handoff) must not be
+# treated as "already reviewed" — otherwise no handoff can ever be created
+# and the card is stuck forever (t_41f071c7 incident).
+# ---------------------------------------------------------------------------
+
+
+def test_awaiting_integration_claim_can_still_request_a_real_review(
+    kanban_home: Path,
+) -> None:
+    """complete_task's integration fallback is not a reviewer boundary.
+
+    When ``complete_task`` cannot verify a declared integration contract it
+    parks the card in ``review`` with ``integration_status=awaiting_integration``
+    (see test_kanban_integration_gate.py) without ever calling
+    ``request_review`` — no handoff, no reviewer, no screenshots. If a worker
+    later reclaims that card via ``claim_review_task`` (the normal way a
+    review-lane card is picked back up), it must still be able to call
+    ``request_review`` to produce the first real handoff. Refusing that call
+    as "you are already the active reviewer" — as if a genuine review had
+    taken place — makes the card impossible to ever close correctly.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="Deliver candidate", assignee="worker",
+            workspace_kind="dir",
+        )
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        with pytest.raises(kb.CompletionValidationError, match="awaiting_integration"):
+            kb.complete_task(
+                conn,
+                tid,
+                summary="candidate complete",
+                metadata={
+                    "evidence": {"kind": "test", "detail": "tests passed"},
+                    "integration": {
+                        "required": True,
+                        "repo_path": str(kanban_home),
+                        "target_remote": "origin",
+                        "target_branch": "main",
+                        "commit": "deadbeefcafefeedfacefeedfacefeedfacefeed",
+                    },
+                },
+            )
+        task = kb.get_task(conn, tid)
+        assert task.status == "review"
+        assert task.integration_status == "awaiting_integration"
+        assert not any(
+            run.outcome == "review_requested" for run in kb.list_runs(conn, tid)
+        )
+
+        # A worker (dispatcher-driven) reclaims the stranded review-lane
+        # card, exactly like claiming a genuinely-reviewed card.
+        reclaimed = kb.claim_review_task(conn, tid, claimer="worker:2")
+        assert reclaimed is not None and reclaimed.current_run_id is not None
+
+        ok, reason = kb.request_review(
+            conn,
+            tid,
+            summary="candidate ready for real review",
+            reviewer="coder",
+            expected_run_id=reclaimed.current_run_id,
+            with_reason=True,
+        )
+        assert ok is True, reason
+
+        rr = _events(conn, tid, kind="review_requested")
+        assert len(rr) == 1
+        assert rr[0][1]["reviewer"] == "coder"
+
+        # Now that a genuine handoff exists, the ordinary self-review guard
+        # must still protect the actual reviewer boundary.
+        reviewer_claim = kb.claim_review_task(conn, tid, claimer="coder:1")
+        assert reviewer_claim is not None and reviewer_claim.current_run_id is not None
+        ok2, reason2 = kb.request_review(
+            conn,
+            tid,
+            summary="ask yet another reviewer",
+            expected_run_id=reviewer_claim.current_run_id,
+            with_reason=True,
+        )
+        assert ok2 is False
+        assert reason2 is not None and "already the active reviewer" in reason2
+
+
+# ---------------------------------------------------------------------------
 # Core regression: repeated review requests never escalate to triage
 # ---------------------------------------------------------------------------
 

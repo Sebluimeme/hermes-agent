@@ -8478,6 +8478,24 @@ def _review_handoff_projection_result(
         return exc, metadata, reviewer, row
 
 
+def _has_review_requested_handoff(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether a genuine ``kanban_request_review`` handoff ever ran.
+
+    A task can land in ``review`` two structurally different ways: (1) an
+    implementer called :func:`request_review`, producing a run with
+    ``outcome='review_requested'`` that carries the reviewer's expected
+    screenshot set; or (2) :func:`complete_task` parked it in
+    ``review``/``awaiting_integration`` because its integration contract
+    could not be verified yet — a fallback that never asked for review and
+    never recorded any handoff. Only case (1) is a real reviewer boundary.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? AND outcome = 'review_requested' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
 def request_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8535,7 +8553,8 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT title, body, created_by, assignee, status, claim_lock, current_run_id "
+            "SELECT title, body, created_by, assignee, status, claim_lock, current_run_id, "
+            "integration_status "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -8552,9 +8571,23 @@ def request_review(
                 False,
                 "task changed while projecting review handoff; retry request_review",
             )
+        # A claim on a task parked in review/awaiting_integration by the
+        # integration gate (see complete_task) is not a genuine reviewer
+        # claim: no request_review call ever produced a handoff, so there is
+        # nothing to approve, request changes on, or defer. Treat it like an
+        # ordinary implementer claim so the *first* real handoff for this
+        # task can actually be created — otherwise it can never be, which is
+        # exactly the stuck state this guard must not create. Once that
+        # handoff exists, the ordinary "already the active reviewer" rule
+        # applies again on any later claim.
+        stuck_without_real_review = (
+            trow["integration_status"] == "awaiting_integration"
+            and not _has_review_requested_handoff(conn, task_id)
+        )
         if (
             trow["status"] == "running"
             and trow["current_run_id"] is not None
+            and not stuck_without_real_review
             and _retry_status_for_run(
                 conn, task_id, int(trow["current_run_id"]),
             ) == "review"
