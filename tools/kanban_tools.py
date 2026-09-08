@@ -338,6 +338,18 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
     return reason if verdict != "done" else None
 
 
+def _goal_handoff_evidence(
+    summary: Optional[str], result: Optional[str], metadata: Optional[dict],
+) -> str:
+    """Give the goal judge the same structured evidence as completion gates."""
+    parts = [str(summary or result or "").strip()]
+    if isinstance(metadata, dict) and metadata:
+        parts.append(json.dumps(metadata, ensure_ascii=False, sort_keys=True))
+    return "\n\nStructured completion metadata:\n".join(
+        part for part in parts if part
+    )
+
+
 # ---------------------------------------------------------------------------
 # Runtime-activity → board-heartbeat bridge (#31752)
 # ---------------------------------------------------------------------------
@@ -937,7 +949,7 @@ def _handle_complete(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
-                (summary or result or "").strip(),
+                _goal_handoff_evidence(summary, result, metadata),
             )
             if rejection is not None:
                 return tool_error(

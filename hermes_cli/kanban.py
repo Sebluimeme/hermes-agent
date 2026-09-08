@@ -2452,6 +2452,18 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
     return reason if verdict != "done" else None
 
 
+def _goal_handoff_evidence(
+    summary: Optional[str], result: Optional[str], metadata: Optional[dict],
+) -> str:
+    """Give the goal judge the structured proof passed to the lifecycle call."""
+    parts = [str(summary or result or "").strip()]
+    if isinstance(metadata, dict) and metadata:
+        parts.append(json.dumps(metadata, ensure_ascii=False, sort_keys=True))
+    return "\n\nStructured completion metadata:\n".join(
+        part for part in parts if part
+    )
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2489,7 +2501,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
-                (summary or args.result or "").strip(),
+                _goal_handoff_evidence(summary, args.result, metadata),
             )
             if rejection is not None:
                 print(

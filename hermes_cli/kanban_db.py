@@ -99,12 +99,19 @@ from agent.redact import redact_sensitive_text
 _log = logging.getLogger(__name__)
 
 
-def _completion_requires_integration(task: "Task", metadata: Mapping[str, Any]) -> bool:
+def completion_explicitly_forbids_integration(
+    task: "Task", metadata: Mapping[str, Any],
+) -> bool:
+    """Return whether the task contract intentionally leaves work uncommitted.
+
+    This is public so completion plugins can apply the same contract instead
+    of independently treating an intentionally dirty worktree as an error.
+    """
     contract = metadata.get("integration")
-    if isinstance(contract, Mapping) and "required" in contract:
-        return bool(contract.get("required"))
+    if isinstance(contract, Mapping) and contract.get("required") is False:
+        return True
     text = f"{task.title or ''} {task.body or ''}".lower()
-    explicitly_without_delivery = any(
+    return "[no-integration]" in text or any(
         re.search(pattern, text)
         for pattern in (
             r"\bne\s+pas\s+(?:faire\s+de\s+)?commit(?:ter)?(?:\s*/\s*push)?\b",
@@ -113,12 +120,21 @@ def _completion_requires_integration(task: "Task", metadata: Mapping[str, Any]) 
             r"\bno\s+commit(?:\s*/\s*push)?\b",
         )
     )
+
+
+def _completion_requires_integration(task: "Task", metadata: Mapping[str, Any]) -> bool:
+    contract = metadata.get("integration")
+    if isinstance(contract, Mapping) and "required" in contract:
+        return bool(contract.get("required"))
+    explicitly_without_delivery = completion_explicitly_forbids_integration(
+        task, metadata,
+    )
     if (
-        "[no-integration]" in text
-        or task.workspace_kind == "scratch"
+        task.workspace_kind == "scratch"
         or explicitly_without_delivery
     ):
         return False
+    text = f"{task.title or ''} {task.body or ''}".lower()
     return any(
         marker in text
         for marker in (

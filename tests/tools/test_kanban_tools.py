@@ -493,6 +493,49 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
+def test_goal_completion_judge_receives_structured_metadata(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="visual goal", assignee="test-worker",
+            body="Provide desktop and mobile screenshots.", goal_mode=True,
+        )
+        claimed = kb.claim_task(conn, task_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    seen = {}
+
+    def accepting_judge(goal, last_response, *, timeout=30.0, subgoals=None):
+        seen["evidence"] = last_response
+        return "done", "verified", False, None, False
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", accepting_judge)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+    metadata = {
+        "visual_review": {
+            "screenshots": ["/tmp/desktop.png", "/tmp/mobile.png"],
+        },
+    }
+    out = json.loads(kt._handle_complete({
+        "summary": "Visual review passed.",
+        "metadata": metadata,
+    }))
+    assert out.get("ok") is True
+    assert "/tmp/desktop.png" in seen["evidence"]
+    assert "/tmp/mobile.png" in seen["evidence"]
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})
