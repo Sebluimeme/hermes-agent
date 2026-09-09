@@ -8,6 +8,7 @@ from hermes_cli import gateway as gateway_cli
 def test_planned_stop_helper_writes_marker_for_valid_pid(monkeypatch):
     calls: list[int] = []
 
+    monkeypatch.setenv("MAINPID", "99999")
     monkeypatch.setattr(
         "gateway.status.write_planned_stop_marker",
         lambda pid: calls.append(pid) or True,
@@ -17,16 +18,69 @@ def test_planned_stop_helper_writes_marker_for_valid_pid(monkeypatch):
     assert calls == [12345]
 
 
-def test_planned_stop_helper_rejects_invalid_pid_before_marker_import(monkeypatch):
+def test_planned_stop_helper_uses_systemd_mainpid_when_pid_is_omitted(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setenv("MAINPID", "24680")
+    monkeypatch.setattr(
+        "gateway.status.write_planned_stop_marker",
+        lambda pid: calls.append(pid) or True,
+    )
+
+    assert planned_stop.main([]) == 0
+    assert calls == [24680]
+
+
+def test_planned_stop_helper_is_clean_noop_without_systemd_mainpid(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.delenv("MAINPID", raising=False)
+    monkeypatch.setattr(
+        "gateway.status.write_planned_stop_marker",
+        lambda pid: calls.append(pid) or True,
+    )
+
+    assert planned_stop.main([]) == 0
+    assert calls == []
+
+
+def test_planned_stop_helper_never_falls_back_to_replacement_gateway(monkeypatch):
+    """A late ExecStop from gateway A must never discover and mark gateway B."""
+    calls: list[int] = []
+    monkeypatch.delenv("MAINPID", raising=False)
+    monkeypatch.setattr(
+        "gateway.status.get_running_pid",
+        lambda: (_ for _ in ()).throw(AssertionError("pidfile fallback is unsafe")),
+    )
+    monkeypatch.setattr(
+        "gateway.status.write_planned_stop_marker",
+        lambda pid: calls.append(pid) or True,
+    )
+
+    assert planned_stop.main([]) == 0
+    assert calls == []
+
+
+def test_planned_stop_helper_rejects_invalid_explicit_pid(monkeypatch):
     calls: list[int] = []
     monkeypatch.setattr(
         "gateway.status.write_planned_stop_marker",
         lambda pid: calls.append(pid) or True,
     )
 
-    assert planned_stop.main([]) == 2
     assert planned_stop.main(["not-a-pid"]) == 2
     assert planned_stop.main(["0"]) == 2
+    assert planned_stop.main(["123", "456"]) == 2
+    assert calls == []
+
+
+def test_planned_stop_helper_rejects_invalid_systemd_mainpid(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setenv("MAINPID", "not-a-pid")
+    monkeypatch.setattr(
+        "gateway.status.write_planned_stop_marker",
+        lambda pid: calls.append(pid) or True,
+    )
+
+    assert planned_stop.main([]) == 2
     assert calls == []
 
 
@@ -34,8 +88,11 @@ def test_generated_user_systemd_unit_marks_stop_before_sigterm():
     unit = gateway_cli.generate_systemd_unit(system=False)
 
     exec_stop = next(line for line in unit.splitlines() if line.startswith("ExecStop="))
-    assert exec_stop.endswith(" -m gateway.planned_stop $MAINPID")
+    assert exec_stop.endswith(" -m gateway.planned_stop")
+    assert "$MAINPID" not in exec_stop
     assert "KillSignal=SIGTERM" in unit
+    assert "SuccessExitStatus=75" in unit
+    assert "RestartForceExitStatus=75" in unit
 
 
 def test_generated_system_systemd_unit_marks_stop_before_sigterm(monkeypatch):
@@ -52,8 +109,38 @@ def test_generated_system_systemd_unit_marks_stop_before_sigterm(monkeypatch):
     unit = gateway_cli.generate_systemd_unit(system=True, run_as_user="alice")
 
     exec_stop = next(line for line in unit.splitlines() if line.startswith("ExecStop="))
-    assert exec_stop.endswith(" -m gateway.planned_stop $MAINPID")
+    assert exec_stop.endswith(" -m gateway.planned_stop")
+    assert "$MAINPID" not in exec_stop
     assert "KillSignal=SIGTERM" in unit
+    assert "SuccessExitStatus=75" in unit
+    assert "RestartForceExitStatus=75" in unit
+
+
+def test_systemd_unit_without_planned_restart_success_status_is_stale(
+    tmp_path, monkeypatch
+):
+    expected = (
+        "[Service]\n"
+        "Restart=always\n"
+        "SuccessExitStatus=75\n"
+        "RestartForceExitStatus=75\n"
+    )
+    installed = expected.replace("SuccessExitStatus=75\n", "")
+    unit_path = tmp_path / "hermes-gateway.service"
+    unit_path.write_text(installed, encoding="utf-8")
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "get_systemd_unit_path",
+        lambda system=False: unit_path,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "generate_systemd_unit",
+        lambda system=False, run_as_user=None: expected,
+    )
+
+    assert gateway_cli.systemd_unit_is_current(system=False) is False
 
 
 def test_watcher_callback_planned_verdict_survives_followup_sigterm():

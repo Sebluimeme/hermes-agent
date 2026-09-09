@@ -56,6 +56,30 @@ def test_loop_liveness_watchdog_stop_during_dump_disarms_hard_exit():
     assert exit_codes == []
 
 
+def test_loop_liveness_watchdog_default_exit_is_a_real_failure():
+    """A frozen loop must not reuse the clean planned-restart exit status 75."""
+    loop = MagicMock(spec=asyncio.AbstractEventLoop)
+    exit_codes: list[int] = []
+
+    with (
+        patch("gateway.shutdown_watchdog.logger.critical"),
+        patch("gateway.shutdown_watchdog.faulthandler.dump_traceback"),
+        patch("gateway.lifecycle_ledger.mark_exited"),
+        patch("gateway.shutdown_watchdog.os._exit", side_effect=exit_codes.append),
+    ):
+        handle = start_loop_liveness_watchdog(
+            loop,
+            probe_interval=0.01,
+            probe_timeout=0.01,
+            max_strikes=1,
+        )
+        assert handle is not None
+        handle.join(timeout=2.0)
+
+    assert not handle.is_alive()
+    assert exit_codes == [1]
+
+
 def test_loop_liveness_watchdog_stop_during_final_miss_disarms_hard_exit():
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
     probe_scheduled = threading.Event()
