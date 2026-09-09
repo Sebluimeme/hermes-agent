@@ -89,7 +89,14 @@ def test_absent_plugin_preserves_handoff_without_legacy_visual_policy(
         assert callbacks == []
         assert kb.request_review(conn, tid, summary="ready", metadata={"x": 1}) is True
         assert _status(conn, tid) == "review"
-        assert _last_run_metadata(conn, tid) == {"x": 1}
+        assert _last_run_metadata(conn, tid) == {
+            "task_contract": {
+                "verification_tier": "express",
+                "delivery_target": None,
+                "visual_review_required": None,
+            },
+            "x": 1,
+        }
         assert has_hook_calls == ["validate_kanban_review_handoff"]
     finally:
         conn.close()
@@ -135,6 +142,36 @@ def test_direct_request_review_projects_metadata_reviewer_and_context(
         assert len(seen) == 1
     finally:
         conn.close()
+
+
+def test_review_handoff_context_exposes_durable_card_contract(
+    review_handoff_validators, kanban_home
+):
+    callbacks, _ = review_handoff_validators
+    seen = []
+    callbacks.append(
+        lambda context: seen.append(context)
+        or KanbanReviewHandoffResult.accept(context.metadata)
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="Critical visual delivery",
+            assignee="worker",
+            initial_status="running",
+            verification_tier="critical",
+            delivery_target="deploy",
+            visual_review_required=True,
+        )
+        assert kb.request_review(conn, tid, summary="ready") is True
+    finally:
+        conn.close()
+
+    assert len(seen) == 1
+    assert seen[0].verification_tier == "critical"
+    assert seen[0].delivery_target == "deploy"
+    assert seen[0].visual_review_required is True
 
 
 def test_metadata_is_redacted_before_plugin_boundary(

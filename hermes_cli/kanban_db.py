@@ -102,11 +102,17 @@ _log = logging.getLogger(__name__)
 def completion_explicitly_forbids_integration(
     task: "Task", metadata: Mapping[str, Any],
 ) -> bool:
-    """Return whether the task contract intentionally leaves work uncommitted.
+    """Return whether the task contract intentionally stops at a working tree.
 
     This is public so completion plugins can apply the same contract instead
-    of independently treating an intentionally dirty worktree as an error.
+    of independently treating an intentionally uncommitted worktree as an
+    integration error. A local ``commit`` target is not remote integration,
+    but it still must carry a domain-verified local commit.
     """
+    if task.delivery_target == "working_tree":
+        return True
+    if task.delivery_target in {"commit", "push", "deploy"}:
+        return False
     contract = metadata.get("integration")
     if isinstance(contract, Mapping) and contract.get("required") is False:
         return True
@@ -123,6 +129,10 @@ def completion_explicitly_forbids_integration(
 
 
 def _completion_requires_integration(task: "Task", metadata: Mapping[str, Any]) -> bool:
+    if task.delivery_target in {"working_tree", "commit"}:
+        return False
+    if task.delivery_target in {"push", "deploy"}:
+        return True
     contract = metadata.get("integration")
     if isinstance(contract, Mapping) and "required" in contract:
         return bool(contract.get("required"))
@@ -159,18 +169,75 @@ def _git_output(repo: Path, *args: str, timeout: int = 12) -> tuple[int, str]:
         return 124, str(exc)
 
 
+_SUCCESSFUL_DELIVERY_VERDICTS = frozenset({
+    "ok", "pass", "passed", "success", "succeeded", "successful", "deployed",
+})
+_PRODUCTION_PROOF_SCHEMA = "hermes.production-proof.v1"
+
+
+def _successful_delivery_verdict(value: Any) -> bool:
+    return str(value or "").strip().casefold() in _SUCCESSFUL_DELIVERY_VERDICTS
+
+
+def _production_evidence_file(
+    task: "Task", path_value: Any, *, expected_commit: str,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Load the bounded production-proof schema without relying on a plugin.
+
+    The optional visual-proof plugin performs stricter freshness/HTTPS checks,
+    but the domain delivery contract must still reject an empty/self-asserted
+    ``evidence_path`` when that plugin is disabled or unavailable.
+    """
+    raw = str(path_value or "").strip()
+    if not raw:
+        return None, None
+    path = Path(raw).expanduser()
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return "production_proof evidence_path is missing or empty", None
+        if path.stat().st_size > 1024 * 1024:
+            return "production_proof evidence_path is too large", None
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"production_proof evidence_path is unreadable: {exc}", None
+    if not isinstance(evidence, dict):
+        return "production_proof evidence must be a JSON object", None
+    if evidence.get("schema") != _PRODUCTION_PROOF_SCHEMA:
+        return "production_proof evidence has an unexpected schema", None
+    if str(evidence.get("task_id") or "").strip() != task.id:
+        return "production_proof evidence belongs to another task", None
+    evidence_commit = str(
+        evidence.get("commit") or evidence.get("commit_sha") or ""
+    ).strip()
+    if evidence_commit != expected_commit:
+        return "production_proof evidence does not match the delivered commit", None
+    if not _successful_delivery_verdict(evidence.get("verdict")):
+        return "production_proof evidence verdict is not successful", None
+    evidence_url = str(evidence.get("url") or "").strip()
+    if not evidence_url:
+        return "production_proof evidence has no verified URL", None
+    if not evidence_url.casefold().startswith("https://"):
+        return "production_proof evidence URL is not HTTPS", None
+    return None, evidence
+
+
 def _integration_delivery_projection(
     task: "Task", metadata: Optional[dict]
 ) -> tuple[Optional[str], dict]:
-    """Verify that a claimed delivery commit is truly on the target remote.
+    """Verify the durable local/remote/deployment delivery contract.
 
-    Candidate worktree commits remain valid review artifacts, but they cannot
-    close a card whose contract explicitly requires integration/production.
-    The check uses the remote's advertised branch head, then verifies both Git
-    ancestry and equality of the local target branch with that remote head.
+    ``commit`` is a deliberately local boundary: the declared commit must be
+    the repository HEAD, descend from the task baseline when one is supplied,
+    and leave every explicitly declared changed path committed. Unrelated
+    pre-existing dirt is not a blocker and no remote is contacted. ``push``
+    and ``deploy`` retain the stronger remote ancestry/synchronisation checks.
+    ``deploy`` additionally needs a substantive, successful production proof
+    tied to the exact commit.
     """
     projected = dict(metadata or {})
-    if not _completion_requires_integration(task, projected):
+    requires_local_commit = task.delivery_target == "commit"
+    requires_remote = _completion_requires_integration(task, projected)
+    if not requires_local_commit and not requires_remote:
         return None, projected
     raw_contract = projected.get("integration")
     contract = dict(raw_contract) if isinstance(raw_contract, Mapping) else {}
@@ -178,7 +245,140 @@ def _integration_delivery_projection(
         str(contract.get("repo_path") or task.workspace_path or "")
     ).expanduser()
     if not repo.is_dir():
-        return "integration required but repo_path is missing or invalid", projected
+        boundary = "commit" if requires_local_commit else "integration"
+        return f"{boundary} required but repo_path is missing or invalid", projected
+    code, repo_root = _git_output(repo, "rev-parse", "--show-toplevel")
+    if code != 0 or not repo_root:
+        boundary = "commit" if requires_local_commit else "integration"
+        return f"{boundary} required but repo_path is not a git worktree", projected
+    repo = Path(repo_root)
+
+    commit = str(
+        contract.get("commit")
+        or projected.get("commit_sha")
+        or projected.get("commit")
+        or ""
+    ).strip()
+    if not commit:
+        boundary = "commit" if requires_local_commit else "integration"
+        return f"{boundary} required but no delivered commit was declared", projected
+    code, resolved_commit = _git_output(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+    if code != 0:
+        return f"declared delivery commit is not resolvable: {commit}", projected
+
+    if requires_local_commit:
+        baseline = str(
+            contract.get("base_commit")
+            or contract.get("baseline_commit")
+            or projected.get("base_commit")
+            or projected.get("baseline_commit")
+            or ""
+        ).strip()
+        resolved_baseline = ""
+        if baseline:
+            code, resolved_baseline = _git_output(
+                repo, "rev-parse", "--verify", f"{baseline}^{{commit}}"
+            )
+            if code != 0:
+                return f"declared base_commit is not resolvable: {baseline}", projected
+            if resolved_baseline == resolved_commit:
+                return "delivered commit does not advance the declared base_commit", projected
+            code, _ = _git_output(
+                repo, "merge-base", "--is-ancestor", resolved_baseline, resolved_commit
+            )
+            if code != 0:
+                return "delivered commit does not descend from the declared base_commit", projected
+        code, head = _git_output(repo, "rev-parse", "--verify", "HEAD")
+        if code != 0 or head != resolved_commit:
+            return "declared delivery commit is not the repository HEAD", projected
+        # A shared repository may contain user-owned dirt that predates this
+        # task. Requiring the whole tree to be clean would recreate the former
+        # development-guard false wait. When the handoff declares its exact
+        # changed files, verify only those paths are committed; otherwise the
+        # resolvable HEAD is the strongest safe domain fact available.
+        raw_changed_files = contract.get("changed_files") or projected.get("changed_files")
+        relevant_paths: list[str] = []
+        if isinstance(raw_changed_files, (list, tuple)):
+            for item in raw_changed_files:
+                raw_path = str(item or "").strip()
+                if not raw_path:
+                    continue
+                candidate = Path(raw_path).expanduser()
+                candidate = candidate if candidate.is_absolute() else repo / candidate
+                try:
+                    # ``abspath`` is lexical: it rejects ``../`` escapes but
+                    # does not follow an in-repo symlink to its target.
+                    candidate = Path(os.path.abspath(candidate)).relative_to(
+                        repo.resolve()
+                    )
+                except (OSError, ValueError):
+                    return "changed_files contains a path outside repo_path", projected
+                relevant_paths.append(str(candidate))
+        relevant_paths = list(dict.fromkeys(relevant_paths))
+        if not resolved_baseline and not relevant_paths:
+            return (
+                "commit proof is incomplete; declare a valid base_commit or "
+                "non-empty changed_files"
+            ), projected
+        if relevant_paths:
+            code, relevant_status = _git_output(
+                repo,
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                *relevant_paths,
+            )
+            if code != 0:
+                return "could not verify the relevant committed paths", projected
+            if relevant_status:
+                return "declared changed_files still contain uncommitted changes", projected
+            if resolved_baseline:
+                code, changed_output = _git_output(
+                    repo,
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    resolved_baseline,
+                    resolved_commit,
+                    "--",
+                )
+            else:
+                code, changed_output = _git_output(
+                    repo,
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "-z",
+                    resolved_commit,
+                )
+            if code != 0:
+                return "could not verify changed_files against the delivered commit", projected
+            committed_paths = {
+                item for item in changed_output.split("\0") if item
+            }
+            missing_from_diff = [
+                item for item in relevant_paths if item not in committed_paths
+            ]
+            if missing_from_diff:
+                return (
+                    "declared changed_files are absent from the delivered commit diff: "
+                    + ", ".join(missing_from_diff)
+                ), projected
+        contract.update({
+            "required": False,
+            "delivery_target": "commit",
+            "repo_path": str(repo.resolve()),
+            "commit": resolved_commit,
+            "status": "committed",
+        })
+        if resolved_baseline:
+            contract["base_commit"] = resolved_baseline
+        projected["integration"] = contract
+        return None, projected
+
     remote = str(contract.get("target_remote") or "origin").strip()
     branch = str(contract.get("target_branch") or "").strip()
     if not branch:
@@ -191,17 +391,6 @@ def _integration_delivery_projection(
         branch = explicit.group(1) if explicit else ""
     if not remote or not branch:
         return "integration required but target_remote/target_branch is not declared", projected
-    commit = str(
-        contract.get("commit")
-        or projected.get("commit_sha")
-        or projected.get("commit")
-        or ""
-    ).strip()
-    if not commit:
-        return "integration required but no delivered commit was declared", projected
-    code, resolved_commit = _git_output(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
-    if code != 0:
-        return f"declared delivery commit is not resolvable: {commit}", projected
     code, advertised = _git_output(
         repo, "ls-remote", "--heads", remote, f"refs/heads/{branch}"
     )
@@ -220,7 +409,12 @@ def _integration_delivery_projection(
             f"local target {branch} is not synchronized with {remote}/{branch} "
             f"({local_target[:12] if local_target else 'missing'} != {remote_sha[:12]})"
         ), projected
-    if "requires_deployment" in contract:
+    if task.delivery_target is not None:
+        # An explicit durable target replaces the old lexical inference. Push
+        # proves remote integration only; deploy additionally requires a
+        # production proof tied to that exact commit.
+        requires_deployment = task.delivery_target == "deploy"
+    elif "requires_deployment" in contract:
         requires_deployment = bool(contract.get("requires_deployment"))
     else:
         text = f"{task.title or ''} {task.body or ''}".lower()
@@ -238,8 +432,24 @@ def _integration_delivery_projection(
             return "production_proof does not match the delivered commit", projected
         if declared_deployment and deployment_id != declared_deployment:
             return "production_proof does not match the declared deployment_id", projected
+        if not str(proof.get("evidence_path") or "").strip():
+            return (
+                "deployment required but production_proof.evidence_path is missing"
+            ), projected
+        evidence_error, evidence = _production_evidence_file(
+            task,
+            proof.get("evidence_path"),
+            expected_commit=resolved_commit,
+        )
+        if evidence_error is not None:
+            return evidence_error, projected
+        if proof.get("verdict") is not None and not _successful_delivery_verdict(
+            proof.get("verdict")
+        ):
+            return "production_proof verdict is not successful", projected
     contract.update({
         "required": True,
+        "delivery_target": task.delivery_target,
         "repo_path": str(repo.resolve()),
         "target_remote": remote,
         "target_branch": branch,
@@ -257,6 +467,8 @@ def _integration_delivery_projection(
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"ready", "running", "blocked"}
+VALID_VERIFICATION_TIERS = frozenset({"express", "standard", "critical"})
+VALID_DELIVERY_TARGETS = frozenset({"working_tree", "commit", "push", "deploy"})
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -614,7 +826,7 @@ DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 # Every newly claimed review run records this value and every resumed session
 # receives it in the fresh task context, so old conversation history can never
 # silently keep an obsolete provider workflow authoritative.
-VISUAL_REVIEW_POLICY_VERSION = "2026-09-05-gpt-only-v1"
+VISUAL_REVIEW_POLICY_VERSION = "2026-09-09-lean-opt-in-v1"
 
 # This is a visibility threshold, not a kill timeout.  A worker may still be
 # thinking or waiting on a legitimate long call, but after two minutes without
@@ -1405,6 +1617,20 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Durable worker conversations, kept separately by lifecycle role.  These
+    # are Hermes session ids (short-lived worker *processes* may exit); the
+    # paired profile prevents a Claude/Coder fallback from ever opening a
+    # different profile's transcript.
+    implementation_profile: Optional[str] = None
+    implementation_session_id: Optional[str] = None
+    reviewer_profile: Optional[str] = None
+    reviewer_session_id: Optional[str] = None
+    # Creation-time execution contract. Legacy rows remain NULL; new callers
+    # default to the lightest verification tier while delivery and visual QA
+    # stay explicitly unspecified unless requested.
+    verification_tier: Optional[str] = None
+    delivery_target: Optional[str] = None
+    visual_review_required: Optional[bool] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
@@ -1518,6 +1744,36 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            implementation_profile=(
+                row["implementation_profile"]
+                if "implementation_profile" in keys else None
+            ),
+            implementation_session_id=(
+                row["implementation_session_id"]
+                if "implementation_session_id" in keys else None
+            ),
+            reviewer_profile=(
+                row["reviewer_profile"]
+                if "reviewer_profile" in keys else None
+            ),
+            reviewer_session_id=(
+                row["reviewer_session_id"]
+                if "reviewer_session_id" in keys else None
+            ),
+            verification_tier=(
+                row["verification_tier"]
+                if "verification_tier" in keys else None
+            ),
+            delivery_target=(
+                row["delivery_target"]
+                if "delivery_target" in keys else None
+            ),
+            visual_review_required=(
+                bool(row["visual_review_required"])
+                if "visual_review_required" in keys
+                and row["visual_review_required"] is not None
+                else None
             ),
             block_kind=(
                 row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
@@ -1716,6 +1972,27 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Durable conversations for the two same-card roles.  A session is
+    -- reusable only while its paired profile still matches the assignee.
+    implementation_profile   TEXT,
+    implementation_session_id TEXT,
+    reviewer_profile         TEXT,
+    reviewer_session_id      TEXT,
+    -- Minimal per-card verification/delivery contract. Application-created
+    -- cards normally store verification_tier='express'; columns stay nullable
+    -- so pre-contract rows remain distinguishable and migrate without a
+    -- semantic backfill.
+    verification_tier    TEXT CHECK (
+        verification_tier IS NULL OR
+        verification_tier IN ('express', 'standard', 'critical')
+    ),
+    delivery_target      TEXT CHECK (
+        delivery_target IS NULL OR
+        delivery_target IN ('working_tree', 'commit', 'push', 'deploy')
+    ),
+    visual_review_required INTEGER CHECK (
+        visual_review_required IS NULL OR visual_review_required IN (0, 1)
+    ),
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -3071,6 +3348,38 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    for role_column in (
+        "implementation_profile",
+        "implementation_session_id",
+        "reviewer_profile",
+        "reviewer_session_id",
+    ):
+        if role_column not in cols:
+            _add_column_if_missing(
+                conn, "tasks", role_column, f"{role_column} TEXT"
+            )
+
+    _task_contract_columns = (
+        (
+            "verification_tier",
+            "verification_tier TEXT CHECK (verification_tier IS NULL OR "
+            "verification_tier IN ('express', 'standard', 'critical'))",
+        ),
+        (
+            "delivery_target",
+            "delivery_target TEXT CHECK (delivery_target IS NULL OR "
+            "delivery_target IN ('working_tree', 'commit', 'push', 'deploy'))",
+        ),
+        (
+            "visual_review_required",
+            "visual_review_required INTEGER CHECK ("
+            "visual_review_required IS NULL OR visual_review_required IN (0, 1))",
+        ),
+    )
+    for contract_column, contract_ddl in _task_contract_columns:
+        if contract_column not in cols:
+            _add_column_if_missing(conn, "tasks", contract_column, contract_ddl)
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -3541,7 +3850,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
-                "       max_runtime_seconds, last_heartbeat_at, started_at "
+                "       max_runtime_seconds, last_heartbeat_at, started_at, "
+                "       verification_tier, delivery_target, "
+                "       visual_review_required "
                 "FROM tasks "
                 "WHERE status = 'running' AND current_run_id IS NULL"
             ).fetchall()
@@ -3553,14 +3864,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                         task_id, profile, status,
                         claim_lock, claim_expires, worker_pid,
                         max_runtime_seconds, last_heartbeat_at,
-                        started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                        started_at, metadata
+                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"], row["assignee"], row["claim_lock"],
                         row["claim_expires"], row["worker_pid"],
                         row["max_runtime_seconds"], row["last_heartbeat_at"],
                         started,
+                        json.dumps(
+                            _task_contract_run_metadata(row),
+                            ensure_ascii=False,
+                        ),
                     ),
                 )
                 # CAS: only install the pointer if nothing else claimed
@@ -4147,6 +4462,9 @@ def create_task(
     mission_origin: Optional[dict] = None,
     acceptance: Optional[dict] = None,
     queue_class: str = "active",
+    verification_tier: Optional[str] = "express",
+    delivery_target: Optional[str] = None,
+    visual_review_required: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -4205,6 +4523,28 @@ def create_task(
         raise ValueError("queue_class must be active, backlog, recurring, or idea")
     if routing_tier is not None and routing_tier not in VALID_ROUTING_TIERS:
         raise ValueError(f"routing_tier must be one of {sorted(VALID_ROUTING_TIERS)}, got {routing_tier!r}")
+    if verification_tier is not None:
+        if not isinstance(verification_tier, str):
+            raise ValueError("verification_tier must be a string or null")
+        verification_tier = verification_tier.strip().lower()
+        if verification_tier not in VALID_VERIFICATION_TIERS:
+            raise ValueError(
+                "verification_tier must be one of "
+                f"{sorted(VALID_VERIFICATION_TIERS)}, got {verification_tier!r}"
+            )
+    if delivery_target is not None:
+        if not isinstance(delivery_target, str):
+            raise ValueError("delivery_target must be a string or null")
+        delivery_target = delivery_target.strip().lower()
+        if delivery_target not in VALID_DELIVERY_TARGETS:
+            raise ValueError(
+                "delivery_target must be one of "
+                f"{sorted(VALID_DELIVERY_TARGETS)}, got {delivery_target!r}"
+            )
+    if visual_review_required is not None and not isinstance(
+        visual_review_required, bool
+    ):
+        raise ValueError("visual_review_required must be a boolean or null")
     audit_text = f"{title or ''}\n{body or ''}".casefold()
     if goal_mode and ("audit" in audit_text or "read-only" in audit_text or "lecture seule" in audit_text):
         raise ValueError(
@@ -4510,9 +4850,10 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, routing_tier
-                        , mission_id, queue_class
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, routing_tier,
+                        mission_id, queue_class, verification_tier,
+                        delivery_target, visual_review_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4541,6 +4882,13 @@ def create_task(
                         routing_tier,
                         mission_id,
                         queue_class,
+                        verification_tier,
+                        delivery_target,
+                        (
+                            1 if visual_review_required
+                            else 0 if visual_review_required is False
+                            else None
+                        ),
                     ),
                 )
                 for pid in parents:
@@ -4572,6 +4920,9 @@ def create_task(
                         "routing_tier": routing_tier,
                         "mission_id": mission_id,
                         "queue_class": queue_class,
+                        "verification_tier": verification_tier,
+                        "delivery_target": delivery_target,
+                        "visual_review_required": visual_review_required,
                     },
                 )
                 _refresh_mission_status(conn, mission_id)
@@ -5579,6 +5930,67 @@ def _end_workspace_wait(conn: sqlite3.Connection, task_id: str) -> None:
         _append_event(conn, task_id, "workspace_wait_ended", payload)
 
 
+def _persist_worker_role_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    worker_session_id: Optional[str],
+) -> bool:
+    """Remember the active worker conversation under its exact task role.
+
+    The worker process remains disposable.  Only the Hermes conversation id
+    and the profile that owns it are durable.  Review runs are identified by
+    their claim boundary, not by the task's current assignee, because a
+    ``changes_requested`` transition restores the implementer before closing
+    the reviewer run.
+    """
+    session_id = str(worker_session_id or "").strip()
+    if not session_id:
+        return False
+    run = conn.execute(
+        "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(run_id), task_id),
+    ).fetchone()
+    profile = str(run["profile"] or "").strip() if run else ""
+    if not profile:
+        return False
+    role = (
+        "reviewer"
+        if _retry_status_for_run(conn, task_id, int(run_id)) == "review"
+        else "implementation"
+    )
+    conn.execute(
+        f"UPDATE tasks SET {role}_profile = ?, {role}_session_id = ? "
+        "WHERE id = ?",
+        (profile, session_id, task_id),
+    )
+    return True
+
+
+def _durable_worker_role_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    profile: Optional[str],
+    role: str,
+) -> Optional[str]:
+    """Return a role session only when its recorded profile still matches."""
+    if role not in {"implementation", "reviewer"}:
+        return None
+    expected_profile = str(profile or "").strip()
+    if not expected_profile:
+        return None
+    row = conn.execute(
+        f"SELECT {role}_profile AS profile, {role}_session_id AS session_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or str(row["profile"] or "").strip() != expected_profile:
+        return None
+    session_id = str(row["session_id"] or "").strip()
+    return session_id or None
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5632,6 +6044,12 @@ def _end_run(
         _checkpoint["state"] = outcome
         _checkpoint["closed_at"] = now
     _closed_metadata = _existing_metadata or None
+    _persist_worker_role_session(
+        conn,
+        task_id,
+        run_id,
+        _existing_metadata.get("worker_session_id"),
+    )
     conn.execute(
         """
         UPDATE task_runs
@@ -5696,11 +6114,15 @@ def _synthesize_ended_run(
     """
     now = int(time.time())
     trow = conn.execute(
-        "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
+        "SELECT assignee, current_step_key, verification_tier, "
+        "delivery_target, visual_review_required FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     profile = trow["assignee"] if trow else None
     step_key = trow["current_step_key"] if trow else None
+    run_metadata = _task_contract_run_metadata(trow)
+    if isinstance(metadata, dict):
+        run_metadata.update(metadata)
     cur = conn.execute(
         """
         INSERT INTO task_runs (
@@ -5714,7 +6136,7 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(run_metadata, ensure_ascii=False),
             now, now,
         ),
     )
@@ -5888,6 +6310,142 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _task_contract_run_metadata(row: Any) -> dict[str, Any]:
+    """Project a task's immutable execution contract into one run record."""
+    if row is None:
+        verification_tier = delivery_target = visual_review_required = None
+    else:
+        verification_tier = row["verification_tier"]
+        delivery_target = row["delivery_target"]
+        visual_value = row["visual_review_required"]
+        visual_review_required = (
+            bool(visual_value) if visual_value is not None else None
+        )
+    return {
+        "task_contract": {
+            "verification_tier": verification_tier,
+            "delivery_target": delivery_target,
+            "visual_review_required": visual_review_required,
+        }
+    }
+
+
+_VISUAL_REVIEW_MARKERS = ("[visual]", "[visual-web]", "[web-visual]")
+_NO_VISUAL_REVIEW_MARKERS = ("[no-visual]", "[sans-visuel]")
+
+
+def _explicit_review_bool(value: Any) -> Optional[bool]:
+    """Decode only an explicitly represented boolean contract value."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        folded = value.strip().casefold()
+        if folded in {"1", "true", "yes", "on"}:
+            return True
+        if folded in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _visual_review_flag(value: Any) -> Optional[bool]:
+    if isinstance(value, Mapping):
+        for key in ("required", "review_required", "enabled"):
+            explicit = _explicit_review_bool(value.get(key))
+            if explicit is not None:
+                return explicit
+        return None
+    return _explicit_review_bool(value)
+
+
+def _metadata_visual_review_requirement(
+    metadata: Optional[Mapping[str, Any]],
+) -> Optional[bool]:
+    """Read the explicit visual contract shapes accepted by the guard plugin."""
+    if not isinstance(metadata, Mapping):
+        return None
+    visual = metadata.get("visual_review")
+    if isinstance(visual, Mapping):
+        if _explicit_review_bool(visual.get("no_visual")) is True:
+            return False
+        required = _explicit_review_bool(visual.get("required"))
+        if required is not None:
+            return required
+        # Review handoffs normalized by an older guard remain explicit. Merely
+        # carrying screenshot paths is deliberately not enough to opt in.
+        if (
+            visual.get("schema") == "hermes.visual-review.v1"
+            and str(visual.get("policy_version") or "").strip()
+            and str(visual.get("stage") or "").strip()
+        ):
+            return True
+    candidates = (
+        (metadata.get("critical_contract"), True),
+        (metadata.get("verification"), False),
+        (metadata.get("quality_gate"), False),
+    )
+    for candidate, inherently_critical in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        level = str(
+            candidate.get("level")
+            or candidate.get("tier")
+            or candidate.get("mode")
+            or ""
+        ).strip().casefold()
+        if not (inherently_critical or level in {"critical", "critique"}):
+            continue
+        for key in ("visual_review", "requires_visual_review"):
+            if _visual_review_flag(candidate.get(key)) is True:
+                return True
+    return None
+
+
+def _task_visual_review_requirement(
+    conn: sqlite3.Connection,
+    task: Task,
+) -> Optional[bool]:
+    """Resolve explicit visual opt-in without inferring from UI/web wording.
+
+    The durable card field is projected over the latest implementation
+    handoff, matching the standalone visual-proof guard. Historical explicit
+    markers and handoff metadata remain supported during rolling migration.
+    """
+    text = f"{task.title or ''}\n{task.body or ''}".casefold()
+    if any(marker in text for marker in _NO_VISUAL_REVIEW_MARKERS):
+        return False
+    row = conn.execute(
+        "SELECT metadata FROM task_runs "
+        "WHERE task_id = ? AND outcome = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task.id,),
+    ).fetchone()
+    try:
+        metadata = json.loads(row["metadata"] or "{}") if row else {}
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if task.visual_review_required is not None:
+        visual = metadata.get("visual_review")
+        visual = dict(visual) if isinstance(visual, Mapping) else {}
+        visual["required"] = task.visual_review_required
+        metadata["visual_review"] = visual
+    if task.verification_tier:
+        verification = metadata.get("verification")
+        verification = (
+            dict(verification) if isinstance(verification, Mapping) else {}
+        )
+        verification["level"] = task.verification_tier
+        if task.visual_review_required is not None:
+            verification["visual_review"] = task.visual_review_required
+        metadata["verification"] = verification
+    metadata_requirement = _metadata_visual_review_requirement(metadata)
+    if metadata_requirement is not None:
+        return metadata_requirement
+    if any(marker in text for marker in _VISUAL_REVIEW_MARKERS):
+        return True
+    return None
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
@@ -5915,6 +6473,21 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # ``next_retry_at`` is a durable not-before boundary, not merely a
+        # dispatcher hint.  Direct claimers (CLI integrations and tests) use
+        # this function too, so enforce the boundary before emitting any
+        # event or repairing any stale run.  The CAS below repeats the guard
+        # to stay correct if another writer moves the deadline concurrently.
+        retry_row = conn.execute(
+            "SELECT next_retry_at FROM tasks WHERE id = ? AND status = 'ready'",
+            (task_id,),
+        ).fetchone()
+        if (
+            retry_row is not None
+            and retry_row["next_retry_at"] is not None
+            and int(retry_row["next_retry_at"]) > now
+        ):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5986,15 +6559,17 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND (next_retry_at IS NULL OR next_retry_at <= ?)
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, now),
         )
         if cur.rowcount != 1:
             return None
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "verification_tier, delivery_target, visual_review_required "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6003,8 +6578,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -6014,6 +6589,10 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps(
+                    _task_contract_run_metadata(trow),
+                    ensure_ascii=False,
+                ),
             ),
         )
         run_id = run_cur.lastrowid
@@ -6064,6 +6643,19 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Same durable not-before contract as ``claim_task``.  Check it before
+        # dependency repair so a dispatcher tick before the deadline is a
+        # strict no-op (no demotion and no audit noise).
+        retry_row = conn.execute(
+            "SELECT next_retry_at FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if (
+            retry_row is not None
+            and retry_row["next_retry_at"] is not None
+            and int(retry_row["next_retry_at"]) > now
+        ):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -6105,16 +6697,42 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND (next_retry_at IS NULL OR next_retry_at <= ?)
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, now),
         )
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT assignee, max_runtime_seconds, current_step_key, "
+            "integration_status, verification_tier, delivery_target, "
+            "visual_review_required "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        source_status = (
+            "integration_pending"
+            if trow and _integration_continuation_is_latest(
+                conn,
+                task_id,
+                trow["integration_status"],
+            )
+            else "review"
+        )
+        review_metadata = {
+            **_task_contract_run_metadata(trow),
+            "review": {"role": "independent"},
+        }
+        review_task = get_task(conn, task_id)
+        visual_review_requirement = (
+            _task_visual_review_requirement(conn, review_task)
+            if review_task is not None
+            else None
+        )
+        if visual_review_requirement is True:
+            review_metadata["policy_versions"] = {
+                "visual_review": VISUAL_REVIEW_POLICY_VERSION,
+            }
         run_cur = conn.execute(
             """
             INSERT INTO task_runs (
@@ -6131,14 +6749,7 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
-                json.dumps(
-                    {
-                        "policy_versions": {
-                            "visual_review": VISUAL_REVIEW_POLICY_VERSION,
-                        }
-                    },
-                    ensure_ascii=False,
-                ),
+                json.dumps(review_metadata, ensure_ascii=False),
             ),
         )
         run_id = run_cur.lastrowid
@@ -6154,7 +6765,7 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": source_status},
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -6193,6 +6804,23 @@ def _retry_status_for_run(
     if not isinstance(payload, dict):
         payload = {}
     return "review" if payload.get("source_status") == "review" else "ready"
+
+
+def _integration_continuation_is_latest(
+    conn: sqlite3.Connection,
+    task_id: str,
+    integration_status: Optional[str],
+) -> bool:
+    """Distinguish an integration retry from a later genuine review handoff."""
+    if integration_status != "awaiting_integration":
+        return False
+    boundary = conn.execute(
+        "SELECT kind FROM task_events WHERE task_id = ? "
+        "AND kind IN ('awaiting_integration', 'review_requested') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return boundary is not None and boundary["kind"] == "awaiting_integration"
 
 
 def goal_run_status(
@@ -6866,6 +7494,30 @@ def _declared_replaced_task_ids(
     return tuple(dict.fromkeys(targets))
 
 
+def _completion_run_is_current(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: Optional[int],
+) -> bool:
+    """Return whether a completion still owns the task's active run.
+
+    Completion has several rejection paths that intentionally mutate durable
+    state (for example ``awaiting_integration`` and hallucination audit
+    events). They all need the same CAS boundary as the final ``done`` update:
+    an obsolete worker must be a strict no-op once a successor run exists.
+    """
+    if expected_run_id is None:
+        return True
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    return (
+        row is not None
+        and row["current_run_id"] is not None
+        and int(row["current_run_id"]) == int(expected_run_id)
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6910,6 +7562,11 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    # CAS precedes every completion side effect. Re-check again inside each
+    # write transaction below, because validation and git inspection can take
+    # long enough for a successor run to be claimed on another connection.
+    if not _completion_run_is_current(conn, task_id, expected_run_id):
+        return False
     now = int(time.time())
     created_cards_tuple = tuple(str(c) for c in (created_cards or ()))
     replaced_task_ids = _declared_replaced_task_ids(conn, task_id)
@@ -6929,6 +7586,10 @@ def complete_task(
         )
         if phantom_cards:
             with write_txn(conn):
+                if not _completion_run_is_current(
+                    conn, task_id, expected_run_id,
+                ):
+                    return False
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -6955,16 +7616,24 @@ def complete_task(
     if integration_error is not None:
         with write_txn(conn):
             row = conn.execute(
-                "SELECT status,current_run_id FROM tasks WHERE id=?",
+                "SELECT status,current_run_id,assignee FROM tasks WHERE id=?",
                 (task_id,),
             ).fetchone()
+            if not _completion_run_is_current(
+                conn, task_id, expected_run_id,
+            ):
+                return False
             if row and row["status"] in {"running", "ready", "blocked", "review"}:
                 run_id = row["current_run_id"]
+                integration_profile = _implementation_profile_for_continuation(
+                    conn, task_id, row["assignee"],
+                )
                 conn.execute(
                     "UPDATE tasks SET status='review', integration_status='awaiting_integration', "
                     "execution_status='awaiting_integration', claim_lock=NULL, claim_expires=NULL, "
-                    "worker_pid=NULL, action_required=NULL WHERE id=?",
-                    (task_id,),
+                    "worker_pid=NULL, action_required=NULL, "
+                    "assignee=COALESCE(?, assignee) WHERE id=?",
+                    (integration_profile, task_id),
                 )
                 if run_id is not None:
                     _end_run(
@@ -7005,6 +7674,8 @@ def complete_task(
             code=getattr(validation_error, "code", "validator_rejected"),
         )
     with write_txn(conn):
+        if not _completion_run_is_current(conn, task_id, expected_run_id):
+            return False
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -8076,15 +8747,24 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
-            # A claimed review run is itself the active reviewer.  It cannot
-            # depend on another reviewer of the same card; approval,
-            # requested changes, or kanban_defer_review are the supported
-            # outcomes. Refuse that self-wait only when every real Kanban
-            # parent is satisfied. A parent may genuinely be reopened while
-            # review is active; that task must return to todo and later resume
-            # in review instead of being stranded in its active run.
-            if source_status == "review" and _parents_satisfied(conn, task_id):
-                return False
+            blocking_parent = conn.execute(
+                "SELECT p.id FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') "
+                "ORDER BY p.id LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if blocking_parent is None:
+                raise ValueError(
+                    "dependency block requires at least one linked, unfinished "
+                    "parent; call link_tasks(parent_id, child_id) before "
+                    "kanban_block(kind='dependency')"
+                )
+            # A claimed review run is itself the active reviewer.  The only
+            # valid dependency wait here is a real linked parent that was
+            # reopened; then the task returns to todo and later resumes in
+            # review instead of recursively waiting on another reviewer.
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -8436,7 +9116,8 @@ def _review_handoff_projection_result(
     guard and then laundered into an apparent allow.
     """
     row = conn.execute(
-        "SELECT title, body, created_by, assignee, status, claim_lock, current_run_id "
+        "SELECT title, body, created_by, assignee, status, claim_lock, current_run_id, "
+        "verification_tier, delivery_target, visual_review_required "
         "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
@@ -8464,6 +9145,13 @@ def _review_handoff_projection_result(
                 reviewer=reviewer,
                 source=source,
                 surface=source,
+                verification_tier=row["verification_tier"],
+                delivery_target=row["delivery_target"],
+                visual_review_required=(
+                    bool(row["visual_review_required"])
+                    if row["visual_review_required"] is not None
+                    else None
+                ),
             )
         )
 
@@ -8510,6 +9198,36 @@ def _has_review_requested_handoff(conn: sqlite3.Connection, task_id: str) -> boo
         (task_id,),
     ).fetchone()
     return row is not None
+
+
+def _implementation_profile_for_continuation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    fallback: Optional[str],
+) -> Optional[str]:
+    """Resolve the implementer for an integration continuation.
+
+    New cards carry the profile beside their durable session.  The event
+    fallback keeps cards created before the additive schema migration
+    resumable as well.
+    """
+    row = conn.execute(
+        "SELECT implementation_profile FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is not None and str(row["implementation_profile"] or "").strip():
+        return str(row["implementation_profile"]).strip()
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        payload = json.loads(event["payload"] or "{}") if event else {}
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    implementer = payload.get("implementer") if isinstance(payload, dict) else None
+    return str(implementer).strip() if str(implementer or "").strip() else fallback
 
 
 def request_review(
@@ -8560,7 +9278,7 @@ def request_review(
         source=review_handoff_source,
     )
     if projection_error is not None:
-        prefix = "visual review handoff rejected"
+        prefix = "review handoff rejected"
         if getattr(projection_error, "code", None) is not None:
             prefix = "review handoff validator rejected handoff"
         return _ret(False, f"{prefix}: {projection_error}")
@@ -8735,6 +9453,7 @@ def request_changes(
     *,
     reason: str,
     expected_run_id: Optional[int] = None,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, Optional[str]]:
     """Finish an active review run and route the task back for rework.
 
@@ -8745,6 +9464,7 @@ def request_changes(
     success or a diagnostic reason on failure.
     """
     reason = str(redact_review_value(reason or "")).strip()
+    metadata = redact_review_value(metadata if isinstance(metadata, dict) else None)
     if not reason:
         return False, "reason is required"
     if _review_reason_is_internal_closure_failure(reason):
@@ -8839,6 +9559,7 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            metadata=metadata,
         )
         _append_event(
             conn,
@@ -8855,6 +9576,116 @@ def request_changes(
     return True, implementer
 
 
+REVIEW_DEFER_MIN_BACKOFF_SECONDS = 60
+REVIEW_DEFER_MAX_BACKOFF_SECONDS = 30 * 60
+
+
+def _review_defer_identity(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    metadata: Optional[dict[str, Any]],
+) -> dict[str, str]:
+    """Return a durable candidate/gate/failure identity for one deferral."""
+    supplied = metadata if isinstance(metadata, dict) else {}
+    handoff = conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        handoff_metadata = (
+            json.loads(handoff["metadata"] or "{}") if handoff else {}
+        )
+    except (TypeError, json.JSONDecodeError):
+        handoff_metadata = {}
+    if not isinstance(handoff_metadata, dict):
+        handoff_metadata = {}
+
+    candidate = next((
+        str(value).strip()
+        for value in (
+            supplied.get("candidate_fingerprint"),
+            supplied.get("candidate_hash"),
+            supplied.get("commit"),
+            handoff_metadata.get("candidate_fingerprint"),
+            handoff_metadata.get("candidate_hash"),
+            handoff_metadata.get("commit"),
+            handoff_metadata.get("commit_sha"),
+        )
+        if value is not None and str(value).strip()
+    ), None)
+    if candidate is None:
+        candidate = (
+            f"review_requested:{int(handoff['id'])}"
+            if handoff is not None else f"task:{task_id}"
+        )
+
+    normalized = " ".join(str(reason or "").casefold().split())
+    explicit_gate = supplied.get("gate") or supplied.get("review_gate")
+    if explicit_gate:
+        gate = str(explicit_gate).strip().casefold()
+    elif "kanban_complete" in normalized or (
+        "guard" in normalized and any(
+            word in normalized for word in ("refus", "reject", "bloqu")
+        )
+    ):
+        gate = "completion"
+    elif any(word in normalized for word in ("visual", "gemini", "capture", "screenshot")):
+        gate = "visual_review"
+    else:
+        gate = "review"
+
+    explicit_signature = (
+        supplied.get("failure_signature") or supplied.get("signature")
+    )
+    if explicit_signature:
+        signature = str(explicit_signature).strip().casefold()
+    else:
+        status_match = _PROVIDER_STATUS_RE.search(normalized)
+        if status_match:
+            signature = f"http:{status_match.group(1)}"
+        elif _RESPAWN_BLOCKER_RE.search(normalized):
+            signature = "provider_limit"
+        elif gate == "completion":
+            signature = "completion_refused"
+        else:
+            stable_reason = re.sub(r"\b[0-9a-f]{7,64}\b", "<hash>", normalized)
+            stable_reason = re.sub(r"\b(run|pid)\s*#?\s*\d+\b", r"\1:<n>", stable_reason)
+            stable_reason = re.sub(r"\b\d{10,13}\b", "<epoch>", stable_reason)
+            signature = hashlib.sha256(stable_reason.encode("utf-8")).hexdigest()[:20]
+
+    fingerprint = hashlib.sha256(json.dumps(
+        {"candidate": candidate, "gate": gate, "signature": signature},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return {
+        "fingerprint": fingerprint,
+        "candidate": candidate,
+        "gate": gate,
+        "signature": signature,
+    }
+
+
+def _latest_review_defer_payload(
+    conn: sqlite3.Connection, task_id: str,
+) -> tuple[Optional[int], dict[str, Any]]:
+    row = conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'visual_review_deferred' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, {}
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    return row["run_id"], payload if isinstance(payload, dict) else {}
+
+
 def defer_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8866,9 +9697,9 @@ def defer_review_task(
 ) -> tuple[bool, Optional[str]]:
     """Return an active reviewer to ``review`` with an automatic retry time.
 
-    This is intentionally distinct from ``block_task``: a temporary Gemini
-    quota/network condition needs no human action and must preserve the review
-    phase plus the exact reviewer session.  The dispatcher already honours
+    This is intentionally distinct from ``block_task``: a temporary automatic
+    reviewer dependency needs no human action and must preserve the review
+    phase plus the exact reviewer session. The dispatcher already honours
     ``next_retry_at`` for review rows and will resume the task when due.
     """
     reason = str(redact_review_value(reason or "")).strip()
@@ -8879,17 +9710,39 @@ def defer_review_task(
         retry_at = int(retry_at)
     except (TypeError, ValueError):
         return False, "retry_at must be a Unix timestamp"
-    if retry_at <= now:
-        return False, "retry_at must be in the future"
     if retry_at > now + 7 * 24 * 3600:
         return False, "retry_at cannot be more than seven days away"
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, current_run_id, mission_id FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, mission_id, next_retry_at "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
             return False, "task not found"
+        identity = _review_defer_identity(conn, task_id, reason, metadata)
+        prior_run_id, prior = _latest_review_defer_payload(conn, task_id)
+        same_deferral = (
+            prior.get("defer_fingerprint") == identity["fingerprint"]
+        )
+        if (
+            row["status"] == "review"
+            and row["next_retry_at"] is not None
+            and int(row["next_retry_at"]) > now
+            and same_deferral
+            and (
+                expected_run_id is None
+                or prior_run_id is None
+                or int(prior_run_id) == int(expected_run_id)
+            )
+        ):
+            # The same worker may retry its terminal tool call after a delayed
+            # response.  The first call already closed the run and installed
+            # the not-before boundary; acknowledge it without another event,
+            # run, or deadline rewrite.
+            return True, None
+        if retry_at <= now:
+            return False, "retry_at must be in the future"
         current_run_id = row["current_run_id"]
         if row["status"] != "running" or current_run_id is None:
             return False, "task is not in an active review run"
@@ -8897,29 +9750,58 @@ def defer_review_task(
             return False, "run_id mismatch"
         if _retry_status_for_run(conn, task_id, int(current_run_id)) != "review":
             return False, "active run was not claimed from review"
+        requested_delay = max(1, retry_at - now)
+        recurrence = int(prior.get("recurrence") or 0) + 1 if same_deferral else 1
+        if same_deferral:
+            previous_backoff = int(
+                prior.get("backoff_seconds")
+                or max(1, int(prior.get("retry_at") or now) - now)
+            )
+            backoff_seconds = min(
+                REVIEW_DEFER_MAX_BACKOFF_SECONDS,
+                max(REVIEW_DEFER_MIN_BACKOFF_SECONDS, previous_backoff * 2),
+            )
+        else:
+            backoff_seconds = min(
+                REVIEW_DEFER_MAX_BACKOFF_SECONDS,
+                max(REVIEW_DEFER_MIN_BACKOFF_SECONDS, requested_delay),
+            )
+        effective_retry_at = max(retry_at, now + backoff_seconds)
+        defer_state: dict[str, Any] = {
+            "defer_fingerprint": identity["fingerprint"],
+            "candidate_fingerprint": identity["candidate"],
+            "gate": identity["gate"],
+            "failure_signature": identity["signature"],
+            "recurrence": recurrence,
+            "requested_retry_at": retry_at,
+            "retry_at": effective_retry_at,
+            "backoff_seconds": backoff_seconds,
+        }
         cur = conn.execute(
             "UPDATE tasks SET status='review', claim_lock=NULL, "
             "claim_expires=NULL, worker_pid=NULL, next_retry_at=?, "
             "execution_status='waiting_visual_review', "
             "failure_class='visual_review_unavailable', action_required=NULL "
             "WHERE id=? AND status='running' AND current_run_id=?",
-            (retry_at, task_id, int(current_run_id)),
+            (effective_retry_at, task_id, int(current_run_id)),
         )
         if cur.rowcount != 1:
             return False, "task changed during review deferral"
+        run_metadata = dict(metadata or {})
+        run_metadata["review_defer"] = defer_state
         run_id = _end_run(
             conn,
             task_id,
             outcome="review_deferred",
             status="retry_wait",
             summary=reason,
-            metadata=metadata,
+            metadata=run_metadata,
         )
         _append_event(
             conn,
             task_id,
             "visual_review_deferred",
-            {"reason": reason, "retry_at": retry_at, "source_status": "review"},
+            {"reason": reason, "source_status": "review", **defer_state},
             run_id=run_id,
         )
         _refresh_mission_status(conn, row["mission_id"])
@@ -10334,6 +11216,59 @@ def _provider_error_cooldowns_path() -> Path:
     )
 
 
+def _quota_routing_path() -> Path:
+    return Path(
+        os.environ.get("HERMES_KANBAN_QUOTA_ROUTING_PATH", "").strip()
+        or str(kanban_home() / QUOTA_ROUTING_STATE_PATH)
+    )
+
+
+def _cooldown_deadline_epoch(record: Any) -> Optional[int]:
+    """Read one exact cooldown deadline from either durable state shape."""
+    if not isinstance(record, dict):
+        return None
+    for key in ("cooldown_until_epoch", "reset_at_epoch"):
+        raw_epoch = record.get(key)
+        if isinstance(raw_epoch, (int, float)) and not isinstance(raw_epoch, bool):
+            return int(raw_epoch)
+        if isinstance(raw_epoch, str) and raw_epoch.strip().isdigit():
+            return int(raw_epoch.strip())
+    raw_deadline = record.get("cooldown_until") or record.get("reset_at")
+    if isinstance(raw_deadline, (int, float)) and not isinstance(raw_deadline, bool):
+        return int(raw_deadline)
+    if not isinstance(raw_deadline, str) or not raw_deadline.strip():
+        return None
+    try:
+        return int(dt.datetime.fromisoformat(
+            raw_deadline.strip().replace("Z", "+00:00")
+        ).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def _quota_routing_cooldown(
+    profile: Optional[str], *, now: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    """Return an active cooldown from ``ai-quota-routing.json``."""
+    if not profile:
+        return None
+    try:
+        payload = json.loads(_quota_routing_path().read_text(encoding="utf-8"))
+        record = (payload.get("agent_cooldowns") or {}).get(profile)
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    deadline = _cooldown_deadline_epoch(record)
+    current = time.time() if now is None else now
+    if (
+        isinstance(record, dict)
+        and record.get("dispatch_allowed") is False
+        and deadline is not None
+        and current < deadline
+    ):
+        return record
+    return None
+
+
 def _persist_provider_error_cooldown(
     profile: str,
     *,
@@ -10360,22 +11295,31 @@ def _persist_provider_error_cooldown(
                 payload = {}
             records = payload.setdefault("profiles", {})
             previous = records.get(profile) if isinstance(records, dict) else None
-            previous_deadline = None
-            if isinstance(previous, dict):
-                try:
-                    previous_deadline = dt.datetime.fromisoformat(
-                        str(previous.get("cooldown_until", "")).replace("Z", "+00:00")
-                    )
-                except ValueError:
-                    previous_deadline = None
-            if previous_deadline is None or reset_at >= previous_deadline:
+            previous_deadline = _cooldown_deadline_epoch(previous)
+            reset_epoch = int(reset_at.timestamp())
+            missing_exact_epoch = not (
+                isinstance(previous, dict)
+                and _cooldown_deadline_epoch({
+                    "cooldown_until_epoch": previous.get("cooldown_until_epoch")
+                }) is not None
+            )
+            if (
+                previous_deadline is None
+                or reset_epoch > previous_deadline
+                or (reset_epoch == previous_deadline and missing_exact_epoch)
+            ):
                 records[profile] = {
                     "dispatch_allowed": False,
                     "reason": "provider_cooldown",
                     "source": source,
                     "observed_at": observed_at.isoformat(),
                     "cooldown_until": reset_at.isoformat(),
+                    "cooldown_until_epoch": reset_epoch,
                 }
+            else:
+                # Identical/older evidence adds no routing fact.  Keep the
+                # durable file byte-stable instead of rewriting it every tick.
+                return
             tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
             tmp.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -10403,11 +11347,8 @@ def provider_error_cooldown(
         return None
     if not isinstance(record, dict):
         return None
-    try:
-        deadline = dt.datetime.fromisoformat(
-            str(record.get("cooldown_until", "")).replace("Z", "+00:00")
-        ).timestamp()
-    except ValueError:
+    deadline = _cooldown_deadline_epoch(record)
+    if deadline is None:
         return None
     return record if (time.time() if now is None else now) < deadline else None
 
@@ -10415,16 +11356,23 @@ def provider_error_cooldown(
 def provider_cooldown_retry_at(
     profile: Optional[str], *, now: Optional[float] = None,
 ) -> Optional[int]:
-    """Return the active provider reset deadline as an epoch timestamp."""
-    record = provider_error_cooldown(profile, now=now)
-    if record is None:
-        return None
-    try:
-        return int(dt.datetime.fromisoformat(
-            str(record.get("cooldown_until", "")).replace("Z", "+00:00")
-        ).timestamp())
-    except (TypeError, ValueError):
-        return None
+    """Return the unified active quota deadline as an exact epoch.
+
+    Provider errors and the independently refreshed quota-routing snapshot are
+    two views of the same provider availability boundary.  Taking the latest
+    active deadline prevents one shorter/stale view from reopening a lane
+    before the other source says it is available.
+    """
+    records = (
+        provider_error_cooldown(profile, now=now),
+        _quota_routing_cooldown(profile, now=now),
+    )
+    deadlines = [
+        deadline
+        for deadline in (_cooldown_deadline_epoch(record) for record in records)
+        if deadline is not None
+    ]
+    return max(deadlines) if deadlines else None
 
 
 # --- Routing tiers (t_8e9eedfa LOT 1) ----------------------------------
@@ -10856,19 +11804,48 @@ def _ready_task_has_resumable_worker_session(
     generalist pool; transient/runtime recovery keeps the exact conversation.
     """
     row = conn.execute(
-        "SELECT block_kind FROM tasks WHERE id = ?", (task_id,),
+        "SELECT block_kind, status, integration_status, "
+        "implementation_profile, implementation_session_id, "
+        "reviewer_profile, reviewer_session_id "
+        "FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     previous = conn.execute(
         "SELECT profile, outcome, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
+    durable_boundary = previous is not None and previous["outcome"] in {
+        "blocked", "rate_limited", "crashed", "timed_out", "stale",
+        "review_deferred", "reclaimed", "scheduled", "interrupted",
+        "strategy_required",
+        "changes_requested", "integration_pending", "review_requested",
+    }
+    if (
+        previous is not None
+        and previous["outcome"] == "blocked"
+        and (row is None or row["block_kind"] != "transient")
+    ):
+        durable_boundary = False
+    if row is not None and durable_boundary:
+        role = (
+            "implementation"
+            if row["status"] != "review"
+            or _integration_continuation_is_latest(
+                conn, task_id, row["integration_status"],
+            )
+            else "reviewer"
+        )
+        saved_profile = str(row[f"{role}_profile"] or "").strip()
+        saved_session = str(row[f"{role}_session_id"] or "").strip()
+        if saved_profile == assignee and saved_session:
+            return True
     if previous is None or previous["profile"] != assignee:
         return False
     outcome = previous["outcome"]
     if outcome not in {
         "blocked", "rate_limited", "crashed", "timed_out", "stale",
         "review_deferred", "reclaimed", "scheduled", "interrupted",
+        "strategy_required",
     }:
         return False
     if outcome == "blocked" and (row is None or row["block_kind"] != "transient"):
@@ -10986,24 +11963,8 @@ def quota_dispatch_guard(assignee: Optional[str], *, now: Optional[float] = None
         return "provider_cooldown"
     if assignee not in {"claude1", "claude2"}:
         return None
-    path = Path(os.environ.get("HERMES_KANBAN_QUOTA_ROUTING_PATH", "").strip() or (kanban_home() / QUOTA_ROUTING_STATE_PATH))
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        record = (payload.get("agent_cooldowns") or {}).get(assignee)
-    except (OSError, json.JSONDecodeError, AttributeError):
-        return None
-    if not isinstance(record, dict):
-        return None
-    if record.get("dispatch_allowed") is True and record.get("preflight_required") is False:
-        return None
-    raw_deadline = record.get("cooldown_until")
-    if isinstance(raw_deadline, str):
-        try:
-            deadline = __import__("datetime").datetime.fromisoformat(raw_deadline.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
-        if (time.time() if now is None else now) < deadline:
-            return "provider_cooldown"
+    if _quota_routing_cooldown(assignee, now=now) is not None:
+        return "provider_cooldown"
     # A failed refresh or an expired measurement is not provider evidence.
     # Let the real task attempt establish availability instead of parking the
     # queue forever behind a telemetry collector failure.
@@ -11844,6 +12805,9 @@ def heartbeat_worker(
             if _session:
                 _checkpoint["worker_session_id"] = _session
                 _run_meta["worker_session_id"] = _session
+                _persist_worker_role_session(
+                    conn, task_id, run_id, _session,
+                )
             _run_meta["checkpoint"] = _checkpoint
             conn.execute(
                 "UPDATE task_runs SET metadata = ? WHERE id = ?",
@@ -12723,6 +13687,7 @@ def capture_provider_reset(
         "provider_resolved": provider,
         "received_at": received_dt.isoformat(),
         "reset_at": None,
+        "reset_at_epoch": None,
         "reset_source": None,
     }
     explicit_reset = _parse_explicit_reset_at(error)
@@ -12748,19 +13713,20 @@ def capture_provider_reset(
             if delay_seconds is not None and delay_seconds >= 0:
                 payload["reset_at"] = (received_dt + dt.timedelta(seconds=delay_seconds)).isoformat()
                 payload["reset_source"] = "api_retry_after"
-    _append_event(conn, task_id, "provider_reset_observed", payload)
-    if role in ("claude2", "claude1"):
-        _append_event(conn, task_id, "claude_provider_reset", payload)
     if payload["reset_at"] is not None:
         reset_at = dt.datetime.fromisoformat(
             str(payload["reset_at"]).replace("Z", "+00:00")
         )
+        payload["reset_at_epoch"] = int(reset_at.timestamp())
         _persist_provider_error_cooldown(
             role,
             reset_at=reset_at,
             observed_at=received_dt,
             source=str(payload["reset_source"] or "provider_error"),
         )
+    _append_event(conn, task_id, "provider_reset_observed", payload)
+    if role in ("claude2", "claude1"):
+        _append_event(conn, task_id, "claude_provider_reset", payload)
     return payload
 
 
@@ -15950,12 +16916,14 @@ def _worker_retry_strategy_hint(runs: Iterable[Run]) -> str:
 
 
 def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optional[str]:
-    """Return the immediately preceding resumable worker session.
+    """Return the durable session for the role owned by the active run.
 
-    A runtime checkpoint makes quota exits, crashes, timeouts, stale reclaims,
-    and transient blocks resumable in the exact session. Human/capability/
-    dependency blocks intentionally start from a fresh operator-approved
-    handoff. The historical function name is retained for compatibility.
+    Implementation and review conversations have independent identities.  A
+    correction or integration continuation therefore resumes the implementer,
+    while a deferred/reopened review resumes its reviewer.  The profile paired
+    with the session must match the current assignee; fallback routing never
+    opens another profile's transcript.  Legacy per-run checkpoints remain a
+    fallback for cards created before the role columns existed.
     """
     try:
         with contextlib.closing(connect(board=board)) as conn:
@@ -15966,11 +16934,34 @@ def _transient_resume_session_id(task_id: str, *, board: Optional[str]) -> Optio
             previous = runs[-2] if runs and runs[-1].ended_at is None else (
                 runs[-1] if runs else None
             )
-            if previous is None or previous.outcome not in {
+            resumable_outcomes = {
                 "blocked", "rate_limited", "crashed", "timed_out", "stale",
                 "review_deferred", "reclaimed", "scheduled", "interrupted",
-            }:
+                "strategy_required",
+                "changes_requested", "integration_pending", "review_requested",
+            }
+            if previous is None or previous.outcome not in resumable_outcomes:
                 return None
+            if previous.outcome == "blocked" and task.block_kind != "transient":
+                # An explicit human decision deliberately starts a fresh turn;
+                # durable role memory must not weaken that existing boundary.
+                return None
+            role = (
+                "reviewer"
+                if task.current_run_id is not None
+                and _retry_status_for_run(
+                    conn, task_id, task.current_run_id,
+                ) == "review"
+                else "implementation"
+            )
+            durable_session = _durable_worker_role_session(
+                conn,
+                task_id,
+                profile=task.assignee,
+                role=role,
+            )
+            if durable_session:
+                return durable_session
             if previous.profile and task.assignee and previous.profile != task.assignee:
                 # A provider fallback changed executor identity. Reuse the
                 # durable checkpoint/handoff, but never open profile A's exact
@@ -16416,6 +17407,49 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    verification_tier = task.verification_tier or "legacy/unspecified"
+    verification_guidance = {
+        "express": (
+            "run only the bounded checks directly relevant to the change; "
+            "this tier does not require an independent or visual review"
+        ),
+        "standard": (
+            "run the normal focused tests and evidence checks proportionate "
+            "to the card's acceptance criteria"
+        ),
+        "critical": (
+            "run the full risk-relevant verification and preserve explicit "
+            "evidence for every acceptance criterion"
+        ),
+    }.get(
+        verification_tier,
+        "follow the explicit acceptance criteria without inventing extra gates",
+    )
+    lines.append(
+        f"Verification contract ({verification_tier}): {verification_guidance}."
+    )
+    delivery_guidance = {
+        "working_tree": "leave the verified result in the working tree; do not commit",
+        "commit": "create the required local commit; do not push or deploy",
+        "push": "commit and push the required result; do not deploy",
+        "deploy": "commit, push, deploy, and verify the deployed result",
+    }.get(
+        task.delivery_target,
+        "no delivery boundary was recorded; follow only an explicit task instruction",
+    )
+    lines.append(
+        f"Delivery contract ({task.delivery_target or 'unspecified'}): "
+        f"{delivery_guidance}."
+    )
+    visual_review_requirement = _task_visual_review_requirement(conn, task)
+    visual_contract = (
+        "required"
+        if visual_review_requirement is True
+        else "not required"
+        if visual_review_requirement is False
+        else "unspecified"
+    )
+    lines.append(f"Visual review: {visual_contract}")
     lines.append("")
 
     if (
@@ -16423,19 +17457,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         and _retry_status_for_run(conn, task.id, task.current_run_id) == "review"
     ):
         lines.append("## Current assignment — independent reviewer")
-        lines.append(f"Visual-review policy: {VISUAL_REVIEW_POLICY_VERSION}")
         lines.append(
             f"You are the active reviewer in run #{task.current_run_id}; any "
             "active reviewer shown for this card is this process, not a "
             "dependency to wait for. Inspect the latest review_requested "
             "handoff and choose exactly one terminal verdict: approve with "
             "kanban_complete, return defects with kanban_request_changes, or "
-            "The final visual verdict is GPT/Coder native only. Never call "
-            "Gemini, gemini_review_image.py, wait for a Gemini quota, or defer "
-            "this card for Gemini, even if resumed conversation history says "
-            "otherwise. Treat this policy version as newer and authoritative. "
-            "Establish the candidate's exact diff and baseline before judging "
-            "screenshots. Request implementation changes only when a finding "
+            "use a typed transient/capability block when completion is genuinely "
+            "impossible. Establish the candidate's exact diff and baseline. "
+            "Request implementation changes only when a finding "
             "violates an acceptance criterion or is a regression introduced by "
             "that diff; a pre-existing or out-of-scope issue is non-blocking "
             "and must never send the implementer into unrelated rework. "
@@ -16448,6 +17478,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "Never call kanban_request_review and never dependency-block "
             "waiting for yourself."
         )
+        if visual_review_requirement is True:
+            lines.append(
+                f"Visual-review policy: {VISUAL_REVIEW_POLICY_VERSION}. "
+                "A visual verdict is explicitly required for this card. Use "
+                "the native GPT/Coder visual path on the required production "
+                "or candidate screenshots. Never call Gemini, "
+                "gemini_review_image.py, wait for a Gemini quota, or defer this "
+                "card for Gemini, even if resumed history says otherwise."
+            )
+        else:
+            lines.append(
+                "No visual review is contracted for this card. Do not create "
+                "screenshots or add a visual-review gate unless the task's "
+                "explicit acceptance criteria independently require them."
+            )
         lines.append("")
 
     if task.body and task.body.strip():

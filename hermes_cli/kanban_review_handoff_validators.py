@@ -37,6 +37,9 @@ class KanbanReviewHandoffContext:
     reviewer: str | None
     source: str
     surface: str
+    verification_tier: str | None = None
+    delivery_target: str | None = None
+    visual_review_required: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +156,9 @@ def project_kanban_review_handoff(
                 reviewer=reviewer,
                 source=context.source,
                 surface=context.surface,
+                verification_tier=context.verification_tier,
+                delivery_target=context.delivery_target,
+                visual_review_required=context.visual_review_required,
             )
             try:
                 raw = _invoke_validator_callback(callback, current_context)
@@ -211,6 +217,9 @@ def _invoke_validator_callback(callback: Any, context: KanbanReviewHandoffContex
         "reviewer": context.reviewer,
         "source": context.source,
         "surface": context.surface,
+        "verification_tier": context.verification_tier,
+        "delivery_target": context.delivery_target,
+        "visual_review_required": context.visual_review_required,
     }
     try:
         parameters = inspect.signature(callback).parameters

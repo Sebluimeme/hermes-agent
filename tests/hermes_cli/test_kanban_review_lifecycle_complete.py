@@ -96,7 +96,14 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert requested.payload["summary"] == "Implementation and focused tests are ready."
     implementation_run = _run(kb.list_runs(conn, task_id), "review_requested")
     assert implementation_run.summary == "Implementation and focused tests are ready."
-    assert implementation_run.metadata == {"commit": "abc123"}
+    assert implementation_run.metadata == {
+        "task_contract": {
+            "verification_tier": "express",
+            "delivery_target": None,
+            "visual_review_required": None,
+        },
+        "commit": "abc123",
+    }
 
     review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
     assert review is not None
@@ -583,6 +590,11 @@ def test_parked_review_approval_without_evidence_still_creates_audit_run(conn) -
     assert run.profile == "reviewer"
     assert run.summary == "Review approved without additional evidence."
     assert run.metadata == {
+        "task_contract": {
+            "verification_tier": "express",
+            "delivery_target": None,
+            "visual_review_required": None,
+        },
         "source_status": "review",
         "approval": "manual",
     }

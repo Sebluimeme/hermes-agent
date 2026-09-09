@@ -82,6 +82,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
         "routing_tier": t.routing_tier,
+        "verification_tier": t.verification_tier,
+        "delivery_target": t.delivery_target,
+        "visual_review_required": t.visual_review_required,
         "mission_id": t.mission_id,
         "queue_class": t.queue_class,
         "execution_status": t.execution_status,
@@ -458,6 +461,33 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "Creation-time only — there is "
                                "no way to change it after the card exists. "
                                "Omit for the fail-safe default (complex).")
+    p_create.add_argument(
+        "--verification-tier",
+        choices=sorted(kb.VALID_VERIFICATION_TIERS),
+        default="express",
+        help=(
+            "Verification depth recorded on the card: express (default), "
+            "standard, or critical."
+        ),
+    )
+    p_create.add_argument(
+        "--delivery-target",
+        choices=sorted(kb.VALID_DELIVERY_TARGETS),
+        default=None,
+        help=(
+            "Required delivery boundary: working_tree, commit, push, or deploy. "
+            "Omit when the legacy/unspecified contract is intended."
+        ),
+    )
+    p_create.add_argument(
+        "--visual-review-required",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Persist whether this card requires visual review. Omit to leave "
+            "the decision unspecified."
+        ),
+    )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1792,12 +1822,26 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "ready"),
             routing_tier=getattr(args, "routing_tier", None),
+            verification_tier=getattr(args, "verification_tier", "express"),
+            delivery_target=getattr(args, "delivery_target", None),
+            visual_review_required=getattr(args, "visual_review_required", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        visual_review = (
+            "yes" if task.visual_review_required is True
+            else "no" if task.visual_review_required is False
+            else "unspecified"
+        )
+        print(
+            "  contract: "
+            f"verification={task.verification_tier or 'unspecified'}, "
+            f"delivery={task.delivery_target or 'unspecified'}, "
+            f"visual-review={visual_review}"
+        )
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are
@@ -1970,6 +2014,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  model:     {task.model_override}{_prov}")
     print(f"  routing-tier: {kb.normalize_routing_tier(task.routing_tier)}" +
           (" (raw: none, fail-safe default)" if not task.routing_tier else ""))
+    print(f"  verification-tier: {task.verification_tier or '-'}")
+    print(f"  delivery-target: {task.delivery_target or '-'}")
+    visual_review = (
+        "yes" if task.visual_review_required is True
+        else "no" if task.visual_review_required is False
+        else "-"
+    )
+    print(f"  visual-review-required: {visual_review}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see

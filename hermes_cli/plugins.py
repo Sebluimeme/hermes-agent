@@ -377,7 +377,8 @@ VALID_HOOKS: Set[str] = {
     # Kwargs include a typed context plus additive scalar fields:
     #   context: KanbanReviewHandoffContext, task_id, title, body, created_by,
     #   board, prior_status, assignee, run_id, summary, metadata, reviewer,
-    #   source/surface: "core" | "cli" | "tool".
+    #   source/surface: "core" | "cli" | "tool", plus nullable durable
+    #   verification_tier, delivery_target, and visual_review_required.
     "validate_kanban_review_handoff",
     # Gateway platform-boundary observer hooks (#64176). Observer-only; each
     # callback isolated by invoke_hook. Payloads are normalized envelopes only,

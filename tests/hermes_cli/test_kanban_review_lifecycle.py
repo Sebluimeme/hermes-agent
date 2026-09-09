@@ -173,24 +173,181 @@ def test_active_reviewer_cannot_wait_for_or_request_itself(
             expected_run_id=reviewer.current_run_id,
             with_reason=True,
         )
-        dependency_wait = kb.block_task(
-            conn,
-            tid,
-            reason="wait for the active reviewer",
-            kind="dependency",
-            expected_run_id=reviewer.current_run_id,
-        )
+        with pytest.raises(ValueError, match="link_tasks"):
+            kb.block_task(
+                conn,
+                tid,
+                reason="wait for the active reviewer",
+                kind="dependency",
+                expected_run_id=reviewer.current_run_id,
+            )
         current = kb.get_task(conn, tid)
 
     assert "You are the active reviewer" in context
-    assert kb.VISUAL_REVIEW_POLICY_VERSION in context
-    assert "Never call Gemini" in context
-    assert review_run.metadata["policy_versions"]["visual_review"] == kb.VISUAL_REVIEW_POLICY_VERSION
+    assert "No visual review is contracted" in context
+    assert kb.VISUAL_REVIEW_POLICY_VERSION not in context
+    assert "Never call Gemini" not in context
+    assert review_run.metadata["review"] == {"role": "independent"}
+    assert "policy_versions" not in review_run.metadata
     assert ok is False
     assert reason is not None and "already the active reviewer" in reason
-    assert dependency_wait is False
     assert current is not None and current.status == "running"
     assert current.current_run_id == reviewer.current_run_id
+
+
+def test_visual_review_policy_is_injected_only_for_opted_in_card(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="review visuals",
+            assignee="implementer",
+            verification_tier="standard",
+            visual_review_required=True,
+        )
+        claimed = kb.claim_task(conn, tid, claimer="implementer:1")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="visual candidate ready",
+            reviewer="coder",
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer = kb.claim_review_task(conn, tid, claimer="coder:1")
+        assert reviewer is not None and reviewer.current_run_id is not None
+        context = kb.build_worker_context(conn, tid)
+        review_run = next(
+            run for run in kb.list_runs(conn, tid)
+            if run.id == reviewer.current_run_id
+        )
+
+    assert kb.VISUAL_REVIEW_POLICY_VERSION == "2026-09-09-lean-opt-in-v1"
+    assert kb.VISUAL_REVIEW_POLICY_VERSION in context
+    assert "A visual verdict is explicitly required" in context
+    assert "Never call Gemini" in context
+    assert review_run.metadata["policy_versions"]["visual_review"] == (
+        kb.VISUAL_REVIEW_POLICY_VERSION
+    )
+
+
+def test_visual_marker_routes_reviewer_to_opted_in_policy(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="[VISUAL] compare the final candidate",
+            assignee="implementer",
+            visual_review_required=None,
+        )
+        claimed = kb.claim_task(conn, tid, claimer="implementer:marker")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="candidate ready",
+            reviewer="coder",
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer = kb.claim_review_task(conn, tid, claimer="coder:marker")
+        assert reviewer is not None and reviewer.current_run_id is not None
+        context = kb.build_worker_context(conn, tid)
+        review_run = next(
+            run
+            for run in kb.list_runs(conn, tid)
+            if run.id == reviewer.current_run_id
+        )
+
+    assert "Visual review: required" in context
+    assert "A visual verdict is explicitly required" in context
+    assert review_run.metadata["policy_versions"]["visual_review"] == (
+        kb.VISUAL_REVIEW_POLICY_VERSION
+    )
+
+
+@pytest.mark.parametrize(
+    "handoff_metadata",
+    [
+        {"visual_review": {"required": True}},
+        {"verification": {"level": "critical", "visual_review": True}},
+    ],
+)
+def test_explicit_handoff_metadata_routes_reviewer_to_visual_policy(
+    kanban_home: Path,
+    handoff_metadata: dict,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="final candidate",
+            assignee="implementer",
+            verification_tier=(
+                "critical"
+                if "verification" in handoff_metadata
+                else "express"
+            ),
+            visual_review_required=None,
+        )
+        claimed = kb.claim_task(conn, tid, claimer="implementer:handoff")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="candidate ready",
+            metadata=handoff_metadata,
+            reviewer="coder",
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer = kb.claim_review_task(conn, tid, claimer="coder:handoff")
+        assert reviewer is not None and reviewer.current_run_id is not None
+        context = kb.build_worker_context(conn, tid)
+        review_run = next(
+            run
+            for run in kb.list_runs(conn, tid)
+            if run.id == reviewer.current_run_id
+        )
+
+    assert "Visual review: required" in context
+    assert "A visual verdict is explicitly required" in context
+    assert review_run.metadata["policy_versions"]["visual_review"] == (
+        kb.VISUAL_REVIEW_POLICY_VERSION
+    )
+
+
+def test_critical_handoff_without_visual_opt_in_stays_generic(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="critical database migration",
+            assignee="implementer",
+            verification_tier="critical",
+            visual_review_required=None,
+        )
+        claimed = kb.claim_task(conn, tid, claimer="implementer:critical")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="candidate ready",
+            metadata={"verification": {"level": "critical"}},
+            reviewer="coder",
+            expected_run_id=claimed.current_run_id,
+        )
+        reviewer = kb.claim_review_task(conn, tid, claimer="coder:critical")
+        assert reviewer is not None and reviewer.current_run_id is not None
+        context = kb.build_worker_context(conn, tid)
+        review_run = next(
+            run
+            for run in kb.list_runs(conn, tid)
+            if run.id == reviewer.current_run_id
+        )
+
+    assert "No visual review is contracted" in context
+    assert "policy_versions" not in review_run.metadata
 
 
 # ---------------------------------------------------------------------------

@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 from agent.context_compressor import ContextCompressor
+from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
@@ -2135,6 +2136,16 @@ def init_agent(
         _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
     except (TypeError, ValueError):
         _api_retries = 3
+    # A Kanban worker has a durable dispatcher above it. Repeating the same
+    # provider call inside the disposable worker hides quota/reset evidence
+    # from that dispatcher and historically turned one 429 into hours of
+    # blind probes. Surface the first failure; the dispatcher can then route
+    # once or sleep until its durable retry_at.
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and is_dispatcher_owned_worker_context()
+    ):
+        _api_retries = 1
     agent._api_max_retries = _api_retries
 
     # Initialize context compressor for automatic context management

@@ -288,7 +288,54 @@ def test_defer_review_tool_keeps_review_retryable(worker_env):
         assert task is not None
         assert task.status == "review"
         assert task.next_retry_at == retry_at
-        assert kb.latest_run(conn, worker_env).outcome == "review_deferred"
+        latest_run = kb.latest_run(conn, worker_env)
+        assert latest_run.outcome == "review_deferred"
+        assert latest_run.metadata["review_deferred"] is True
+        assert "visual_review_deferred" not in latest_run.metadata
+    finally:
+        conn.close()
+
+
+def test_defer_review_tool_schema_is_provider_neutral():
+    from tools import kanban_tools as kt
+
+    encoded = json.dumps(kt.KANBAN_DEFER_REVIEW_SCHEMA).casefold()
+    assert "gemini" not in encoded
+    assert "visual-review script" not in encoded
+    assert "visual validation" not in encoded
+
+
+def test_request_changes_tool_persists_reviewer_session(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        implementation = kb.latest_run(conn, worker_env)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            worker_env,
+            summary="ready for independent review",
+            reviewer="reviewer",
+            expected_run_id=implementation.id,
+        )
+        review = kb.claim_review_task(conn, worker_env)
+        assert review is not None
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+        monkeypatch.setenv("HERMES_SESSION_ID", "reviewer-session-from-tool")
+    finally:
+        conn.close()
+
+    result = json.loads(kt._handle_request_changes({"reason": "fix one defect"}))
+    assert result["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.reviewer_profile == "reviewer"
+        assert task.reviewer_session_id == "reviewer-session-from-tool"
     finally:
         conn.close()
 
@@ -332,6 +379,95 @@ def test_create_many_is_atomic_dependency_aware_and_idempotent(worker_env):
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before
     finally:
         conn.close()
+
+
+def test_create_tools_persist_and_return_minimal_delivery_contract(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    single = json.loads(kt._handle_create({
+        "title": "contract child",
+        "verification_tier": "standard",
+        "delivery_target": "commit",
+        "visual_review_required": False,
+    }))
+    assert single["ok"] is True
+    assert single["verification_tier"] == "standard"
+    assert single["delivery_target"] == "commit"
+    assert single["visual_review_required"] is False
+
+    batch = json.loads(kt._handle_create_many({
+        "idempotency_key": "contract-batch",
+        "defaults": {
+            "verification_tier": "critical",
+            "delivery_target": "deploy",
+            "visual_review_required": True,
+        },
+        "tasks": [
+            {"key": "deploy", "title": "Deploy carefully"},
+            {
+                "key": "express",
+                "title": "Small follow-up",
+                "verification_tier": "express",
+                "delivery_target": "working_tree",
+                "visual_review_required": False,
+            },
+        ],
+    }))
+    assert batch["ok"] is True
+    assert batch["tasks"][0]["verification_tier"] == "critical"
+    assert batch["tasks"][0]["delivery_target"] == "deploy"
+    assert batch["tasks"][0]["visual_review_required"] is True
+    assert batch["tasks"][1]["verification_tier"] == "express"
+    assert batch["tasks"][1]["delivery_target"] == "working_tree"
+    assert batch["tasks"][1]["visual_review_required"] is False
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, single["task_id"])
+    assert task is not None
+    assert task.verification_tier == "standard"
+    assert task.delivery_target == "commit"
+    assert task.visual_review_required is False
+
+
+@pytest.mark.parametrize(
+    "args, field",
+    [
+        ({"title": "bad", "verification_tier": "slow"}, "verification_tier"),
+        ({"title": "bad", "delivery_target": "release"}, "delivery_target"),
+        (
+            {"title": "bad", "visual_review_required": "false"},
+            "visual_review_required",
+        ),
+    ],
+)
+def test_create_tool_rejects_invalid_delivery_contract(worker_env, args, field):
+    from tools import kanban_tools as kt
+
+    response = json.loads(kt._handle_create(args))
+    assert field in response["error"]
+
+
+def test_create_tool_schemas_declare_minimal_delivery_contract():
+    from tools import kanban_tools as kt
+
+    single = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    many = (
+        kt.KANBAN_CREATE_MANY_SCHEMA["parameters"]["properties"]["tasks"]
+        ["items"]["properties"]
+    )
+    defaults = (
+        kt.KANBAN_CREATE_MANY_SCHEMA["parameters"]["properties"]["defaults"]
+        ["properties"]
+    )
+    for properties in (single, many, defaults):
+        assert properties["verification_tier"]["enum"] == [
+            "express", "standard", "critical",
+        ]
+        assert properties["delivery_target"]["enum"] == [
+            "working_tree", "commit", "push", "deploy",
+        ]
+        assert properties["visual_review_required"]["type"] == "boolean"
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
@@ -382,7 +518,15 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2, "evidence": evidence}
+        assert run.metadata == {
+            "task_contract": {
+                "verification_tier": "express",
+                "delivery_target": None,
+                "visual_review_required": None,
+            },
+            "files": 2,
+            "evidence": evidence,
+        }
     finally:
         conn.close()
 
@@ -404,7 +548,14 @@ def test_transient_block_stamps_worker_session_for_safe_resume(worker_env, monke
         run = kb.latest_run(conn, worker_env)
         assert run is not None
         assert run.outcome == "blocked"
-        assert run.metadata == {"worker_session_id": "worker-session-42"}
+        assert run.metadata == {
+            "task_contract": {
+                "verification_tier": "express",
+                "delivery_target": None,
+                "visual_review_required": None,
+            },
+            "worker_session_id": "worker-session-42",
+        }
     finally:
         conn.close()
 

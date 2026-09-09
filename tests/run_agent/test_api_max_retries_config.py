@@ -6,6 +6,10 @@ faster on flaky primaries instead of burning ~3x180s on the same stall.
 """
 from unittest.mock import patch
 
+from agent.delegation_context import (
+    delegated_child_context,
+    non_dispatcher_owned_context,
+)
 from run_agent import AIAgent
 
 
@@ -44,5 +48,19 @@ def test_api_max_retries_honors_config_override():
     assert agent2._api_max_retries == 5
 
 
+def test_kanban_worker_surfaces_first_provider_failure(monkeypatch):
+    """The durable dispatcher, not the worker, owns Kanban retries."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_retry_contract")
+    agent = _make_agent(api_max_retries=9)
+    assert agent._api_max_retries == 1
+
+
+def test_in_process_children_do_not_inherit_worker_retry_policy(monkeypatch):
+    """A delegate/cron is not the dispatcher-owned worker despite its env."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent_worker")
+    for scope in (delegated_child_context, non_dispatcher_owned_context):
+        with scope():
+            agent = _make_agent(api_max_retries=9)
+        assert agent._api_max_retries == 9
 
 

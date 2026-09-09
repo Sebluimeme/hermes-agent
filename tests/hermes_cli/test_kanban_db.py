@@ -243,6 +243,9 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "verification_tier" in task_columns
+    assert "delivery_target" in task_columns
+    assert "visual_review_required" in task_columns
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
@@ -250,6 +253,9 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
     assert legacy_done.delivery_status == "delivered"
+    assert legacy_done.verification_tier is None
+    assert legacy_done.delivery_target is None
+    assert legacy_done.visual_review_required is None
 
 
 # ---------------------------------------------------------------------------
@@ -1074,6 +1080,101 @@ def test_create_task_rejects_invalid_routing_tier(kanban_home):
     with kb.connect() as conn:
         with pytest.raises(ValueError):
             kb.create_task(conn, title="bad", assignee="a", routing_tier="urgent")
+
+
+def test_create_task_persists_minimal_delivery_contract_in_event_run_and_context(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="contracted work",
+            assignee="a",
+            verification_tier="standard",
+            delivery_target="push",
+            visual_review_required=True,
+        )
+        task = kb.get_task(conn, tid)
+        created_event = next(
+            event for event in kb.list_events(conn, tid) if event.kind == "created"
+        )
+        claimed = kb.claim_task(conn, tid, claimer="a:contract")
+        assert claimed is not None and claimed.current_run_id is not None
+        run = next(
+            item for item in kb.list_runs(conn, tid)
+            if item.id == claimed.current_run_id
+        )
+        context = kb.build_worker_context(conn, tid)
+
+    assert task is not None
+    assert task.verification_tier == "standard"
+    assert task.delivery_target == "push"
+    assert task.visual_review_required is True
+    assert created_event.payload["verification_tier"] == "standard"
+    assert created_event.payload["delivery_target"] == "push"
+    assert created_event.payload["visual_review_required"] is True
+    assert run.metadata["task_contract"] == {
+        "verification_tier": "standard",
+        "delivery_target": "push",
+        "visual_review_required": True,
+    }
+    assert "Verification contract (standard)" in context
+    assert "Delivery contract (push)" in context
+    assert "Visual review: required" in context
+
+
+def test_create_task_contract_defaults_and_nullable_legacy_shape(kanban_home):
+    with kb.connect() as conn:
+        default_id = kb.create_task(conn, title="default contract")
+        nullable_id = kb.create_task(
+            conn,
+            title="explicit legacy contract",
+            verification_tier=None,
+            delivery_target=None,
+            visual_review_required=None,
+        )
+        default_task = kb.get_task(conn, default_id)
+        nullable_task = kb.get_task(conn, nullable_id)
+
+    assert default_task is not None and default_task.verification_tier == "express"
+    assert default_task.delivery_target is None
+    assert default_task.visual_review_required is None
+    assert nullable_task is not None and nullable_task.verification_tier is None
+    assert nullable_task.delivery_target is None
+    assert nullable_task.visual_review_required is None
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"verification_tier": "slow"}, "verification_tier"),
+        ({"verification_tier": 1}, "verification_tier"),
+        ({"delivery_target": "release"}, "delivery_target"),
+        ({"delivery_target": False}, "delivery_target"),
+        ({"visual_review_required": "false"}, "visual_review_required"),
+        ({"visual_review_required": 1}, "visual_review_required"),
+    ],
+)
+def test_create_task_rejects_invalid_delivery_contract(
+    kanban_home, kwargs, message,
+):
+    with kb.connect() as conn, pytest.raises(ValueError, match=message):
+        kb.create_task(conn, title="invalid contract", **kwargs)
+
+
+def test_task_contract_columns_enforce_values_at_sql_boundary(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="strict schema")
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE tasks SET delivery_target='release' WHERE id=?",
+                (tid,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE tasks SET visual_review_required=2 WHERE id=?",
+                (tid,),
+            )
 
 
 def test_create_task_rejects_read_only_analysis_on_shared_workspace_root(kanban_home):
@@ -2636,6 +2737,160 @@ def test_checkpoint_preserves_exact_session_for_transient_resume(kanban_home):
     assert kb._transient_resume_session_id(
         task_id, board=kb.get_current_board(),
     ) == "worker-session-42"
+
+
+def test_review_rework_resumes_each_roles_own_durable_session(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="role continuity", assignee="builder")
+        implementation = kb.claim_task(conn, task_id, claimer="builder:first")
+        assert implementation is not None
+        assert kb.heartbeat_worker(
+            conn,
+            task_id,
+            expected_run_id=implementation.current_run_id,
+            worker_session_id="implementation-session",
+        )
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="reviewer",
+            summary="candidate ready",
+            expected_run_id=implementation.current_run_id,
+            metadata={"worker_session_id": "implementation-session"},
+        )
+        task = kb.get_task(conn, task_id)
+        assert (task.implementation_profile, task.implementation_session_id) == (
+            "builder",
+            "implementation-session",
+        )
+
+        review = kb.claim_review_task(conn, task_id, claimer="reviewer:first")
+        assert review is not None
+        assert kb.heartbeat_worker(
+            conn,
+            task_id,
+            expected_run_id=review.current_run_id,
+            worker_session_id="review-session",
+        )
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="adjust the candidate",
+            expected_run_id=review.current_run_id,
+            metadata={"worker_session_id": "review-session"},
+        ) == (True, "builder")
+        task = kb.get_task(conn, task_id)
+        assert (task.reviewer_profile, task.reviewer_session_id) == (
+            "reviewer",
+            "review-session",
+        )
+
+        rework = kb.claim_task(conn, task_id, claimer="builder:rework")
+        assert rework is not None
+        assert kb._transient_resume_session_id(
+            task_id, board=kb.get_current_board(),
+        ) == "implementation-session"
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="corrected candidate",
+            expected_run_id=rework.current_run_id,
+            metadata={"worker_session_id": "implementation-session"},
+        )
+        rereview = kb.claim_review_task(conn, task_id, claimer="reviewer:again")
+        assert rereview is not None
+        assert kb._transient_resume_session_id(
+            task_id, board=kb.get_current_board(),
+        ) == "review-session"
+
+
+def test_durable_role_session_is_never_reused_across_profiles(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="profile isolation", assignee="claude2")
+        conn.execute(
+            "UPDATE tasks SET implementation_profile=?, implementation_session_id=? "
+            "WHERE id=?",
+            ("claude1", "claude1-session", task_id),
+        )
+        conn.commit()
+        claimed = kb.claim_task(conn, task_id, claimer="claude2:first")
+        assert claimed is not None
+
+    assert kb._transient_resume_session_id(
+        task_id, board=kb.get_current_board(),
+    ) is None
+
+
+def test_review_deferral_and_integration_resume_the_correct_role(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        deferred_id = kb.create_task(conn, title="deferred review", assignee="builder")
+        implementation = kb.claim_task(conn, deferred_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            deferred_id,
+            reviewer="reviewer",
+            summary="ready",
+            expected_run_id=implementation.current_run_id,
+            metadata={"worker_session_id": "builder-session"},
+        )
+        review = kb.claim_review_task(conn, deferred_id)
+        assert review is not None
+        assert kb.defer_review_task(
+            conn,
+            deferred_id,
+            reason="temporary quota",
+            retry_at=int(time.time()) + 60,
+            expected_run_id=review.current_run_id,
+            metadata={"worker_session_id": "reviewer-session"},
+        ) == (True, None)
+        retry_at = kb.get_task(conn, deferred_id).next_retry_at
+        monkeypatch.setattr(kb.time, "time", lambda: float(retry_at + 1))
+        resumed_review = kb.claim_review_task(conn, deferred_id)
+        assert resumed_review is not None
+        assert kb._transient_resume_session_id(
+            deferred_id, board=kb.get_current_board(),
+        ) == "reviewer-session"
+
+        integration_id = kb.create_task(
+            conn, title="integration continuation", assignee="builder",
+        )
+        integration = kb.claim_task(conn, integration_id)
+        assert integration is not None
+        assert kb.heartbeat_worker(
+            conn,
+            integration_id,
+            expected_run_id=integration.current_run_id,
+            worker_session_id="integration-session",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='review', integration_status='awaiting_integration', "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (integration_id,),
+            )
+            kb._end_run(
+                conn,
+                integration_id,
+                outcome="integration_pending",
+                metadata={"worker_session_id": "integration-session"},
+            )
+            kb._append_event(
+                conn,
+                integration_id,
+                "awaiting_integration",
+                {"reason": "integration still required"},
+            )
+        resumed_integration = kb.claim_review_task(conn, integration_id)
+        assert resumed_integration is not None
+        assert kb._retry_status_for_run(
+            conn, integration_id, resumed_integration.current_run_id,
+        ) == "ready"
+        assert kb._transient_resume_session_id(
+            integration_id, board=kb.get_current_board(),
+        ) == "integration-session"
 
 
 def test_operator_reclaim_resumes_the_exact_checkpointed_session(kanban_home):

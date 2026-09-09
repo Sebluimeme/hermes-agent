@@ -547,6 +547,16 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     return default, f"{name} must be a boolean or 'true'/'false'"
 
 
+def _parse_optional_bool_arg(args: dict, name: str):
+    """Parse a nullable contract boolean without truthy-string coercion."""
+    value = args.get(name)
+    if value is None:
+        return None, None
+    if not isinstance(value, bool):
+        return None, f"{name} must be a boolean or null"
+    return value, None
+
+
 def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     """Belt-and-suspenders runtime guard for orchestrator-only handlers.
 
@@ -586,6 +596,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "verification_tier": task.verification_tier,
+        "delivery_target": task.delivery_target,
+        "visual_review_required": task.visual_review_required,
         "mission_id": task.mission_id,
         "queue_class": task.queue_class,
         "execution_status": task.execution_status,
@@ -702,6 +715,9 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "verification_tier": t.verification_tier,
+                    "delivery_target": t.delivery_target,
+                    "visual_review_required": t.visual_review_required,
                     "mission_id": t.mission_id,
                     "queue_class": t.queue_class,
                     "execution_status": t.execution_status,
@@ -1324,6 +1340,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 tid,
                 reason=reason,
                 expected_run_id=_worker_run_id(tid),
+                metadata=_stamp_worker_session_metadata(tid, None),
             )
             if not ok:
                 return tool_error(
@@ -1347,7 +1364,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
 
 
 def _handle_defer_review(args: dict, **kw) -> str:
-    """Defer a visual final review without creating a human blocker."""
+    """Defer an automatic review retry without creating a human blocker."""
     delegated_err = _reject_delegated_child_mutation("kanban_defer_review")
     if delegated_err:
         return delegated_err
@@ -1364,10 +1381,12 @@ def _handle_defer_review(args: dict, **kw) -> str:
         return tool_error("reason is required")
     retry_at = args.get("retry_at")
     if retry_at is None:
-        return tool_error("retry_at is required (Unix timestamp returned by the visual review script)")
+        return tool_error(
+            "retry_at is required (future Unix timestamp for automatic retry)"
+        )
     metadata = _stamp_worker_session_metadata(
         tid,
-        {"visual_review_deferred": True, "retry_at": retry_at},
+        {"review_deferred": True, "retry_at": retry_at},
     )
     board = args.get("board")
     try:
@@ -1384,8 +1403,17 @@ def _handle_defer_review(args: dict, **kw) -> str:
                 metadata=metadata,
             )
             if not ok:
-                return tool_error(f"could not defer visual review for {tid}: {detail}")
-            return _ok(task_id=tid, status="review", retry_at=int(retry_at))
+                return tool_error(f"could not defer review for {tid}: {detail}")
+            landed = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                status="review",
+                retry_at=(
+                    int(landed.next_retry_at)
+                    if landed is not None and landed.next_retry_at is not None
+                    else int(retry_at)
+                ),
+            )
         finally:
             conn.close()
     except (TypeError, ValueError) as e:
@@ -1799,6 +1827,13 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error("'provider' requires 'model' to be set as well")
     routing_tier = args.get("routing_tier")
     queue_class = args.get("queue_class") or "active"
+    verification_tier = args.get("verification_tier", "express")
+    delivery_target = args.get("delivery_target")
+    visual_review_required, visual_bool_error = _parse_optional_bool_arg(
+        args, "visual_review_required"
+    )
+    if visual_bool_error:
+        return tool_error(visual_bool_error)
     acceptance = args.get("acceptance")
     if isinstance(parents, str):
         parents = [parents]
@@ -1880,6 +1915,9 @@ def _handle_create(args: dict, **kw) -> str:
                 },
                 acceptance=acceptance if isinstance(acceptance, dict) else None,
                 queue_class=str(queue_class),
+                verification_tier=verification_tier,
+                delivery_target=delivery_target,
+                visual_review_required=visual_review_required,
             )
             new_task = kb.get_task(conn, new_tid)
             try:
@@ -1926,6 +1964,13 @@ def _handle_create(args: dict, **kw) -> str:
                 subscribed=subscribed,
                 mission_id=new_task.mission_id if new_task else None,
                 queue_class=new_task.queue_class if new_task else None,
+                verification_tier=(
+                    new_task.verification_tier if new_task else None
+                ),
+                delivery_target=new_task.delivery_target if new_task else None,
+                visual_review_required=(
+                    new_task.visual_review_required if new_task else None
+                ),
                 read_only=bool(read_only),
                 workspace_forced_scratch=workspace_forced_scratch,
                 execution_started=execution_started,
@@ -2007,6 +2052,14 @@ def _handle_create_many(args: dict, **kw) -> str:
                 provider = merged.get("provider")
                 if provider and not model:
                     return tool_error(f"tasks[{index}].provider requires model")
+                visual_review_required = merged.get("visual_review_required")
+                if (
+                    visual_review_required is not None
+                    and not isinstance(visual_review_required, bool)
+                ):
+                    return tool_error(
+                        f"tasks[{index}].visual_review_required must be a boolean or null"
+                    )
                 workspace_kind = merged.get("workspace_kind")
                 workspace_path = merged.get("workspace_path")
                 project_id = merged.get("project") or merged.get("project_id")
@@ -2074,6 +2127,11 @@ def _handle_create_many(args: dict, **kw) -> str:
                         if isinstance(merged.get("acceptance"), dict) else None
                     ),
                     "queue_class": str(merged.get("queue_class") or "active"),
+                    "verification_tier": merged.get(
+                        "verification_tier", "express"
+                    ),
+                    "delivery_target": merged.get("delivery_target"),
+                    "visual_review_required": visual_review_required,
                     "board": board,
                 })
 
@@ -2086,6 +2144,13 @@ def _handle_create_many(args: dict, **kw) -> str:
                     "task_id": task_id,
                     "status": task.status if task else None,
                     "mission_id": task.mission_id if task else None,
+                    "verification_tier": (
+                        task.verification_tier if task else None
+                    ),
+                    "delivery_target": task.delivery_target if task else None,
+                    "visual_review_required": (
+                        task.visual_review_required if task else None
+                    ),
                     "subscribed": _maybe_auto_subscribe(conn, task_id),
                 })
             return _ok(
@@ -2746,8 +2811,8 @@ KANBAN_DEFER_REVIEW_SCHEMA = {
     "name": "kanban_defer_review",
     "description": (
         "Temporarily defer an active review run until a precise retry time. "
-        "Use when final visual validation is temporarily unavailable (quota, "
-        "rate limit, or transient network failure). The task remains in the "
+        "Use when an automatic reviewer dependency is temporarily unavailable "
+        "(quota, rate limit, or transient network failure). The task remains in the "
         "review phase, resumes automatically in the same reviewer session, "
         "and does not ask the human for action."
     ),
@@ -2757,11 +2822,11 @@ KANBAN_DEFER_REVIEW_SCHEMA = {
             "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
             "reason": {
                 "type": "string",
-                "description": "Short factual reason the final visual check could not run.",
+                "description": "Short factual reason the review cannot continue yet.",
             },
             "retry_at": {
                 "type": "integer",
-                "description": "Future Unix timestamp supplied by the visual-review script.",
+                "description": "Future Unix timestamp for the automatic review retry.",
             },
             "board": _board_schema_prop(),
         },
@@ -3141,6 +3206,30 @@ KANBAN_CREATE_SCHEMA = {
                     "Omit for the fail-safe default (complex)."
                 ),
             },
+            "verification_tier": {
+                "type": "string",
+                "enum": ["express", "standard", "critical"],
+                "description": (
+                    "Durable verification depth for this card. Defaults to "
+                    "express; use standard or critical only when the risk "
+                    "requires the additional checks."
+                ),
+            },
+            "delivery_target": {
+                "type": "string",
+                "enum": ["working_tree", "commit", "push", "deploy"],
+                "description": (
+                    "Durable delivery boundary required by the card. Omit "
+                    "when no target was explicitly contracted."
+                ),
+            },
+            "visual_review_required": {
+                "type": "boolean",
+                "description": (
+                    "Whether the card explicitly requires visual review. "
+                    "Omit to leave the decision unspecified."
+                ),
+            },
             "queue_class": {
                 "type": "string",
                 "enum": ["active", "backlog", "recurring", "idea"],
@@ -3188,6 +3277,15 @@ KANBAN_CREATE_MANY_SCHEMA = {
                         "assignee": {"type": "string"},
                         "parents": {"type": "array", "items": {"type": "string"}},
                         "routing_tier": {"type": "string", "enum": ["simple", "complex"]},
+                        "verification_tier": {
+                            "type": "string",
+                            "enum": ["express", "standard", "critical"],
+                        },
+                        "delivery_target": {
+                            "type": "string",
+                            "enum": ["working_tree", "commit", "push", "deploy"],
+                        },
+                        "visual_review_required": {"type": "boolean"},
                         "priority": {"type": "integer"},
                         "queue_class": {
                             "type": "string",
@@ -3210,6 +3308,17 @@ KANBAN_CREATE_MANY_SCHEMA = {
             "defaults": {
                 "type": "object",
                 "description": "Fields inherited by every item; item values override them.",
+                "properties": {
+                    "verification_tier": {
+                        "type": "string",
+                        "enum": ["express", "standard", "critical"],
+                    },
+                    "delivery_target": {
+                        "type": "string",
+                        "enum": ["working_tree", "commit", "push", "deploy"],
+                    },
+                    "visual_review_required": {"type": "boolean"},
+                },
             },
             "idempotency_key": {
                 "type": "string",

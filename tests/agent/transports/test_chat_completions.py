@@ -214,6 +214,124 @@ class TestChatCompletionsBasic:
 
 
 class TestChatCompletionsBuildKwargs:
+    def test_local_claude_proxy_gets_durable_worker_headers(
+        self, transport, monkeypatch,
+    ):
+        from providers import get_provider_profile
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:123:claim-1")
+
+        kwargs = transport.build_kwargs(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "continue"}],
+            base_url="http://127.0.0.1:18765",
+            session_id="worker-session-7",
+            provider_profile=get_provider_profile("custom"),
+        )
+
+        assert kwargs["extra_headers"] == {
+            "X-Hermes-Session-Id": "worker-session-7",
+            "X-Hermes-Kanban-Task": "t_abc123",
+            "X-Hermes-Kanban-Run": "42",
+            "X-Hermes-Kanban-Board": "default",
+            "X-Hermes-Kanban-Claim-Lock": "host:123:claim-1",
+        }
+
+    @pytest.mark.parametrize(
+        ("model", "base_url"),
+        [
+            ("claude-sonnet-5", "https://api.example.com/v1"),
+            ("gpt-5.6", "http://127.0.0.1:18765"),
+            ("claude-sonnet-5", "http://127.0.0.1:9999"),
+            ("not-claude-test", "http://127.0.0.1:18765"),
+            ("claude-sonnet-5", "http://127.0.0.1:18765/not-a-proxy-path"),
+        ],
+    )
+    def test_worker_headers_never_leave_the_local_claude_proxy_boundary(
+        self, transport, monkeypatch, model, base_url,
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc123")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "secret-claim")
+
+        kwargs = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "continue"}],
+            base_url=base_url,
+            session_id="worker-session-7",
+        )
+
+        assert "extra_headers" not in kwargs
+
+    def test_external_endpoint_strips_preinjected_hermes_headers(
+        self, transport,
+    ):
+        kwargs = transport.build_kwargs(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "continue"}],
+            base_url="https://api.example.com/v1",
+            session_id="trusted-session",
+            request_overrides={
+                "extra_headers": {
+                    "x-HeRmEs-SeSsIoN-iD": "forged-session",
+                    "X-HERMES-KANBAN-TASK": "t_forged",
+                    "x-hermes-kanban-run-id": "91",
+                    "X-Hermes-Kanban-Claim-Lock": "secret-claim",
+                    "X-Unrelated-Header": "preserved",
+                }
+            },
+        )
+
+        assert kwargs["extra_headers"] == {
+            "X-Unrelated-Header": "preserved",
+        }
+
+    def test_local_proxy_skips_header_values_with_control_characters(
+        self, transport, monkeypatch,
+    ):
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "bad\r\nheader")
+        kwargs = transport.build_kwargs(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "continue"}],
+            base_url="http://localhost:18766",
+            session_id="safe-session",
+        )
+        assert kwargs["extra_headers"] == {
+            "X-Hermes-Session-Id": "safe-session",
+        }
+
+    @pytest.mark.parametrize("context_name", ["delegated", "non_dispatcher"])
+    def test_in_process_children_never_inherit_parent_kanban_headers(
+        self, transport, monkeypatch, context_name,
+    ):
+        from agent.delegation_context import (
+            delegated_child_context,
+            non_dispatcher_owned_context,
+        )
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "99")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "parent-board")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "parent-claim")
+        context = (
+            delegated_child_context("child-session")
+            if context_name == "delegated"
+            else non_dispatcher_owned_context()
+        )
+        with context:
+            kwargs = transport.build_kwargs(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "child work"}],
+                base_url="http://127.0.0.1:18765",
+                session_id="child-session",
+            )
+
+        assert kwargs["extra_headers"] == {
+            "X-Hermes-Session-Id": "child-session",
+        }
+
 
     def test_basic_kwargs(self, transport):
         msgs = [{"role": "user", "content": "Hello"}]

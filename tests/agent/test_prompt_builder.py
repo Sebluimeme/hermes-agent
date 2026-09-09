@@ -1034,6 +1034,14 @@ class TestKanbanGuidanceFor:
         assert kanban_guidance_for(True) == KANBAN_GUIDANCE
         assert kanban_guidance_for() == KANBAN_GUIDANCE
 
+    def test_guidance_keeps_bounded_work_on_the_lean_path(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        assert "bounded `express` task completes after its targeted check" in KANBAN_GUIDANCE
+        assert "Visual review is opt-in" in KANBAN_GUIDANCE
+        assert "Never call or wait for Gemini" in KANBAN_GUIDANCE
+        assert "two-stage visual gate" not in KANBAN_GUIDANCE
+
     def test_unreachable_variant_drops_the_shell_out_prohibition(self):
         from agent.prompt_builder import kanban_guidance_for
 
@@ -1085,5 +1093,4 @@ class TestAgentInitKanbanToolsReachModelConfig:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

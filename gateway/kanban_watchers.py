@@ -1269,12 +1269,12 @@ class GatewayKanbanWatchersMixin:
                                 retry_at = int(ev.payload["retry_at"])
                             resume = (
                                 time.strftime("%d/%m à %H:%M", time.localtime(retry_at))
-                                if retry_at else "dès que Gemini redevient disponible"
+                                if retry_at else "dès que le reviewer redevient disponible"
                             )
                             msg = (
                                 f"⏳ {title}\n"
-                                "Le travail est prêt, mais la validation visuelle finale "
-                                "Gemini est temporairement indisponible.\n"
+                                "Le travail est prêt, mais sa vérification demandée "
+                                "est temporairement indisponible.\n"
                                 f"Reprise automatique {resume}. Aucune action requise."
                             )
                         elif kind == "relayed_to_coder":

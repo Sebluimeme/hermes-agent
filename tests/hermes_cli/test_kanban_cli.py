@@ -74,6 +74,26 @@ def test_kanban_list_json_includes_operational_wait_state(kanban_home):
     assert row["next_retry_at"] == 123456
 
 
+def test_cli_create_and_show_surface_minimal_delivery_contract(kanban_home):
+    created = json.loads(kc.run_slash(
+        "create 'contract task' --verification-tier critical "
+        "--delivery-target deploy --visual-review-required --json"
+    ))
+    assert created["verification_tier"] == "critical"
+    assert created["delivery_target"] == "deploy"
+    assert created["visual_review_required"] is True
+
+    shown = json.loads(kc.run_slash(f"show {created['id']} --json"))
+    assert shown["task"]["verification_tier"] == "critical"
+    assert shown["task"]["delivery_target"] == "deploy"
+    assert shown["task"]["visual_review_required"] is True
+
+    text = kc.run_slash(f"show {created['id']}")
+    assert "verification-tier: critical" in text
+    assert "delivery-target: deploy" in text
+    assert "visual-review-required: yes" in text
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
@@ -194,4 +214,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-

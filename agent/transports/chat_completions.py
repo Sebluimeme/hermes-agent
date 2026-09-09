@@ -10,7 +10,10 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import json
+import os
+import re
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.reasoning_effort import (
@@ -26,6 +29,108 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+
+_LOCAL_HEADER_VALUE_RE = re.compile(r"^[A-Za-z0-9._:@/+\-=]{1,512}$")
+_LOCAL_CLAUDE_MODEL_RE = re.compile(r"^claude(?:$|[-._:/])", re.IGNORECASE)
+_LOCAL_CLAUDE_PROXY_PORTS = frozenset({18765, 18766})
+_LOCAL_CLAUDE_PROXY_PATHS = frozenset({"", "/", "/v1", "/v1/"})
+_HERMES_OPERATIONAL_HEADERS = frozenset({
+    "x-hermes-session-id",
+    "x-hermes-kanban-task",
+    "x-hermes-kanban-run",
+    "x-hermes-kanban-run-id",
+    "x-hermes-kanban-board",
+    "x-hermes-kanban-claim-lock",
+})
+
+
+def _add_local_claude_proxy_headers(
+    api_kwargs: dict[str, Any],
+    *,
+    model: Any,
+    base_url: Any,
+    session_id: Any,
+) -> None:
+    """Forward durable worker identity only to a loopback Claude proxy.
+
+    Chat Completions is otherwise stateless.  The local Claude CLI proxies use
+    the Hermes session id to reopen their native Claude conversation while the
+    dispatcher keeps worker processes short-lived.  The exact-host and model
+    checks are intentional data-loss boundaries: none of these operational
+    headers may follow a provider fallback to an external endpoint.
+    """
+    try:
+        incoming_headers = dict(api_kwargs.get("extra_headers") or {})
+    except (TypeError, ValueError):
+        incoming_headers = {}
+    # Request overrides are untrusted at this boundary. Remove every spelling
+    # of Hermes operational identity before deciding whether this exact target
+    # is the local proxy; unrelated custom headers remain intact.
+    headers = {
+        name: value
+        for name, value in incoming_headers.items()
+        if str(name).casefold() not in _HERMES_OPERATIONAL_HEADERS
+    }
+    if headers:
+        api_kwargs["extra_headers"] = headers
+    else:
+        api_kwargs.pop("extra_headers", None)
+    try:
+        parsed = urlparse(str(base_url or "").strip())
+    except Exception:
+        return
+    if parsed.scheme != "http":
+        return
+    if (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
+        return
+    try:
+        proxy_port = parsed.port
+    except ValueError:
+        return
+    if proxy_port not in _LOCAL_CLAUDE_PROXY_PORTS:
+        return
+    if parsed.path not in _LOCAL_CLAUDE_PROXY_PATHS:
+        return
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return
+    if _LOCAL_CLAUDE_MODEL_RE.match(str(model or "").strip()) is None:
+        return
+
+    candidates = {
+        "X-Hermes-Session-Id": session_id,
+    }
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        owns_dispatcher_task = is_dispatcher_owned_worker_context()
+    except Exception:
+        # Fail closed for task/run/claim identity. The explicit conversation
+        # id remains safe because it came from this request, not process-global
+        # Kanban environment inherited from a parent worker.
+        owns_dispatcher_task = False
+    if owns_dispatcher_task:
+        candidates.update({
+            "X-Hermes-Kanban-Task": os.environ.get("HERMES_KANBAN_TASK"),
+            "X-Hermes-Kanban-Run": os.environ.get("HERMES_KANBAN_RUN_ID"),
+            "X-Hermes-Kanban-Board": os.environ.get("HERMES_KANBAN_BOARD"),
+            "X-Hermes-Kanban-Claim-Lock": os.environ.get(
+                "HERMES_KANBAN_CLAIM_LOCK"
+            ),
+        })
+    forwarded = {
+        name: str(value).strip()
+        for name, value in candidates.items()
+        if value is not None
+        and _LOCAL_HEADER_VALUE_RE.fullmatch(str(value).strip()) is not None
+    }
+    if not forwarded:
+        return
+    # Trusted runtime identity wins over a same-named request override.  This
+    # makes the proxy key deterministic and prevents a stale custom header
+    # from attaching this task to the wrong conversation.
+    headers.update(forwarded)
+    api_kwargs["extra_headers"] = headers
 
 
 def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
@@ -731,6 +836,12 @@ class ChatCompletionsTransport(ProviderTransport):
             session_id=params.get("session_id"),
             cache_scope_id=params.get("cache_scope_id"),
         )
+        _add_local_claude_proxy_headers(
+            api_kwargs,
+            model=model,
+            base_url=params.get("base_url"),
+            session_id=params.get("session_id"),
+        )
 
         return api_kwargs
 
@@ -893,6 +1004,12 @@ class ChatCompletionsTransport(ProviderTransport):
             supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
             session_id=params.get("session_id"),
             cache_scope_id=params.get("cache_scope_id"),
+        )
+        _add_local_claude_proxy_headers(
+            api_kwargs,
+            model=model,
+            base_url=params.get("base_url"),
+            session_id=params.get("session_id"),
         )
 
         return api_kwargs
