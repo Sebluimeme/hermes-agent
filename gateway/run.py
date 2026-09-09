@@ -32063,6 +32063,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return response
 
 
+def _claim_gateway_shutdown_kind(
+    current_kind: Optional[str],
+    *,
+    planned_takeover: bool,
+    planned_stop: bool,
+) -> Tuple[str, bool]:
+    """Latch the first shutdown classification and report whether it is new.
+
+    A systemd ``ExecStop`` marker can be observed by the marker watcher just
+    before the kernel delivers SIGTERM.  Both callbacks run on the event loop;
+    whichever arrives first is authoritative.  The second callback must not
+    consume/reclassify state or schedule another stop after the first one has
+    begun.
+    """
+    if current_kind is not None:
+        return current_kind, False
+    if planned_takeover:
+        return "planned_takeover", True
+    if planned_stop:
+        return "planned_stop", True
+    return "unexpected", True
+
+
 def _run_planned_stop_watcher(
     stop_event: threading.Event,
     runner,
@@ -32883,10 +32906,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # managers can revive the process. Planned stop paths write a marker
     # before signalling us so they can exit cleanly instead.
     _signal_initiated_shutdown = False
+    _shutdown_kind: Optional[str] = None
 
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
-        nonlocal _signal_initiated_shutdown
+        nonlocal _shutdown_kind, _signal_initiated_shutdown
+        # The marker watcher and the real SIGTERM can both enqueue this
+        # callback for the same systemd stop. Once the first callback has
+        # classified and scheduled shutdown, the second one is a no-op. This
+        # must happen before marker consumption: the first callback may have
+        # consumed the one-shot planned-stop marker already.
+        if _shutdown_kind is not None:
+            logger.debug(
+                "Ignoring duplicate shutdown callback (%r); first kind=%s",
+                received_signal,
+                _shutdown_kind,
+            )
+            return
         # Planned --replace takeover check: when a sibling gateway is
         # taking over via --replace, it wrote a marker naming this PID
         # before sending SIGTERM. If present, treat the signal as a
@@ -32932,12 +32968,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
 
-        if planned_takeover:
+        _shutdown_kind, first_callback = _claim_gateway_shutdown_kind(
+            _shutdown_kind,
+            planned_takeover=planned_takeover,
+            planned_stop=planned_stop,
+        )
+        if not first_callback:
+            return
+
+        if _shutdown_kind == "planned_takeover":
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
             )
-        elif planned_stop:
+        elif _shutdown_kind == "planned_stop":
             logger.info(
                 "Received %s as a planned gateway stop — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
