@@ -1123,6 +1123,36 @@ def test_create_task_persists_minimal_delivery_contract_in_event_run_and_context
     assert "Visual review: required" in context
 
 
+def test_scratch_worker_context_infers_named_project_without_recursive_scan(
+    kanban_home,
+):
+    project = kanban_home / "workspace" / "poivre-et-sale"
+    project.mkdir(parents=True)
+    (project / "package.json").write_text("{}\n", encoding="utf-8")
+    decoy = kanban_home / "workspace" / "ecobloc"
+    decoy.mkdir()
+    (decoy / "package.json").write_text("{}\n", encoding="utf-8")
+    scripts = kanban_home / "scripts"
+    scripts.mkdir()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Poivre & Sel — évolution mensuelle",
+            body="Comparer les visites et conversions sans modifier de données.",
+            workspace_kind="scratch",
+        )
+        claimed = kb.claim_task(conn, tid, claimer="spark:source-hint")
+        assert claimed is not None
+        context = kb.build_worker_context(conn, tid)
+
+    assert "Fast source discovery" in context
+    assert str(project) in context
+    assert str(decoy) not in context
+    assert "`rg --files` / `rg -n`" in context
+    assert "never use Python `Path.rglob`" in context
+
+
 def test_create_task_contract_defaults_and_nullable_legacy_shape(kanban_home):
     with kb.connect() as conn:
         default_id = kb.create_task(conn, title="default contract")

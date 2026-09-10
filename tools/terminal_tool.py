@@ -2703,6 +2703,63 @@ _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\bpython(?:3)?\s+-m\s+http\.server\b", re.IGNORECASE),
 )
 
+_RECURSIVE_DISCOVERY_PRIMITIVES = re.compile(
+    r"(?:\.rglob\s*\(|os\.walk\s*\(|Path\([^\n]*\)\.glob\s*\(\s*['\"]\*\*)",
+    re.IGNORECASE,
+)
+_QUOTED_PATH_LITERAL = re.compile(r"(['\"])(?P<path>[^'\"]+)\1")
+
+
+def _broad_recursive_discovery_guidance(command: str) -> str | None:
+    """Reject model-authored full-tree Python walks in Kanban workers.
+
+    A worker once spent more than eleven minutes repeatedly evaluating
+    ``Path('/home/.../.hermes').rglob('*')`` even though ``rg --files`` found
+    the relevant script in under a second.  Full-tree walks of the shared
+    Hermes root (or its multi-project ``workspace`` container) are discovery
+    bugs: they traverse caches, worktrees, histories, and dependencies and
+    routinely consume the whole worker iteration budget.
+
+    This guard is intentionally narrow.  It applies only to dispatcher-owned
+    Kanban workers, only to recursive Python traversal primitives, and only
+    when a quoted path is exactly the shared Hermes root or the shared
+    workspace container.  Recursive operations inside one explicit project
+    directory remain allowed.
+    """
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    if not _RECURSIVE_DISCOVERY_PRIMITIVES.search(command or ""):
+        return None
+
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        hermes_root = get_default_hermes_root().expanduser().resolve()
+    except Exception:
+        hermes_root = Path(
+            os.environ.get("HERMES_KANBAN_HOME")
+            or os.environ.get("HERMES_HOME")
+            or Path.home() / ".hermes"
+        ).expanduser().resolve()
+    broad_roots = {hermes_root, hermes_root / "workspace"}
+
+    for match in _QUOTED_PATH_LITERAL.finditer(command or ""):
+        raw = os.path.expandvars(match.group("path")).strip()
+        if not raw.startswith(("/", "~")):
+            continue
+        try:
+            candidate = Path(raw).expanduser().resolve()
+        except OSError:
+            continue
+        if candidate in broad_roots:
+            return (
+                "Refused a recursive Python scan of the shared Hermes tree. "
+                "Use `rg --files <specific-project-or-scripts-root> | rg -i "
+                "'<terms>'` (or `rg -n`) with a bounded timeout, then inspect "
+                "only the matching project. Do not retry the broad traversal."
+            )
+    return None
+
 
 def _looks_like_help_or_version_command(command: str) -> bool:
     """Return True for informational invocations that should never be blocked."""
@@ -2984,6 +3041,14 @@ def terminal_tool(
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
         if not background:
+            discovery_guidance = _broad_recursive_discovery_guidance(command)
+            if discovery_guidance:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": discovery_guidance,
+                    "status": "error",
+                }, ensure_ascii=False)
             guidance = _foreground_background_guidance(command)
             if guidance:
                 return json.dumps({

@@ -210,6 +210,31 @@ def test_completion_reuses_exact_ready_handoff_when_model_sends_wrong_args(worke
         conn.close()
 
 
+def test_completion_ready_receipt_can_finalize_without_another_model_turn(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    handoff = {
+        "summary": "Rapport mensuel produit et contrôlé",
+        "metadata": {
+            "evidence": {"kind": "artifact", "detail": "rapport vérifié"},
+        },
+    }
+    ready = json.loads(kt._handle_completion_ready(handoff))
+    assert ready["ready"] is True
+
+    assert kt.finalize_completion_from_readiness(worker_env) is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        run = kb.latest_run(conn, worker_env)
+        assert task is not None and task.status == "done"
+        assert run is not None and run.summary == handoff["summary"]
+    finally:
+        conn.close()
+
+
 def test_completion_reaps_worker_temp_processes(worker_env, monkeypatch):
     from tools import kanban_tools as kt
 

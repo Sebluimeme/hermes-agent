@@ -101,6 +101,34 @@ def hydrate_completion_args_from_readiness(args: dict[str, Any]) -> dict[str, An
         return hydrated
 
 
+def finalize_completion_from_readiness(task_id: str) -> bool:
+    """Apply an already validated readiness receipt without another LLM turn.
+
+    This is used only at the conversation iteration boundary.  The receipt is
+    process-local and task-scoped, and ``_handle_complete`` still re-runs the
+    authoritative completion validation plus the current-run ownership CAS.
+    A missing/stale/rejected receipt therefore fails closed and lets the
+    normal durable retry path take over.
+    """
+    tid = _default_task_id(task_id)
+    if not tid:
+        return False
+    with _COMPLETION_READY_LOCK:
+        if tid not in _COMPLETION_READY_HANDOFFS:
+            return False
+
+    try:
+        payload = json.loads(_handle_complete({"task_id": tid}))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        logger.warning(
+            "Could not auto-finalize readiness receipt for %s",
+            tid,
+            exc_info=True,
+        )
+        return False
+    return payload.get("ok") is True
+
+
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
     # negligible overhead. The check_fn results are further TTL-cached

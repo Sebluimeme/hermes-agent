@@ -85,6 +85,7 @@ import sys
 import threading
 import logging
 import time
+import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17347,6 +17348,62 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+_PROJECT_HINT_MARKERS = (
+    ".git", "package.json", "pyproject.toml", "CLAUDE.md", "vercel.json",
+)
+
+
+def _source_hint_tokens(value: str) -> set[str]:
+    """Return stable project-name tokens for cheap local source matching."""
+    normalized = unicodedata.normalize("NFKD", value or "")
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", ascii_text)
+        if len(token) >= 5
+    }
+
+
+def _named_project_source_hints(task: Task) -> list[Path]:
+    """Resolve likely project roots without recursively walking the workspace.
+
+    Read-only cards deliberately execute in private scratch directories.  When
+    their title/body names a local project, surface matching first-level
+    project roots so the worker does not try to rediscover them by walking the
+    entire shared Hermes tree.  The match is advisory and intentionally cheap:
+    one ``iterdir`` plus filename tokens, never file-content indexing.
+    """
+    if (task.workspace_kind or "scratch") != "scratch":
+        return []
+    title_tokens = _source_hint_tokens(task.title or "")
+    body_tokens = _source_hint_tokens(task.body or "")
+    if not title_tokens and not body_tokens:
+        return []
+    workspace_root = kanban_home() / "workspace"
+    try:
+        children = list(workspace_root.iterdir())
+    except OSError:
+        return []
+
+    scored: list[tuple[int, str, Path]] = []
+    for child in children:
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if not any((child / marker).exists() for marker in _PROJECT_HINT_MARKERS):
+            continue
+        child_tokens = _source_hint_tokens(child.name)
+        title_matches = title_tokens & child_tokens
+        body_matches = body_tokens & child_tokens
+        if not title_matches and not body_matches:
+            continue
+        # A project named in the task title is much more authoritative than a
+        # contextual mention in the body (for example an incident body may
+        # cite both the wrong historical project and Hermes itself).
+        score = (10 * len(title_matches)) + len(body_matches)
+        scored.append((score, child.name, child.resolve()))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [path for _score, _name, path in scored[:3]]
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
@@ -17396,6 +17453,21 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if (task.workspace_kind or "scratch") == "scratch":
+        source_hints = _named_project_source_hints(task)
+        lines.append(
+            "Fast source discovery: this private scratch workspace may not "
+            "contain the project sources. Use `rg --files` / `rg -n` on the "
+            "smallest explicit root; never use Python `Path.rglob`, `glob('**')`, "
+            "or `os.walk` on the shared Hermes root or its multi-project "
+            "workspace container. A failed discovery must be narrowed, not repeated."
+        )
+        if source_hints:
+            lines.append("Likely local project source(s), inferred without recursion:")
+            lines.extend(f"- `{path}`" for path in source_hints)
+        scripts_root = kanban_home() / "scripts"
+        if scripts_root.is_dir():
+            lines.append(f"Shared operational scripts (search with `rg`): `{scripts_root}`")
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,

@@ -71,6 +71,11 @@ _KANBAN_AUTOMATIC_RETRY_MESSAGE = (
     "déjà produit ; aucune approbation ni relance manuelle n’est nécessaire."
 )
 
+_KANBAN_READINESS_AUTO_COMPLETED_MESSAGE = (
+    "La tâche avait déjà franchi sa validation de clôture. "
+    "Son reçu validé a été appliqué automatiquement sans nouveau tour IA."
+)
+
 
 def _record_kanban_budget_exhausted(
     kanban_task: str,
@@ -179,8 +184,33 @@ def finalize_turn(
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
+    readiness_auto_completed = False
+    _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+    if (
+        budget_exhausted
+        and final_response is None
+        and not interrupted
+        and not failed
+        and _kanban_task
+    ):
+        try:
+            from tools.kanban_tools import finalize_completion_from_readiness
+
+            readiness_auto_completed = finalize_completion_from_readiness(
+                _kanban_task
+            )
+        except Exception:
+            logger.warning(
+                "Failed to auto-finalize readiness receipt for task %s",
+                _kanban_task,
+                exc_info=True,
+            )
+        if readiness_auto_completed:
+            final_response = _KANBAN_READINESS_AUTO_COMPLETED_MESSAGE
+            _turn_exit_reason = "kanban_readiness_auto_completed"
     budget_fallback_eligible = (
         budget_exhausted
+        and not readiness_auto_completed
         and not interrupted
         and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
@@ -246,7 +276,7 @@ def finalize_turn(
             # with the lifecycle truth, while the original tool history stays
             # available to the resumed session as its checkpoint.
             final_response = _KANBAN_AUTOMATIC_RETRY_MESSAGE
-    elif budget_exhausted:
+    elif budget_exhausted and not readiness_auto_completed:
         # Bounded fallback (#87096): budget was exhausted but none of the
         # normal fallback paths were eligible (interrupted / failed /
         # anomalous exit_reason). If running as a kanban worker we must
@@ -270,6 +300,7 @@ def finalize_turn(
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
+            or readiness_auto_completed
         )
     )
 

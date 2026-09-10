@@ -239,6 +239,61 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     assert "composed report" not in result["final_response"]
 
 
+def test_budget_boundary_auto_completes_valid_readiness_receipt(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    auto_complete = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.kanban_tools.finalize_completion_from_readiness",
+        auto_complete,
+    )
+    record_timeout = MagicMock()
+    monkeypatch.setattr(
+        "agent.turn_finalizer._record_kanban_budget_exhausted",
+        record_timeout,
+    )
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+    )
+
+    auto_complete.assert_called_once_with("task-123")
+    record_timeout.assert_not_called()
+    assert agent._handle_max_iterations_called is False
+    assert result["completed"] is True
+    assert result["turn_exit_reason"] == "kanban_readiness_auto_completed"
+    assert "sans nouveau tour IA" in result["final_response"]
+
+
+def test_budget_boundary_without_readiness_keeps_durable_retry(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setattr(
+        "tools.kanban_tools.finalize_completion_from_readiness",
+        lambda _task_id: False,
+    )
+    record_timeout = MagicMock()
+    monkeypatch.setattr(
+        "agent.turn_finalizer._record_kanban_budget_exhausted",
+        record_timeout,
+    )
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+    )
+
+    record_timeout.assert_called_once()
+    assert agent._handle_max_iterations_called is True
+    assert result["completed"] is False
+    assert "reprend automatiquement" in result["final_response"]
+
+
 def test_kanban_timeout_is_scoped_to_worker_run(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")

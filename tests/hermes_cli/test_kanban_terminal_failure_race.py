@@ -68,6 +68,14 @@ def test_stale_failure_cannot_close_newer_retry(tmp_path: Path) -> None:
             end_run=True,
             expected_run_id=first.current_run_id,
         ) is False
+        # A timed-out run now receives a durable not-before deadline. Advance
+        # that independent retry gate so this test can focus on its actual
+        # invariant: a late failure from run 1 must not close run 2.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET next_retry_at=NULL WHERE id=?",
+                (task_id,),
+            )
         second = kb.claim_task(conn, task_id, claimer="second")
         assert second is not None and second.current_run_id is not None
 

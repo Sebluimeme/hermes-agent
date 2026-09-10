@@ -1609,6 +1609,21 @@ def execute_code(
             "terminal(command=...) instead."
         )
 
+    # Match the terminal discovery guard before a persistent kernel can spend
+    # minutes walking every project/cache under the shared Hermes tree. The
+    # check is worker-only and path-bounded; normal Python work and recursive
+    # inspection inside one explicit project remain available.
+    from tools.terminal_tool import _broad_recursive_discovery_guidance
+
+    discovery_guidance = _broad_recursive_discovery_guidance(code)
+    if discovery_guidance:
+        return json.dumps({
+            "status": "error",
+            "error": discovery_guidance,
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+
     # Hard-block gateway-lifecycle commands, mirroring the terminal_tool
     # guard (#68289): without this, execute_code is a straight bypass — the
     # terminal() path refuses `launchctl bootout ai.hermes.gateway`, but the
