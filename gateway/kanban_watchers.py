@@ -1007,6 +1007,7 @@ class GatewayKanbanWatchersMixin:
                     # site below; it now means "a wake-deferred event was seen
                     # in this batch", not just "completed" specifically.
                     _completed_defers_to_wake = False
+                    _delivery_receipt: dict[str, Any] | None = None
                     _silent_intermediate_completion = False
                     if any(ev.kind == "completed" for ev in d["events"]):
                         try:
@@ -1087,28 +1088,25 @@ class GatewayKanbanWatchersMixin:
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}{proof}"
                                 wake_handoff = f"{r}{proof}"
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{proof}{handoff}"
+                            # A completed card already contains the worker's
+                            # validated human handoff.  Deliver that durable
+                            # handoff directly instead of waking the creator
+                            # merely to ask another model to paraphrase it.
+                            # This makes the platform ACK the actual closure
+                            # boundary: `_kanban_advance()` (and therefore
+                            # `delivery_status=delivered`) only runs after this
+                            # send succeeds.  Non-push/API adapters still use
+                            # the wake self-post path below because they have
+                            # no direct notification channel.
+                            clean_summary = (
+                                payload_summary
+                                or (str(task.result).strip() if task and task.result else "")
                             )
-                            # Defer to the wake instead of sending the raw
-                            # ping when a live session will describe this
-                            # completion in its own words (see the
-                            # `_completed_defers_to_wake` note above the
-                            # `for ev in d["events"]` loop). Requires an
-                            # actual session to wake — with no session_id
-                            # (legacy rows / sessionless workers) or a
-                            # non-push adapter, nothing else will ever tell
-                            # the user, so the raw ping stays the delivery.
-                            from gateway.wake import adapter_supports_push as _completed_push_ok
-                            if (
-                                wake_agent
-                                and _completed_push_ok(adapter)
-                                and task
-                                and getattr(task, "session_id", None)
-                            ):
-                                _completed_defers_to_wake = True
-                                continue
+                            msg = f"✅ {title}"
+                            if clean_summary:
+                                msg += f"\n{clean_summary[:1200]}"
+                            if proof:
+                                msg += f"\n{proof.removeprefix(' — ')}"
                         elif kind == "blocked":
                             # A block is a terminal state for automatic
                             # execution: nothing more happens without
@@ -1465,6 +1463,15 @@ class GatewayKanbanWatchersMixin:
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                                 )
+                            _delivery_receipt = {
+                                "transport": "direct",
+                                "platform": platform_str,
+                                "chat_id": str(sub["chat_id"]),
+                                "thread_id": str(sub.get("thread_id") or ""),
+                                "message_id": str(
+                                    getattr(_send_res, "message_id", "") or ""
+                                ),
+                            }
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -1565,6 +1572,14 @@ class GatewayKanbanWatchersMixin:
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
+                        # Push adapters receive a completed card through the
+                        # direct, ACK-gated notification above.  Waking the
+                        # creator as well used another model turn and produced
+                        # the recurrent second "already delivered" message.
+                        # API/non-push adapters keep completion in the wake set
+                        # because the self-post is their only delivery path.
+                        if _is_push_adapter and send_passive:
+                            _wake_kinds.discard("completed")
                         _session_key = ""
                         _synth = ""
                         if _wake_kinds:
@@ -1641,6 +1656,12 @@ class GatewayKanbanWatchersMixin:
                                     text=_synth,
                                     session_id=_session_key,
                                 )
+                                _delivery_receipt = {
+                                    "transport": "wake",
+                                    "platform": platform_str,
+                                    "chat_id": str(sub["chat_id"]),
+                                    "thread_id": str(sub.get("thread_id") or ""),
+                                }
                                 logger.info(
                                     "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
                                     sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
@@ -1797,6 +1818,12 @@ class GatewayKanbanWatchersMixin:
                             # ordering above.
                             try:
                                 await _push_wake()
+                                _delivery_receipt = {
+                                    "transport": "wake",
+                                    "platform": platform_str,
+                                    "chat_id": str(sub["chat_id"]),
+                                    "thread_id": str(sub.get("thread_id") or ""),
+                                }
                                 sub_fail_counts.pop(sub_key, None)
                             except Exception as _wk_err:
                                 fails = sub_fail_counts.get(sub_key, 0) + 1
@@ -1831,7 +1858,11 @@ class GatewayKanbanWatchersMixin:
                         # mechanism — it prevents re-delivery of the same
                         # event on subsequent ticks.
                         await _to_thread_process_service(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
+                            self._kanban_advance,
+                            sub,
+                            d["cursor"],
+                            board_slug,
+                            _delivery_receipt,
                         )
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
@@ -1880,7 +1911,11 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(1)
 
     def _kanban_advance(
-        self, sub: dict, cursor: int, board: Optional[str] = None,
+        self,
+        sub: dict,
+        cursor: int,
+        board: Optional[str] = None,
+        delivery_receipt: Optional[dict[str, Any]] = None,
     ) -> None:
         """Sync helper: advance a subscription's cursor. Runs in to_thread.
 
@@ -1900,7 +1935,11 @@ class GatewayKanbanWatchersMixin:
             )
             _task = _kb.get_task(conn, sub["task_id"])
             if _task is not None and _task.status == "done":
-                _kb.mark_task_delivered(conn, sub["task_id"])
+                _kb.mark_task_delivered(
+                    conn,
+                    sub["task_id"],
+                    receipt=delivery_receipt,
+                )
         finally:
             conn.close()
 

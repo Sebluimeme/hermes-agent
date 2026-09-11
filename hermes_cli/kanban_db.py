@@ -4383,8 +4383,13 @@ def _refresh_mission_status(conn: sqlite3.Connection, mission_id: Optional[str])
         )
 
 
-def mark_task_delivered(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Record the distinct delivery phase after a successful notification."""
+def mark_task_delivered(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    receipt: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Record delivery only after a successful transport acknowledgement."""
     now = int(time.time())
     with write_txn(conn):
         row = conn.execute(
@@ -4398,7 +4403,14 @@ def mark_task_delivered(conn: sqlite3.Connection, task_id: str) -> bool:
             "UPDATE tasks SET delivery_status = 'delivered' WHERE id = ?",
             (task_id,),
         )
-        _append_event(conn, task_id, "delivered", {"delivered_at": now})
+        payload: dict[str, Any] = {"delivered_at": now}
+        if isinstance(receipt, dict) and receipt:
+            payload["receipt"] = {
+                str(key): value
+                for key, value in receipt.items()
+                if value not in (None, "")
+            }
+        _append_event(conn, task_id, "delivered", payload)
         _refresh_mission_status(conn, row["mission_id"])
     return True
 

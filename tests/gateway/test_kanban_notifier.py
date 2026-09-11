@@ -197,29 +197,11 @@ def test_completed_notification_carries_structured_closure_evidence(tmp_path, mo
     message = adapter.sent[0]["text"]
     assert "Preuve Kanban : test" in message
     assert "python -m pytest tests/hermes_cli/test_kanban_closure_gate.py OK" in message
-    assert "Correction terminee — Preuve Kanban" in message
+    assert "Correction terminee\nPreuve Kanban" in message
 
 
-def test_completed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch):
-    """t_62e8c688: a `completed` event must reach Sébastien exactly once.
-
-    Before this fix, a push-adapter subscription with an owning session
-    (the normal shape for any interactive Telegram/Discord card, since
-    ``_maybe_auto_subscribe`` always stamps gateway sessions
-    ``delivery_mode="notify+wake"``) delivered the raw technical ping
-    below ("✔ [...] Kanban t_xxx done — title — Preuve Kanban : ...")
-    immediately, THEN woke the creator session, which produced its own
-    normal "clôture automatique" synthesis a moment later — two messages
-    for one completion (AGENTS.md "Silence Kanban intermédiaire": only the
-    human synthesis should ever reach him).
-
-    This pins the fix: the raw technical ping is suppressed entirely
-    (`adapter.sent` stays empty — no task id, no checkmark, no board tag,
-    no raw "Preuve Kanban" line ever reaches the chat directly) while the
-    wake still fires exactly once, carrying the worker's summary and
-    evidence into the synthetic turn so the woken agent can still compose
-    an informed human synthesis from it.
-    """
+def test_completed_event_delivers_handoff_directly_without_model_wake(tmp_path, monkeypatch):
+    """A push completion gets one ACK-gated message and no paraphrase turn."""
     db_path = tmp_path / "completed-defers-to-wake.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
@@ -256,19 +238,13 @@ def test_completed_event_defers_raw_ping_to_wake_synthesis(tmp_path, monkeypatch
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    # No raw technical ping reaches the chat at all — not the checkmark
-    # line, not the task id, not a duplicate.
-    assert adapter.sent == [], (
-        f"a completed event with an owning session must defer entirely to "
-        f"the wake synthesis, got a raw ping too: {adapter.sent}"
-    )
-    # Exactly one wake, carrying the worker's summary and evidence so the
-    # woken agent's own synthesis stays informed by the real result.
-    assert len(adapter.handled) == 1
-    wake_text = adapter.handled[0].text
-    assert tid in wake_text  # internal wake context may reference the id
-    assert "Correction terminee" in wake_text
-    assert "pytest tests/gateway/test_kanban_notifier.py OK" in wake_text
+    assert len(adapter.sent) == 1
+    delivered = adapter.sent[0]["text"]
+    assert delivered.startswith("✅ Corriger le double message Kanban")
+    assert tid not in delivered
+    assert "Correction terminee" in delivered
+    assert "pytest tests/gateway/test_kanban_notifier.py OK" in delivered
+    assert adapter.handled == []
 
     # Cursor advanced — the completed event is not left claimable forever.
     conn = kb.connect()
@@ -503,7 +479,8 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [delivery["chat_id"] for delivery in adapter.sent] == ["writer-chat"]
-    assert owned_tid in adapter.sent[0]["text"]
+    assert "writer-owned" in adapter.sent[0]["text"]
+    assert owned_tid not in adapter.sent[0]["text"]
     assert len(_unseen_terminal_events_for(foreign_tid, "default-chat")) == 1
 
 
@@ -553,7 +530,8 @@ def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
         winner_runner._kanban_dispatcher_lock_handle = winner_handle
         asyncio.run(_run_one_notifier_tick(monkeypatch, winner_runner))
         assert [item["chat_id"] for item in winner_adapter.sent] == ["legacy-chat"]
-        assert task_id in winner_adapter.sent[0]["text"]
+        assert "legacy done" in winner_adapter.sent[0]["text"]
+        assert task_id not in winner_adapter.sent[0]["text"]
     finally:
         _release_singleton_lock(loser_handle)
         _release_singleton_lock(winner_handle)
@@ -634,10 +612,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 ):
     """Done is reversible; archive alone ends notification ownership.
 
-    All events here are `completed` on a push adapter with an owning
-    session, so since t_62e8c688 the raw ping is deferred to the wake
-    (`adapter.sent` stays empty throughout) — the wake carries the same
-    chat/thread/profile routing the raw ping used to.
+    Completed events are sent directly and subscriptions remain available
+    for a later reopen/correction cycle.
     """
     db_path = tmp_path / "done-reopen-archive.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -671,10 +647,9 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert adapter.sent == [], "completed defers to the wake; no raw ping"
-    assert len(adapter.handled) == 1
-    assert adapter.handled[0].source.thread_id == "origin-thread"
-    assert adapter.handled[0].source.profile == "reviewer"
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"]["thread_id"] == "origin-thread"
+    assert adapter.handled == []
 
     conn = kb.connect()
     try:
@@ -689,8 +664,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner = _make_runner(adapter)
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    assert adapter.sent == []
-    assert len(adapter.handled) == 1
+    assert len(adapter.sent) == 1
+    assert adapter.handled == []
 
     conn = kb.connect()
     try:
@@ -706,11 +681,10 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     # Internal reopen status is silent; only the second completion delivers
-    # and wakes the exact original session/thread.
-    assert adapter.sent == []
-    assert len(adapter.handled) == 2
-    assert adapter.handled[-1].source.thread_id == "origin-thread"
-    assert adapter.handled[-1].source.profile == "reviewer"
+    # to the exact original thread.
+    assert len(adapter.sent) == 2
+    assert adapter.sent[-1]["metadata"]["thread_id"] == "origin-thread"
+    assert adapter.handled == []
 
     conn = kb.connect()
     try:
@@ -727,8 +701,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     # Archive itself is intentionally silent, but consumes its event and
     # removes the subscription so no later historical event can replay.
-    assert adapter.sent == []
-    assert len(adapter.handled) == 2
+    assert len(adapter.sent) == 2
+    assert adapter.handled == []
     conn = kb.connect()
     try:
         assert kb.list_notify_subs(conn, tid) == []
@@ -755,7 +729,7 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
             platform="telegram",
             chat_id="chat-dm",
             chat_type="dm",
-            delivery_mode="notify+wake",
+            delivery_mode="wake",
         )
         kb.complete_task(conn, tid, summary="done")
     finally:
@@ -764,7 +738,7 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
 
-    # completed defers to the wake (t_62e8c688); no raw ping is sent.
+    # An explicit wake-only subscription still uses the creator session.
     assert adapter.sent == []
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
@@ -851,7 +825,8 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
 
     # The good task must still be delivered despite the bad task failing.
     assert len(adapter.sent) == 1
-    assert tid_good in adapter.sent[0]["text"]
+    assert "good task" in adapter.sent[0]["text"]
+    assert tid_good not in adapter.sent[0]["text"]
 
 
 def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch):

@@ -39,6 +39,12 @@ class FailingWakeAdapter(RecordingAdapter):
         raise RuntimeError("simulated wake failure")
 
 
+class FailingSendAdapter(RecordingAdapter):
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        raise RuntimeError("simulated platform ACK failure")
+
+
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
 
@@ -155,12 +161,12 @@ def test_wake_only_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
     assert list(runner2._kanban_sub_fail_counts.values()) == [2]
 
 
-def test_notify_wake_completed_failure_rewinds_and_redelivers(tmp_path, monkeypatch):
-    """notify+wake, `completed` kind: since t_62e8c688 the raw ping is
-    deferred to the wake (see gateway/kanban_watchers.py
-    `_completed_defers_to_wake`), so a failed wake must rewind and retry
-    exactly like wake-only mode — the old "text ping IS the delivery, wake
-    is best-effort" contract only applies when nothing deferred to it.
+def test_notify_wake_completed_uses_one_direct_ack_gated_delivery(tmp_path, monkeypatch):
+    """A push-capable completion is delivered directly exactly once.
+
+    The creator must not be woken just to paraphrase the already validated
+    handoff: that extra model turn was both slow and the source of recurrent
+    "already delivered in the previous message" duplicates.
     """
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-wake.db"))
     kb.init_db()
@@ -170,24 +176,42 @@ def test_notify_wake_completed_failure_rewinds_and_redelivers(tmp_path, monkeypa
     runner = _make_runner(adapter)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert adapter.sent == [], "completed defers to the wake; no raw ping"
-    assert len(adapter.handled) == 1, "one wake attempt on the first tick"
-    events = _unseen_terminal_events(tid)
-    assert len(events) == 1, (
-        "a failed deferred-completed wake must REWIND the claim so the "
-        "event is redelivered on a later tick, not lost with no raw ping "
-        "and no successful wake"
-    )
-    assert list(runner._kanban_sub_fail_counts.values()) == [1], (
-        "failure counter must bump on a failed deferred-completed wake"
-    )
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"].startswith("✅ wake ordering task")
+    assert adapter.handled == [], "completion must not consume a second model turn"
+    assert _unseen_terminal_events(tid) == []
+    assert runner._kanban_sub_fail_counts == {}
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).delivery_status == "delivered"
+        delivered = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "delivered"
+        ][-1]
+        assert delivered.payload["receipt"]["transport"] == "direct"
+        assert delivered.payload["receipt"]["platform"] == "telegram"
+    finally:
+        conn.close()
 
-    # Next tick: the same event is claimed and the wake retried.
-    runner2 = _make_runner(adapter)
-    runner2._kanban_sub_fail_counts = runner._kanban_sub_fail_counts
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner2))
-    assert len(adapter.handled) == 2, "event must be redelivered next tick"
-    assert list(runner2._kanban_sub_fail_counts.values()) == [2]
+
+def test_notify_wake_completed_send_failure_keeps_card_undelivered(tmp_path, monkeypatch):
+    """No Telegram ACK means no delivery transition and a retryable event."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "notify-send-fail.db"))
+    kb.init_db()
+    tid = _make_completed_task("notify+wake")
+
+    adapter = FailingSendAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.handled == []
+    assert len(_unseen_terminal_events(tid)) == 1
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).delivery_status == "awaiting_delivery"
+    finally:
+        conn.close()
 
 
 def test_wake_only_failure_cap_preserves_subscription(tmp_path, monkeypatch):
