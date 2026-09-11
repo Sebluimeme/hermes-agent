@@ -202,7 +202,7 @@ def test_completed_notification_carries_structured_closure_evidence(tmp_path, mo
 
 def test_completed_event_delivers_handoff_directly_without_model_wake(tmp_path, monkeypatch):
     """A push completion gets one ACK-gated message and no paraphrase turn."""
-    db_path = tmp_path / "completed-defers-to-wake.db"
+    db_path = tmp_path / "completed-direct-delivery.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
     conn = kb.connect()

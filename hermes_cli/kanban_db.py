@@ -3433,18 +3433,41 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone():
-        # A terminal internal/cron card with no mission and no notification
-        # route has nothing left to deliver. Leaving it at awaiting_delivery
-        # created a permanent historical backlog (216 rows in production)
-        # even though no notifier could ever claim an event for it.
+        # A terminal card with no task subscription and no routable mission
+        # origin has nothing left to deliver.  A mission id alone is not a
+        # delivery route: internally-created mission graphs deliberately have
+        # no origin, and treating every child as deliverable left their cards
+        # permanently in ``awaiting_delivery`` after the final subscribed card
+        # had already reported the mission result.
         conn.execute(
             "UPDATE tasks SET delivery_status='not_required' "
             "WHERE status IN ('done','archived') "
-            "AND mission_id IS NULL "
             "AND delivery_status IN ('pending','awaiting_delivery') "
             "AND NOT EXISTS ("
             "SELECT 1 FROM kanban_notify_subs s WHERE s.task_id=tasks.id"
-            ")"
+            ") AND (mission_id IS NULL OR NOT EXISTS ("
+            "SELECT 1 FROM missions m WHERE m.id=tasks.mission_id "
+            "AND m.origin_platform IS NOT NULL "
+            "AND m.origin_chat_id IS NOT NULL"
+            "))"
+        )
+        # Reconcile mission rows after the historical child-card repair.  This
+        # is the same derived invariant as ``_refresh_mission_status`` below,
+        # expressed here because schema migration runs before that helper is
+        # defined.
+        _delivery_reconcile_now = int(time.time())
+        conn.execute(
+            "UPDATE missions SET status='delivered', "
+            "updated_at=?, completed_at=COALESCE(completed_at, ?), "
+            "delivered_at=COALESCE(delivered_at, ?) "
+            "WHERE status='completed' "
+            "AND EXISTS (SELECT 1 FROM tasks t WHERE t.mission_id=missions.id "
+            "AND t.queue_class='active') "
+            "AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.mission_id=missions.id "
+            "AND t.queue_class='active' AND ("
+            "t.status NOT IN ('done','archived') OR "
+            "t.delivery_status NOT IN ('delivered','not_required'))) ",
+            (_delivery_reconcile_now,) * 3,
         )
 
     # Older review completions could store their durable proof under
@@ -7719,11 +7742,20 @@ def complete_task(
         ).fetchone()
         prior_status = prior["status"] if prior else None
         has_delivery_route = bool(
-            (prior and prior["mission_id"])
-            or conn.execute(
+            conn.execute(
                 "SELECT 1 FROM kanban_notify_subs WHERE task_id=? LIMIT 1",
                 (task_id,),
             ).fetchone()
+            or (
+                prior
+                and prior["mission_id"]
+                and conn.execute(
+                    "SELECT 1 FROM missions WHERE id=? "
+                    "AND origin_platform IS NOT NULL "
+                    "AND origin_chat_id IS NOT NULL LIMIT 1",
+                    (prior["mission_id"],),
+                ).fetchone()
+            )
         )
         completion_delivery_status = (
             "awaiting_delivery" if has_delivery_route else "not_required"

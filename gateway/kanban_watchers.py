@@ -986,27 +986,13 @@ class GatewayKanbanWatchersMixin:
                     # "Task X completed" and re-decomposes work that already
                     # exists on the board.
                     wake_handoff = ""
-                    # Sébastien 2026-08-25 (t_62e8c688): a "completed" event on
-                    # a push adapter with an owning session used to ALWAYS send
-                    # the raw technical ping below (task id, board tag, "Preuve
-                    # Kanban") in addition to waking that session — and the
-                    # woken agent's own AGENTS.md "Clôture automatique" reply a
-                    # few seconds later duplicated it with a human synthesis.
-                    # AGENTS.md "Silence Kanban intermédiaire" is explicit that
-                    # only the synthesis should reach him. Set when the
-                    # completed branch below defers to the wake instead of
-                    # sending, so the wake call after this loop is promoted
-                    # from best-effort to the same gated rewind/retry contract
-                    # `wake`-only subscriptions already use — the completion is
-                    # never silently lost just because the raw ping is skipped.
-                    # 2026-09-03 (t_07db0331): the same duplicate-message shape
-                    # was confirmed live for `crashed`/`timed_out` — both are
-                    # auto-retry FYI events with no decision required, exactly
-                    # like `completed` — so they now set this flag too. Kept
-                    # under the original name to avoid touching every call
-                    # site below; it now means "a wake-deferred event was seen
-                    # in this batch", not just "completed" specifically.
-                    _completed_defers_to_wake = False
+                    # Intermediate retry/review events may defer their direct
+                    # technical ping to the owning session, avoiding two user
+                    # messages for one transition. A completed event is
+                    # different: its worker handoff is already the validated
+                    # final response and is sent directly below, without a
+                    # second model wake or paraphrase.
+                    _event_defers_to_wake = False
                     _delivery_receipt: dict[str, Any] | None = None
                     _silent_intermediate_completion = False
                     if any(ev.kind == "completed" for ev in d["events"]):
@@ -1206,7 +1192,7 @@ class GatewayKanbanWatchersMixin:
                                 and task
                                 and getattr(task, "session_id", None)
                             ):
-                                _completed_defers_to_wake = True
+                                _event_defers_to_wake = True
                                 continue
                         elif kind == "timed_out":
                             limit = 0
@@ -1228,7 +1214,7 @@ class GatewayKanbanWatchersMixin:
                                 and task
                                 and getattr(task, "session_id", None)
                             ):
-                                _completed_defers_to_wake = True
+                                _event_defers_to_wake = True
                                 continue
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
@@ -1402,7 +1388,7 @@ class GatewayKanbanWatchersMixin:
                                 and task
                                 and getattr(task, "session_id", None)
                             ):
-                                _completed_defers_to_wake = True
+                                _event_defers_to_wake = True
                                 continue
                         delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
@@ -1803,12 +1789,12 @@ class GatewayKanbanWatchersMixin:
                             )
 
                         if _is_push_adapter and _wake_kinds and (
-                            not send_passive or _completed_defers_to_wake
+                            not send_passive or _event_defers_to_wake
                         ):
                             # Wake-only (delivery_mode='wake') push sub, OR a
-                            # notify+wake completed event that deferred to the
-                            # wake instead of sending its raw ping (see
-                            # `_completed_defers_to_wake`): either way the
+                            # notify+wake intermediate event that deferred to
+                            # the wake instead of sending its raw ping (see
+                            # `_event_defers_to_wake`): either way the
                             # wake IS the sole delivery for at least one event
                             # in this batch. It must succeed BEFORE the cursor
                             # advances — advancing first would let a failed
@@ -1876,13 +1862,13 @@ class GatewayKanbanWatchersMixin:
                         if (
                             _is_push_adapter
                             and send_passive
-                            and not _completed_defers_to_wake
+                            and not _event_defers_to_wake
                             and _wake_kinds
                         ):
                             # notify+wake: the text ping above was the
                             # delivery and the cursor has advanced; the wake
                             # injection stays best-effort. Excludes the
-                            # deferred-completed case, which was already
+                            # wake-deferred event, which was already
                             # handled as a gated delivery above — attempting
                             # it again here would wake the session twice.
                             try:

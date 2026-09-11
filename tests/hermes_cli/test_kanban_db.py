@@ -2721,6 +2721,34 @@ def test_internal_card_without_delivery_route_closes_as_not_required(kanban_home
         assert task.delivery_status == "not_required"
 
 
+def test_internal_mission_card_without_delivery_route_closes_as_not_required(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        mission_id = kb.ensure_mission(
+            conn,
+            title="internal mission",
+            request_text="run an internal graph",
+            idempotency_key="internal-mission-no-origin",
+        )
+        task_id = kb.create_task(conn, title="internal unit", mission_id=mission_id)
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="internal unit complete",
+            metadata={"evidence": {"kind": "test", "detail": "check passed"}},
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "done"
+        assert task.delivery_status == "not_required"
+        mission = conn.execute(
+            "SELECT status, delivered_at FROM missions WHERE id=?", (mission_id,)
+        ).fetchone()
+        assert mission["status"] == "delivered"
+        assert mission["delivered_at"] is not None
+
+
 def test_mission_origin_repairs_missing_notification_subscription(kanban_home):
     with kb.connect() as conn:
         mission_id = kb.ensure_mission(
