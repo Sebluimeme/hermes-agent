@@ -3430,6 +3430,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE tasks SET delivery_status='delivered' "
             "WHERE status IN ('done','archived')"
         )
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
+    ).fetchone():
+        # A terminal internal/cron card with no mission and no notification
+        # route has nothing left to deliver. Leaving it at awaiting_delivery
+        # created a permanent historical backlog (216 rows in production)
+        # even though no notifier could ever claim an event for it.
+        conn.execute(
+            "UPDATE tasks SET delivery_status='not_required' "
+            "WHERE status IN ('done','archived') "
+            "AND mission_id IS NULL "
+            "AND delivery_status IN ('pending','awaiting_delivery') "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM kanban_notify_subs s WHERE s.task_id=tasks.id"
+            ")"
+        )
 
     # Older review completions could store their durable proof under
     # ``reviewer_checks`` (or another supported closure-evidence shape) while
@@ -4350,7 +4366,10 @@ def _refresh_mission_status(conn: sqlite3.Connection, mission_id: Optional[str])
     if statuses & {"blocked", "triage"}:
         status, completed_at, delivered_at = "action_required", None, None
     elif statuses <= {"done", "archived"}:
-        delivered = all(row["delivery_status"] == "delivered" for row in rows)
+        delivered = all(
+            row["delivery_status"] in {"delivered", "not_required"}
+            for row in rows
+        )
         status = "delivered" if delivered else "completed"
         completed_at = now
         delivered_at = now if delivered else None
@@ -7699,6 +7718,16 @@ def complete_task(
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
+        has_delivery_route = bool(
+            (prior and prior["mission_id"])
+            or conn.execute(
+                "SELECT 1 FROM kanban_notify_subs WHERE task_id=? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        )
+        completion_delivery_status = (
+            "awaiting_delivery" if has_delivery_route else "not_required"
+        )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -7712,14 +7741,14 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0,
                        execution_status = 'done',
-                       delivery_status = 'awaiting_delivery',
+                       delivery_status = ?,
                        failure_class = NULL,
                        next_retry_at = NULL,
                        action_required = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """,
-                (result, now, task_id),
+                (result, now, completion_delivery_status, task_id),
             )
         else:
             cur = conn.execute(
@@ -7734,7 +7763,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0,
                        execution_status = 'done',
-                       delivery_status = 'awaiting_delivery',
+                       delivery_status = ?,
                        failure_class = NULL,
                        next_retry_at = NULL,
                        action_required = NULL
@@ -7742,7 +7771,13 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (
+                    result,
+                    now,
+                    completion_delivery_status,
+                    task_id,
+                    int(expected_run_id),
+                ),
             )
         if cur.rowcount != 1:
             return False

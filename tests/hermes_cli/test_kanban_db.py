@@ -2706,6 +2706,21 @@ def test_new_active_child_reopens_delivered_mission_and_clears_terminal_times(
         ).fetchone()["status"] == "delivered"
 
 
+def test_internal_card_without_delivery_route_closes_as_not_required(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="internal deterministic cleanup")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="cleanup complete",
+            metadata={"evidence": {"kind": "test", "detail": "check passed"}},
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "done"
+        assert task.delivery_status == "not_required"
+
+
 def test_mission_origin_repairs_missing_notification_subscription(kanban_home):
     with kb.connect() as conn:
         mission_id = kb.ensure_mission(
