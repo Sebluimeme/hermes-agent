@@ -3460,7 +3460,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE missions SET status='delivered', "
             "updated_at=?, completed_at=COALESCE(completed_at, ?), "
             "delivered_at=COALESCE(delivered_at, ?) "
-            "WHERE status='completed' "
+            "WHERE status IN ('active','completed') "
             "AND EXISTS (SELECT 1 FROM tasks t WHERE t.mission_id=missions.id "
             "AND t.queue_class='active') "
             "AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.mission_id=missions.id "

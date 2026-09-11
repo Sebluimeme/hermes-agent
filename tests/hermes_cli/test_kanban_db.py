@@ -2748,6 +2748,21 @@ def test_internal_mission_card_without_delivery_route_closes_as_not_required(
         assert mission["status"] == "delivered"
         assert mission["delivered_at"] is not None
 
+        # A legacy/crashed writer may have left the derived mission row active
+        # even though every child is terminal. Reopening the schema must heal
+        # that drift without manufacturing a notification route.
+        conn.execute(
+            "UPDATE missions SET status='active',completed_at=NULL,delivered_at=NULL "
+            "WHERE id=?",
+            (mission_id,),
+        )
+        kb._migrate_add_optional_columns(conn)
+        reconciled = conn.execute(
+            "SELECT status,delivered_at FROM missions WHERE id=?", (mission_id,)
+        ).fetchone()
+        assert reconciled["status"] == "delivered"
+        assert reconciled["delivered_at"] is not None
+
 
 def test_mission_origin_repairs_missing_notification_subscription(kanban_home):
     with kb.connect() as conn:
