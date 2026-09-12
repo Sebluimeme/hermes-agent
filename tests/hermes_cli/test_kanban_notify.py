@@ -271,6 +271,18 @@ async def test_notifier_notify_plus_wake_sends_and_wakes(kanban_home):
     assert "passive block" in wake_text
     assert "active block" in wake_text
     assert "sans lui demander de répéter" in wake_text
+    # Regression (t_03f35402): this wake only seeds context — the real
+    # human-facing message was already sent via ``sent_msgs`` above. Without
+    # this metadata, base.py's Kanban silent/concise suppression never
+    # applies to the synthetic wake turn, so a model that (correctly)
+    # returns no visible text for this context-only turn falls through to
+    # the generic empty-response fallback ("Processing completed but no
+    # response was generated...") and that fallback gets delivered to
+    # Telegram unfiltered — an apparently blank/void reply right after a
+    # Kanban notification.
+    wake_metadata = wake_mock.await_args.kwargs["metadata"]
+    assert wake_metadata["internal_notification_kind"] == "kanban"
+    assert wake_metadata["user_delivery_policy"] == "silent"
 
 
 @pytest.mark.asyncio

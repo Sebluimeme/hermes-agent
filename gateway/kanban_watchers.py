@@ -891,6 +891,26 @@ class GatewayKanbanWatchersMixin:
                                         text="\n".join(_wake_lines),
                                         session_id=_session_id,
                                         source=_source,
+                                        # This wake only seeds context (the
+                                        # numbered mapping) — the real human
+                                        # message was already sent by
+                                        # ``_group_send`` above. Without this
+                                        # metadata, base.py's Kanban
+                                        # suppression (silent/concise) never
+                                        # applies, so if the model returns no
+                                        # visible text (correctly, since
+                                        # nothing new needs saying) the
+                                        # generic empty-response fallback
+                                        # ("Processing completed but no
+                                        # response was generated...") is sent
+                                        # to Telegram unfiltered — an
+                                        # apparently blank/void reply right
+                                        # after a Kanban notification.
+                                        metadata={
+                                            "internal_notification_kind": "kanban",
+                                            "user_delivery_policy": "silent",
+                                            "kanban_event_kind": "context_only",
+                                        },
                                     )
                                 except Exception as _wake_error:
                                     # The human-facing grouped message already
